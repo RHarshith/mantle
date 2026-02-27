@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agent Trace Dashboard</title>
+  <script src="https://unpkg.com/cytoscape@3.29.2/dist/cytoscape.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f7fb; color: #1b1f24; }
+    .layout { display: grid; grid-template-columns: 280px 1fr 360px; height: 100vh; }
+    .sidebar, .details { border-right: 1px solid #d0d7de; background: #fff; overflow: auto; }
+    .details { border-right: none; border-left: 1px solid #d0d7de; }
+    .main { display: grid; grid-template-rows: 48px 1fr; }
+    .header { display: flex; align-items: center; justify-content: space-between; padding: 0 12px; border-bottom: 1px solid #d0d7de; background: #fff; }
+    .trace-item { padding: 10px 12px; border-bottom: 1px solid #eef1f4; cursor: pointer; }
+    .trace-item:hover { background: #f2f7ff; }
+    .trace-item.active { background: #dbeafe; }
+    .muted { color: #6b7280; font-size: 12px; }
+    #graph { width: 100%; height: 100%; }
+    .panel-title { margin: 0; padding: 12px; font-size: 14px; border-bottom: 1px solid #eef1f4; }
+    .details-body { padding: 12px; }
+    pre { white-space: pre-wrap; word-break: break-word; background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 8px; padding: 8px; font-size: 12px; }
+    button { border: 1px solid #d0d7de; background: #fff; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <h3 class="panel-title">Trace IDs</h3>
+      <div id="traceList"></div>
+    </aside>
+
+    <section class="main">
+      <div class="header">
+        <div>
+          <strong id="traceTitle">No trace selected</strong>
+          <span id="viewMode" class="muted" style="margin-left:8px;">High-level</span>
+        </div>
+        <div>
+          <button id="backBtn" style="display:none;">Back to high-level</button>
+        </div>
+      </div>
+      <div id="graph"></div>
+    </section>
+
+    <aside class="details">
+      <h3 class="panel-title">Event Details</h3>
+      <div class="details-body" id="details">Select a node to inspect metadata.</div>
+    </aside>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
