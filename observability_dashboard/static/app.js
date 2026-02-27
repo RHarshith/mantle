@@ -3,18 +3,37 @@ let currentMode = "high";
 let currentToolCallId = null;
 let cy = null;
 let cachedTraces = [];
+let latestVersion = -1;
 
 const traceListEl = document.getElementById("traceList");
 const traceTitleEl = document.getElementById("traceTitle");
 const viewModeEl = document.getElementById("viewMode");
 const detailsEl = document.getElementById("details");
 const backBtn = document.getElementById("backBtn");
+const zoomInBtn = document.getElementById("zoomInBtn");
+const zoomOutBtn = document.getElementById("zoomOutBtn");
+const fitBtn = document.getElementById("fitBtn");
 
 backBtn.addEventListener("click", async () => {
   currentMode = "high";
   currentToolCallId = null;
   backBtn.style.display = "none";
   await loadHighLevelGraph();
+});
+
+zoomInBtn.addEventListener("click", () => {
+  if (!cy) return;
+  cy.zoom({ level: cy.zoom() * 1.2, renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 } });
+});
+
+zoomOutBtn.addEventListener("click", () => {
+  if (!cy) return;
+  cy.zoom({ level: cy.zoom() / 1.2, renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 } });
+});
+
+fitBtn.addEventListener("click", () => {
+  if (!cy) return;
+  cy.fit(undefined, 40);
 });
 
 async function api(path) {
@@ -83,22 +102,23 @@ function renderGraph(payload) {
           label: "data(label)",
           color: "#111827",
           "text-wrap": "wrap",
-          "text-max-width": "170px",
-          "font-size": "11px",
+          "text-max-width": "260px",
+          "font-size": "12px",
           "text-valign": "center",
           "text-halign": "center",
           shape: "roundrectangle",
-          width: 190,
-          height: 58,
-          padding: "8px",
+          width: 250,
+          height: 78,
+          padding: "12px",
         },
       },
       { selector: "node[kind='prompt']", style: { "background-color": "#bfdbfe" } },
       { selector: "node[kind='tool_call']", style: { "background-color": "#fde68a" } },
       { selector: "node[kind='tool_response']", style: { "background-color": "#c7d2fe" } },
       { selector: "node[kind='assistant_response']", style: { "background-color": "#bbf7d0" } },
-      { selector: "node[kind='action']", style: { "background-color": "#fca5a5" } },
-      { selector: "node[kind='resource']", style: { "background-color": "#d1fae5", width: 230 } },
+      { selector: "node[kind='action']", style: { "background-color": "#fca5a5", width: 280 } },
+      { selector: "node[kind='resource']", style: { "background-color": "#d1fae5", width: 340, height: 86 } },
+      { selector: "node[kind='placeholder']", style: { "background-color": "#e5e7eb", width: 300 } },
       {
         selector: "edge",
         style: {
@@ -108,7 +128,7 @@ function renderGraph(payload) {
           "target-arrow-shape": "triangle",
           "curve-style": "bezier",
           label: "data(label)",
-          "font-size": "10px",
+          "font-size": "11px",
           color: "#475569",
           "text-background-color": "#fff",
           "text-background-opacity": 1,
@@ -116,7 +136,17 @@ function renderGraph(payload) {
         },
       },
     ],
-    layout: { name: "breadthfirst", directed: true, spacingFactor: 1.25, padding: 24 },
+    minZoom: 0.03,
+    maxZoom: 6,
+    layout: {
+      name: "breadthfirst",
+      directed: true,
+      spacingFactor: currentMode === "tool" ? 1.9 : 1.35,
+      padding: 36,
+      fit: true,
+      avoidOverlap: true,
+      rankDir: currentMode === "tool" ? "TB" : "LR",
+    },
   });
 
   cy.on("tap", "node", (evt) => {
@@ -151,8 +181,15 @@ async function loadToolGraph(toolCallId) {
   renderGraph(payload);
 }
 
-async function refreshTraces(keepView = true) {
+async function refreshTraces(keepView = true, force = false) {
   const payload = await api("/api/traces");
+  const version = payload.version ?? 0;
+
+  if (keepView && !force && version === latestVersion) {
+    return;
+  }
+
+  latestVersion = version;
   const traces = payload.traces || [];
 
   if (!selectedTraceId && traces.length > 0) {
@@ -177,7 +214,7 @@ async function init() {
     try {
       await refreshTraces(true);
     } catch (_) {}
-  }, 1500);
+  }, 2000);
 
   // Optional websocket fast-path; silently degrade to polling-only if unavailable.
   try {
@@ -187,7 +224,10 @@ async function init() {
     ws.onmessage = async (evt) => {
       const msg = JSON.parse(evt.data);
       if (msg.type === "version") {
-        await refreshTraces(true);
+        if (typeof msg.version === "number" && msg.version === latestVersion) {
+          return;
+        }
+        await refreshTraces(true, true);
       }
     };
 

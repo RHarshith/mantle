@@ -26,6 +26,17 @@ NOISY_PREFIXES = (
     "/etc/ld.so",
 )
 NOISY_SUFFIXES = (".pyc", ".so", "__pycache__")
+SYSTEM_PREFIXES = (
+    "/usr/",
+    "/lib/",
+    "/etc/",
+    "/proc/",
+    "/sys/",
+    "/dev/",
+    "/run/",
+    "/var/lib/",
+    "/var/cache/",
+)
 
 
 @dataclass
@@ -151,6 +162,30 @@ class TraceStore:
             return True
         return False
 
+    def _is_user_visible_path(self, path: str) -> bool:
+        if not path:
+            return False
+
+        if path.startswith(("pipe:", "socket:", "anon_inode:")):
+            return False
+
+        if any(path.startswith(prefix) for prefix in SYSTEM_PREFIXES):
+            return False
+
+        if "/.venv/" in path or "/site-packages/" in path or "__pycache__" in path:
+            return False
+
+        if path.startswith("/home/"):
+            return True
+
+        if not path.startswith("/"):
+            return "/" in path or "." in path
+
+        if "/workspace/" in path or "/simple_agent/" in path:
+            return True
+
+        return False
+
     def _parse_open_mode(self, args: str) -> str:
         if "O_WRONLY" in args or "O_RDWR" in args or "O_CREAT" in args or "O_TRUNC" in args:
             return "file_write"
@@ -184,12 +219,16 @@ class TraceStore:
 
         if syscall == "execve" and not ret.startswith("-1"):
             quoted = self._extract_quoted(args)
-            cmd = " ".join(quoted[1:]) if len(quoted) > 1 else (quoted[0] if quoted else "exec")
+            exec_path = quoted[0] if quoted else ""
+            argv = quoted[1:] if len(quoted) > 1 else []
+            cmd = " ".join(argv) if argv else (exec_path or "exec")
             self._push_sys_event(
                 state,
                 {
                     "type": "command_exec",
                     "pid": pid,
+                    "exec_path": exec_path,
+                    "argv": argv,
                     "command": cmd,
                     "label": f"exec {cmd[:120]}",
                 },
@@ -202,6 +241,8 @@ class TraceStore:
                 return False
             path = quoted[0]
             if self._is_noisy_path(path):
+                return False
+            if not self._is_user_visible_path(path):
                 return False
             action_type = self._parse_open_mode(args)
             self._push_sys_event(
@@ -222,6 +263,8 @@ class TraceStore:
             path = quoted[-1]
             if self._is_noisy_path(path):
                 return False
+            if not self._is_user_visible_path(path):
+                return False
             self._push_sys_event(
                 state,
                 {
@@ -240,6 +283,8 @@ class TraceStore:
             src, dst = quoted[0], quoted[1]
             if self._is_noisy_path(src) and self._is_noisy_path(dst):
                 return False
+            if not (self._is_user_visible_path(src) or self._is_user_visible_path(dst)):
+                return False
             self._push_sys_event(
                 state,
                 {
@@ -255,6 +300,18 @@ class TraceStore:
         return False
 
     def _ingest_strace_line(self, state: TraceState, line: str, line_no: int) -> bool:
+        m_exit = re.match(r"^(?P<pid>\d+)\s+\+\+\+ exited with", line)
+        if m_exit:
+            pid = int(m_exit.group("pid"))
+            self._push_sys_event(
+                state,
+                {
+                    "type": "process_exit",
+                    "pid": pid,
+                    "label": f"pid {pid} exited",
+                },
+            )
+
         if "+++ exited with" in line and state.root_pid is not None:
             root_prefix = f"{state.root_pid}  +++ exited with"
             if line.startswith(root_prefix):
@@ -365,6 +422,138 @@ class TraceStore:
 
         return {"nodes": nodes, "edges": edges, "timeline": timeline}
 
+    def _tool_start_events(self, trace: TraceState) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for event in trace.agent_events:
+            if event.get("event_type") == "tool_call_started":
+                payload = event.get("payload") or {}
+                if payload.get("tool_call_id"):
+                    out.append(event)
+        return out
+
+    def _tool_line_ranges(self, trace: TraceState) -> dict[str, tuple[int, int | None]]:
+        starts = self._tool_start_events(trace)
+        exec_events = sorted(
+            [e for e in trace.sys_events if e.get("type") == "command_exec"],
+            key=lambda x: int(x.get("line_no", 0)),
+        )
+        if not starts or not exec_events:
+            return {}
+
+        assigned_starts: dict[str, int] = {}
+        used_indices: set[int] = set()
+        cursor = 0
+
+        def norm(text: str) -> str:
+            text = re.sub(r"\s+", " ", text.strip().lower())
+            return text
+
+        def command_match_score(tool_cmd: str, exec_cmd: str) -> int:
+            if not tool_cmd or not exec_cmd:
+                return 0
+            tool_n = norm(tool_cmd)
+            exec_n = norm(exec_cmd)
+            if not tool_n or not exec_n:
+                return 0
+            if tool_n in exec_n:
+                return len(tool_n)
+            tokens = [tok for tok in re.split(r"\s+", tool_n) if len(tok) >= 3]
+            return sum(1 for tok in tokens if tok in exec_n)
+
+        for start in starts:
+            payload = start.get("payload") or {}
+            tool_call_id = payload.get("tool_call_id")
+            if not tool_call_id:
+                continue
+
+            tool_name = payload.get("tool_name")
+            tool_args = payload.get("arguments") or {}
+            tool_cmd = str(tool_args.get("command") or "") if tool_name == "command_exec" else ""
+
+            chosen_idx = None
+
+            if tool_cmd:
+                best_score = 0
+                for idx in range(cursor, len(exec_events)):
+                    if idx in used_indices:
+                        continue
+                    score = command_match_score(tool_cmd, str(exec_events[idx].get("command") or ""))
+                    if score > best_score:
+                        best_score = score
+                        chosen_idx = idx
+
+            if chosen_idx is None:
+                for idx in range(cursor, len(exec_events)):
+                    if idx not in used_indices:
+                        chosen_idx = idx
+                        break
+
+            if chosen_idx is None:
+                continue
+
+            used_indices.add(chosen_idx)
+            cursor = min(chosen_idx + 1, len(exec_events))
+            assigned_starts[tool_call_id] = int(exec_events[chosen_idx].get("line_no", 0))
+
+        ordered_ids = [
+            (event.get("payload") or {}).get("tool_call_id")
+            for event in starts
+            if (event.get("payload") or {}).get("tool_call_id") in assigned_starts
+        ]
+
+        ranges: dict[str, tuple[int, int | None]] = {}
+        for i, call_id in enumerate(ordered_ids):
+            start_line = assigned_starts[call_id]
+            end_line = None
+            if i + 1 < len(ordered_ids):
+                next_start = assigned_starts[ordered_ids[i + 1]]
+                end_line = next_start - 1
+            ranges[call_id] = (start_line, end_line)
+
+        return ranges
+
+    def _compress_sys_events(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not events:
+            return []
+
+        ordered = sorted(events, key=lambda e: int(e.get("line_no", 0)))
+        compressed: list[dict[str, Any]] = []
+
+        for event in ordered:
+            key = (
+                event.get("type"),
+                event.get("pid"),
+                event.get("path"),
+                event.get("command"),
+                event.get("child_pid"),
+                event.get("src"),
+            )
+
+            if compressed and compressed[-1].get("_key") == key:
+                compressed[-1]["count"] += 1
+                compressed[-1]["last_line_no"] = event.get("line_no")
+                continue
+
+            entry = dict(event)
+            entry["count"] = 1
+            entry["first_line_no"] = event.get("line_no")
+            entry["last_line_no"] = event.get("line_no")
+            entry["_key"] = key
+            compressed.append(entry)
+
+        for item in compressed:
+            item.pop("_key", None)
+
+        return compressed
+
+    def _short_command_label(self, event: dict[str, Any]) -> str:
+        argv = event.get("argv") or []
+        if isinstance(argv, list) and argv:
+            return " ".join(argv[:4])[:140]
+
+        command = str(event.get("command") or "exec")
+        return command[:140]
+
     def tool_graph(self, trace_id: str, tool_call_id: str) -> dict[str, Any]:
         t = self._get_trace(trace_id)
 
@@ -390,7 +579,21 @@ class TraceStore:
         if end_ts < start_ts:
             end_ts = start_ts + 5.0
 
-        related = [e for e in t.sys_events if start_ts <= float(e.get("ts", 0)) <= (end_ts + 0.25)]
+        related: list[dict[str, Any]] = []
+        tool_ranges = self._tool_line_ranges(t)
+        line_range = tool_ranges.get(tool_call_id)
+
+        if line_range is not None:
+            start_line, end_line = line_range
+            related = [
+                e
+                for e in t.sys_events
+                if int(e.get("line_no", 0)) >= start_line
+                and (end_line is None or int(e.get("line_no", 0)) <= end_line)
+            ]
+
+        if not related:
+            related = [e for e in t.sys_events if start_ts <= float(e.get("ts", 0)) <= (end_ts + 0.25)]
 
         nodes = [
             {
@@ -402,17 +605,7 @@ class TraceStore:
         ]
         edges = []
 
-        action_agg: dict[tuple, dict[str, Any]] = {}
-        for event in related:
-            event_type = event.get("type")
-            key = (event_type, event.get("command"), event.get("path"), event.get("child_pid"))
-            entry = action_agg.get(key)
-            if entry is None:
-                entry = {"event": event, "count": 0}
-                action_agg[key] = entry
-            entry["count"] += 1
-
-        if not action_agg:
+        if not related:
             nodes.append(
                 {
                     "id": "no_data",
@@ -424,48 +617,254 @@ class TraceStore:
             edges.append({"source": "tool", "target": "no_data", "label": "info"})
             return {"nodes": nodes, "edges": edges, "events": []}
 
-        action_index = 0
-        resource_index = 0
-        resource_nodes: dict[str, str] = {}
-        flat_events = []
+        related_sorted = sorted(related, key=lambda x: int(x.get("line_no", 0)))
+        command_events = [e for e in related_sorted if e.get("type") == "command_exec"]
 
-        for aggregated in action_agg.values():
-            event = aggregated["event"]
-            count = aggregated["count"]
-            action_id = f"act_{action_index}"
-            action_index += 1
-            action_label = event.get("label", event.get("type", "action"))
-
+        if not command_events:
             nodes.append(
                 {
-                    "id": action_id,
-                    "label": action_label,
-                    "kind": "action",
-                    "metadata": {"count": count, **event},
+                    "id": "no_commands",
+                    "label": "No command-level events found",
+                    "kind": "placeholder",
+                    "metadata": {},
                 }
             )
-            edges.append({"source": "tool", "target": action_id, "label": f"x{count}"})
+            edges.append({"source": "tool", "target": "no_commands", "label": "info"})
+            return {"nodes": nodes, "edges": edges, "events": []}
 
-            path = event.get("path")
-            if isinstance(path, str) and path:
-                if path not in resource_nodes:
-                    res_id = f"res_{resource_index}"
-                    resource_index += 1
-                    resource_nodes[path] = res_id
-                    nodes.append(
+        root_pid = int(command_events[0].get("pid", 0))
+
+        if line_range is not None and line_range[1] is None:
+            start_line = line_range[0]
+            exit_lines = [
+                int(e.get("line_no", 0))
+                for e in t.sys_events
+                if e.get("type") == "process_exit"
+                and int(e.get("pid", 0)) == root_pid
+                and int(e.get("line_no", 0)) >= start_line
+            ]
+            if exit_lines:
+                bounded_end = min(exit_lines)
+                related_sorted = [e for e in related_sorted if int(e.get("line_no", 0)) <= bounded_end]
+                command_events = [e for e in command_events if int(e.get("line_no", 0)) <= bounded_end]
+
+        def is_descendant_or_same(pid: int, ancestor: int) -> bool:
+            current = pid
+            seen = set()
+            while current and current not in seen:
+                if current == ancestor:
+                    return True
+                seen.add(current)
+                current = int(t.process_parent.get(current, 0))
+            return False
+
+        command_events = [
+            e for e in command_events if is_descendant_or_same(int(e.get("pid", 0)), root_pid)
+        ] or command_events
+
+        max_commands = 80
+        command_overflow = 0
+        if len(command_events) > max_commands:
+            command_overflow = len(command_events) - max_commands
+            command_events = command_events[:max_commands]
+
+        command_nodes: list[dict[str, Any]] = []
+        command_ids_by_pid: dict[int, list[tuple[int, str]]] = defaultdict(list)
+        command_event_by_id: dict[str, dict[str, Any]] = {}
+
+        for i, cmd in enumerate(command_events):
+            cmd_id = f"cmd_{i}"
+            pid = int(cmd.get("pid", 0))
+            command_ids_by_pid[pid].append((int(cmd.get("line_no", 0)), cmd_id))
+            cmd_label = self._short_command_label(cmd)
+
+            node = {
+                "id": cmd_id,
+                "label": cmd_label,
+                "kind": "action",
+                "metadata": {
+                    "pid": pid,
+                    "line_no": cmd.get("line_no"),
+                    "exec_path": cmd.get("exec_path"),
+                    "argv": cmd.get("argv", []),
+                    "command": cmd.get("command"),
+                },
+            }
+            command_nodes.append(node)
+            command_event_by_id[cmd_id] = cmd
+
+        file_events = [
+            e
+            for e in related_sorted
+            if e.get("type") in {"file_read", "file_write", "file_delete", "file_rename"}
+            and isinstance(e.get("path"), str)
+            and self._is_user_visible_path(str(e.get("path")))
+        ]
+
+        resource_nodes: dict[str, str] = {}
+        resource_index = 0
+
+        command_lookup = sorted(
+            [(int(n["metadata"]["line_no"] or 0), n["metadata"]["pid"], n["id"]) for n in command_nodes],
+            key=lambda x: x[0],
+        )
+
+        def match_command_for_event(event: dict[str, Any]) -> str | None:
+            line = int(event.get("line_no", 0))
+            pid = int(event.get("pid", 0))
+
+            candidates = command_ids_by_pid.get(pid, [])
+            best_id = None
+            best_line = -1
+            for cmd_line, cmd_id in candidates:
+                if cmd_line <= line and cmd_line >= best_line:
+                    best_line = cmd_line
+                    best_id = cmd_id
+
+            if best_id is not None:
+                return best_id
+
+            for cmd_line, _cmd_pid, cmd_id in command_lookup:
+                if cmd_line <= line:
+                    best_id = cmd_id
+                else:
+                    break
+            return best_id
+
+        file_agg: dict[tuple[str, str], dict[str, Any]] = {}
+        for fe in file_events:
+            cmd_id = match_command_for_event(fe)
+            if cmd_id is None:
+                continue
+            path = str(fe.get("path"))
+            key = (cmd_id, path)
+            bucket = file_agg.setdefault(
+                key,
+                {
+                    "cmd_id": cmd_id,
+                    "path": path,
+                    "types": set(),
+                    "count": 0,
+                    "line_min": int(fe.get("line_no", 0)),
+                    "line_max": int(fe.get("line_no", 0)),
+                },
+            )
+            bucket["types"].add(str(fe.get("type")))
+            bucket["count"] += 1
+            bucket["line_min"] = min(bucket["line_min"], int(fe.get("line_no", 0)))
+            bucket["line_max"] = max(bucket["line_max"], int(fe.get("line_no", 0)))
+
+        command_ids_with_files = {b["cmd_id"] for b in file_agg.values()}
+
+        tool_payload = start_event.get("payload") or {}
+        tool_cmd_text = ""
+        if (tool_payload.get("tool_name") or "") == "command_exec":
+            tool_cmd_text = str((tool_payload.get("arguments") or {}).get("command") or "")
+        tool_tokens = {tok for tok in re.findall(r"[A-Za-z0-9_./-]+", tool_cmd_text.lower()) if len(tok) >= 2}
+
+        def command_is_relevant(node: dict[str, Any], idx: int) -> bool:
+            cmd_id = node["id"]
+            if idx == 0:
+                return True
+            if cmd_id in command_ids_with_files:
+                return True
+
+            meta = node.get("metadata") or {}
+            exec_path = str(meta.get("exec_path") or "")
+            base = Path(exec_path).name.lower() if exec_path else ""
+
+            if base and base in tool_tokens:
+                return True
+            if base in {"sh", "bash"}:
+                return True
+            return False
+
+        filtered_nodes: list[dict[str, Any]] = []
+        hidden_count = 0
+        for idx, node in enumerate(command_nodes):
+            if command_is_relevant(node, idx):
+                if hidden_count > 0:
+                    filtered_nodes.append(
                         {
-                            "id": res_id,
-                            "label": path,
-                            "kind": "resource",
-                            "metadata": {"path": path},
+                            "id": f"hidden_{idx}",
+                            "label": f"runtime/setup commands hidden ({hidden_count})",
+                            "kind": "placeholder",
+                            "metadata": {"hidden_commands": hidden_count},
                         }
                     )
-                edges.append({"source": action_id, "target": resource_nodes[path], "label": "touches"})
+                    hidden_count = 0
+                filtered_nodes.append(node)
+            else:
+                hidden_count += 1
 
-            flat_events.append({"count": count, **event})
+        if hidden_count > 0:
+            filtered_nodes.append(
+                {
+                    "id": "hidden_tail",
+                    "label": f"runtime/setup commands hidden ({hidden_count})",
+                    "kind": "placeholder",
+                    "metadata": {"hidden_commands": hidden_count},
+                }
+            )
 
-        flat_events.sort(key=lambda x: x.get("line_no", 0))
-        return {"nodes": nodes, "edges": edges, "events": flat_events}
+        prev_cmd_id: str | None = None
+        visible_command_ids = {n["id"] for n in filtered_nodes if n.get("kind") == "action"}
+        for node in filtered_nodes:
+            nodes.append(node)
+            nid = node["id"]
+            if prev_cmd_id is None:
+                edges.append({"source": "tool", "target": nid, "label": "start"})
+            else:
+                edges.append({"source": prev_cmd_id, "target": nid, "label": "next"})
+            prev_cmd_id = nid
+
+        for bucket in sorted(file_agg.values(), key=lambda b: (b["line_min"], b["path"])):
+            path = bucket["path"]
+            if bucket["cmd_id"] not in visible_command_ids:
+                continue
+            if path not in resource_nodes:
+                res_id = f"res_{resource_index}"
+                resource_index += 1
+                resource_nodes[path] = res_id
+                nodes.append(
+                    {
+                        "id": res_id,
+                        "label": path,
+                        "kind": "resource",
+                        "metadata": {"path": path},
+                    }
+                )
+
+            types = sorted(bucket["types"])
+            label = "/".join(t.replace("file_", "") for t in types)
+            if bucket["count"] > 1:
+                label += f" x{bucket['count']}"
+
+            edges.append({"source": bucket["cmd_id"], "target": resource_nodes[path], "label": label})
+
+        if command_overflow > 0 and prev_cmd_id is not None:
+            nodes.append(
+                {
+                    "id": "overflow",
+                    "label": f"{command_overflow} additional command nodes hidden",
+                    "kind": "placeholder",
+                    "metadata": {"overflow": command_overflow},
+                }
+            )
+            edges.append({"source": prev_cmd_id, "target": "overflow", "label": "next"})
+
+        events_out = [
+            {
+                "type": "command_exec",
+                "line_no": n["metadata"].get("line_no"),
+                "pid": n["metadata"].get("pid"),
+                "command": n["metadata"].get("command"),
+                "exec_path": n["metadata"].get("exec_path"),
+            }
+            for n in command_nodes
+        ]
+
+        return {"nodes": nodes, "edges": edges, "events": events_out}
 
 
 app = FastAPI(title="Agent System Observability Dashboard")
