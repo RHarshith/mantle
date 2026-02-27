@@ -378,7 +378,21 @@ class TraceStore:
         timeline = []
         prev_id = None
 
+        tool_finish_by_id: dict[str, tuple[int, dict[str, Any]]] = {}
         for i, event in enumerate(t.agent_events):
+            if event.get("event_type") not in {"tool_call_finished", "tool_call_denied", "tool_call_invalid_args", "tool_call_unknown"}:
+                continue
+            payload = event.get("payload") or {}
+            tool_call_id = payload.get("tool_call_id")
+            if tool_call_id and tool_call_id not in tool_finish_by_id:
+                tool_finish_by_id[tool_call_id] = (i, event)
+
+        consumed_finish_indices: set[int] = set()
+
+        for i, event in enumerate(t.agent_events):
+            if i in consumed_finish_indices:
+                continue
+
             event_type = event.get("event_type", "unknown")
             payload = event.get("payload") or {}
 
@@ -387,17 +401,30 @@ class TraceStore:
                 kind = "prompt"
                 metadata = {"content": payload.get("content", "")}
             elif event_type == "tool_call_started":
-                label = f"Tool: {payload.get('tool_name', 'unknown')}"
-                kind = "tool_call"
+                tool_call_id = payload.get("tool_call_id")
+                finish_tuple = tool_finish_by_id.get(str(tool_call_id)) if tool_call_id else None
+                finish_event = finish_tuple[1] if finish_tuple else None
+                if finish_tuple:
+                    consumed_finish_indices.add(finish_tuple[0])
+
+                finish_payload = (finish_event or {}).get("payload") or {}
+                status = "ok"
+                result = finish_payload.get("result")
+                if isinstance(result, dict) and result.get("ok") is False:
+                    status = "error"
+                elif finish_event and finish_event.get("event_type") != "tool_call_finished":
+                    status = "error"
+
+                label = f"Tool: {payload.get('tool_name', 'unknown')} ({status})"
+                kind = "tool_step"
                 metadata = {
-                    "tool_call_id": payload.get("tool_call_id"),
+                    "tool_call_id": tool_call_id,
                     "tool_name": payload.get("tool_name"),
                     "arguments": payload.get("arguments", {}),
+                    "status": status,
+                    "result": result,
+                    "duration_ms": finish_payload.get("duration_ms"),
                 }
-            elif event_type in {"tool_call_finished", "tool_call_denied", "tool_call_invalid_args", "tool_call_unknown"}:
-                label = "Tool Response"
-                kind = "tool_response"
-                metadata = payload
             elif event_type == "assistant_response":
                 label = "Agent Response"
                 kind = "assistant_response"
@@ -405,7 +432,7 @@ class TraceStore:
             else:
                 continue
 
-            node_id = f"hl_{i}"
+            node_id = f"hl_{len(nodes)}"
             node = {
                 "id": node_id,
                 "label": label,
@@ -420,7 +447,14 @@ class TraceStore:
                 edges.append({"source": prev_id, "target": node_id, "label": "next"})
             prev_id = node_id
 
-        return {"nodes": nodes, "edges": edges, "timeline": timeline}
+        summary = {
+            "prompts": sum(1 for n in nodes if n["kind"] == "prompt"),
+            "tool_steps": sum(1 for n in nodes if n["kind"] == "tool_step"),
+            "responses": sum(1 for n in nodes if n["kind"] == "assistant_response"),
+            "trace_status": "completed" if t.complete else "active",
+        }
+
+        return {"nodes": nodes, "edges": edges, "timeline": timeline, "summary": summary}
 
     def _tool_start_events(self, trace: TraceState) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -554,46 +588,55 @@ class TraceStore:
         command = str(event.get("command") or "exec")
         return command[:140]
 
-    def tool_graph(self, trace_id: str, tool_call_id: str) -> dict[str, Any]:
-        t = self._get_trace(trace_id)
-
+    def _find_tool_events(self, trace: TraceState, tool_call_id: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         start_event = None
         end_event = None
 
-        for event in t.agent_events:
-            if event.get("event_type") == "tool_call_started":
-                payload = event.get("payload") or {}
-                if payload.get("tool_call_id") == tool_call_id:
-                    start_event = event
-            if event.get("event_type") == "tool_call_finished":
-                payload = event.get("payload") or {}
-                if payload.get("tool_call_id") == tool_call_id:
-                    end_event = event
-                    break
+        for event in trace.agent_events:
+            payload = event.get("payload") or {}
+            if event.get("event_type") == "tool_call_started" and payload.get("tool_call_id") == tool_call_id:
+                start_event = event
+            if event.get("event_type") in {"tool_call_finished", "tool_call_denied", "tool_call_invalid_args", "tool_call_unknown"} and payload.get("tool_call_id") == tool_call_id:
+                end_event = event
+                break
 
-        if start_event is None:
-            raise KeyError(tool_call_id)
+        return start_event, end_event
 
+    def _related_sys_events_for_tool(self, trace: TraceState, tool_call_id: str, start_event: dict[str, Any], end_event: dict[str, Any] | None) -> list[dict[str, Any]]:
         start_ts = float(start_event.get("ts") or 0)
         end_ts = float((end_event or {}).get("ts") or (start_ts + 5.0))
         if end_ts < start_ts:
             end_ts = start_ts + 5.0
 
         related: list[dict[str, Any]] = []
-        tool_ranges = self._tool_line_ranges(t)
+        tool_ranges = self._tool_line_ranges(trace)
         line_range = tool_ranges.get(tool_call_id)
 
         if line_range is not None:
             start_line, end_line = line_range
             related = [
                 e
-                for e in t.sys_events
+                for e in trace.sys_events
                 if int(e.get("line_no", 0)) >= start_line
                 and (end_line is None or int(e.get("line_no", 0)) <= end_line)
             ]
 
         if not related:
-            related = [e for e in t.sys_events if start_ts <= float(e.get("ts", 0)) <= (end_ts + 0.25)]
+            related = [e for e in trace.sys_events if start_ts <= float(e.get("ts", 0)) <= (end_ts + 0.25)]
+
+        return sorted(related, key=lambda x: int(x.get("line_no", 0)))
+
+    def tool_graph(self, trace_id: str, tool_call_id: str) -> dict[str, Any]:
+        t = self._get_trace(trace_id)
+
+        start_event, end_event = self._find_tool_events(t, tool_call_id)
+
+        if start_event is None:
+            raise KeyError(tool_call_id)
+
+        tool_ranges = self._tool_line_ranges(t)
+        line_range = tool_ranges.get(tool_call_id)
+        related = self._related_sys_events_for_tool(t, tool_call_id, start_event, end_event)
 
         nodes = [
             {
@@ -617,7 +660,7 @@ class TraceStore:
             edges.append({"source": "tool", "target": "no_data", "label": "info"})
             return {"nodes": nodes, "edges": edges, "events": []}
 
-        related_sorted = sorted(related, key=lambda x: int(x.get("line_no", 0)))
+        related_sorted = related
         command_events = [e for e in related_sorted if e.get("type") == "command_exec"]
 
         if not command_events:
@@ -866,6 +909,83 @@ class TraceStore:
 
         return {"nodes": nodes, "edges": edges, "events": events_out}
 
+    def trace_summary(self, trace_id: str) -> dict[str, Any]:
+        t = self._get_trace(trace_id)
+
+        file_agg: dict[str, dict[str, Any]] = {}
+        for event in t.sys_events:
+            event_type = str(event.get("type") or "")
+            if event_type not in {"file_read", "file_write", "file_delete", "file_rename", "command_exec"}:
+                continue
+
+            if event_type == "command_exec":
+                path = str(event.get("exec_path") or "")
+                if not self._is_user_visible_path(path):
+                    continue
+                op = "execute"
+            else:
+                path = str(event.get("path") or "")
+                if not self._is_user_visible_path(path):
+                    continue
+                op = event_type.replace("file_", "")
+
+            if not path:
+                continue
+
+            bucket = file_agg.setdefault(path, {"path": path, "ops": set(), "count": 0})
+            bucket["ops"].add(op)
+            bucket["count"] += 1
+
+        files = [{"path": v["path"], "ops": sorted(v["ops"]), "count": v["count"]} for v in file_agg.values()]
+        files.sort(key=lambda x: (-x["count"], x["path"]))
+
+        return {
+            "trace_id": trace_id,
+            "status": "completed" if t.complete else "active",
+            "files": files[:250],
+            "totals": {
+                "unique_files": len(files),
+                "events": len(t.sys_events),
+                "agent_events": len(t.agent_events),
+            },
+        }
+
+    def tool_summary(self, trace_id: str, tool_call_id: str) -> dict[str, Any]:
+        t = self._get_trace(trace_id)
+        start_event, end_event = self._find_tool_events(t, tool_call_id)
+        if start_event is None:
+            raise KeyError(tool_call_id)
+
+        related = self._related_sys_events_for_tool(t, tool_call_id, start_event, end_event)
+        file_agg: dict[str, dict[str, Any]] = {}
+        for event in related:
+            event_type = str(event.get("type") or "")
+            if event_type not in {"file_read", "file_write", "file_delete", "file_rename", "command_exec"}:
+                continue
+
+            if event_type == "command_exec":
+                path = str(event.get("exec_path") or "")
+                op = "execute"
+            else:
+                path = str(event.get("path") or "")
+                op = event_type.replace("file_", "")
+
+            if not self._is_user_visible_path(path):
+                continue
+
+            bucket = file_agg.setdefault(path, {"path": path, "ops": set(), "count": 0})
+            bucket["ops"].add(op)
+            bucket["count"] += 1
+
+        files = [{"path": v["path"], "ops": sorted(v["ops"]), "count": v["count"]} for v in file_agg.values()]
+        files.sort(key=lambda x: (-x["count"], x["path"]))
+
+        return {
+            "tool_call_id": tool_call_id,
+            "files": files,
+            "totals": {"unique_files": len(files), "events": len(related)},
+        }
+
 
 app = FastAPI(title="Agent System Observability Dashboard")
 
@@ -964,6 +1084,22 @@ def high_level_graph(trace_id: str) -> dict[str, Any]:
 def tool_graph(trace_id: str, tool_call_id: str) -> dict[str, Any]:
     try:
         return store.tool_graph(trace_id, tool_call_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Trace or tool call not found")
+
+
+@app.get("/api/traces/{trace_id}/summary")
+def trace_summary(trace_id: str) -> dict[str, Any]:
+    try:
+        return store.trace_summary(trace_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Trace not found")
+
+
+@app.get("/api/traces/{trace_id}/tool-summary/{tool_call_id}")
+def tool_summary(trace_id: str, tool_call_id: str) -> dict[str, Any]:
+    try:
+        return store.tool_summary(trace_id, tool_call_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Trace or tool call not found")
 
