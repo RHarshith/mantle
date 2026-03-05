@@ -65,8 +65,18 @@ class ChatCompletionCapture:
             help="Path to write captured API call JSONL",
         )
 
+    def _debug_log(self, msg: str):
+        """Write debug info to a sidecar log file."""
+        fpath = _get_capture_file()
+        debug_path = fpath.with_suffix(".debug.log")
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(debug_path, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+
     def request(self, flow: http.HTTPFlow):
         url = flow.request.pretty_url
+        self._debug_log(f"REQ  {flow.request.method} {url} (content-type: {flow.request.headers.get('content-type', 'N/A')}, len={len(flow.request.content or b'')})")
+
         if not _is_chat_completion(url):
             return
 
@@ -93,6 +103,10 @@ class ChatCompletionCapture:
 
     def response(self, flow: http.HTTPFlow):
         url = flow.request.pretty_url
+        content_type = flow.response.headers.get("content-type", "N/A") if flow.response else "N/A"
+        resp_len = len(flow.response.content or b'') if flow.response else 0
+        self._debug_log(f"RESP {flow.response.status_code if flow.response else '???'} {url} (content-type: {content_type}, len={resp_len})")
+
         if not _is_chat_completion(url):
             return
 
