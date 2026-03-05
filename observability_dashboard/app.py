@@ -47,6 +47,8 @@ class TraceState:
     strace_offset: int = 0
     strace_line_no: int = 0
     events_offset: int = 0
+    mitm_offset: int = 0
+    mitm_path: Path | None = None
     complete: bool = False
     root_pid: int | None = None
     strace_pending: dict[tuple[int, str], str] = field(default_factory=dict)
@@ -57,9 +59,10 @@ class TraceState:
 
 
 class TraceStore:
-    def __init__(self, trace_dir: Path, events_dir: Path):
+    def __init__(self, trace_dir: Path, events_dir: Path, mitm_dir: Path | None = None):
         self.trace_dir = trace_dir
         self.events_dir = events_dir
+        self.mitm_dir = mitm_dir
         self.traces: dict[str, TraceState] = {}
         self.version = 0
         self._lock = asyncio.Lock()
@@ -81,10 +84,12 @@ class TraceStore:
         for file_path in sorted(self.trace_dir.glob("*.log")):
             trace_id = file_path.name
             if trace_id not in self.traces:
+                mitm_path = self._find_mitm_file(trace_id) if self.mitm_dir else None
                 self.traces[trace_id] = TraceState(
                     trace_id=trace_id,
                     strace_path=file_path,
                     events_path_candidates=self._trace_to_event_candidates(file_path),
+                    mitm_path=mitm_path,
                 )
                 changed = True
 
@@ -92,6 +97,9 @@ class TraceStore:
             if state.strace_path.exists():
                 changed = self._tail_strace(state) or changed
             changed = self._tail_events(state) or changed
+            # If no native events found, try loading from mitmproxy capture
+            if not state.agent_events and state.mitm_path:
+                changed = self._tail_mitm_events(state) or changed
 
         if changed:
             async with self._lock:
@@ -136,6 +144,174 @@ class TraceStore:
             state.agent_events.append(event)
 
         state.events_offset = new_offset
+        return True
+
+    def _find_mitm_file(self, trace_id: str) -> Path | None:
+        """Find a matching .mitm.jsonl file for the given trace_id."""
+        if not self.mitm_dir or not self.mitm_dir.exists():
+            return None
+        stem = trace_id
+        no_ext = Path(trace_id).stem  # strip .log
+        candidates = [
+            self.mitm_dir / f"{stem}.mitm.jsonl",
+            self.mitm_dir / f"{no_ext}.mitm.jsonl",
+        ]
+        # Also strip .strace from e.g. trace_xxx.strace.log
+        if no_ext.endswith(".strace"):
+            candidates.append(self.mitm_dir / f"{no_ext[:-7]}.mitm.jsonl")
+        for cand in candidates:
+            if cand.exists():
+                return cand
+        return None
+
+    def _tail_mitm_events(self, state: TraceState) -> bool:
+        """Parse mitmproxy capture JSONL into agent_events format."""
+        if not state.mitm_path or not state.mitm_path.exists():
+            return False
+
+        lines, new_offset = self._read_new_lines(state.mitm_path, state.mitm_offset)
+        if not lines:
+            return False
+
+        seq = len(state.agent_events)
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            # We only care about 'response' records — they contain both
+            # request (in request_body) and response (in response_body)
+            if record.get("direction") != "response":
+                continue
+
+            req_body = record.get("request_body") or {}
+            resp_body = record.get("response_body") or {}
+            ts = record.get("ts", 0)
+            duration_ms = record.get("duration_ms")
+            model = record.get("model", "")
+
+            messages = req_body.get("messages", [])
+            choices = resp_body.get("choices", [])
+
+            # Extract the user prompt from request messages if this is the
+            # first call (seq == 0) — emit a user_prompt event
+            if seq == 0 and messages:
+                for msg in messages:
+                    if msg.get("role") == "user":
+                        seq += 1
+                        state.agent_events.append({
+                            "ts": ts,
+                            "seq": seq,
+                            "event_type": "user_prompt",
+                            "payload": {
+                                "content": msg.get("content", ""),
+                            },
+                            "_source": "mitm",
+                        })
+                        break
+
+            # Process the model's response choices
+            for choice in choices:
+                msg = choice.get("message") or {}
+                tool_calls = msg.get("tool_calls") or []
+
+                if tool_calls:
+                    # Emit tool_call events
+                    for tc in tool_calls:
+                        func = tc.get("function", {})
+                        tool_name = func.get("name", "unknown")
+                        tool_call_id = tc.get("id", f"mitm_tc_{seq}")
+                        args_raw = func.get("arguments", "{}")
+                        try:
+                            args = json.loads(args_raw)
+                        except json.JSONDecodeError:
+                            args = {"_raw": args_raw}
+
+                        seq += 1
+                        state.agent_events.append({
+                            "ts": ts,
+                            "seq": seq,
+                            "event_type": "tool_call_started",
+                            "payload": {
+                                "tool_call_id": tool_call_id,
+                                "tool_name": tool_name,
+                                "arguments": args,
+                            },
+                            "_source": "mitm",
+                        })
+
+                    # For mitmproxy, we don't see the tool execution result
+                    # directly — but we know the next request will contain it.
+                    # Emit a tool_call_finished from the next request's tool
+                    # result message if available.
+                    # We look at the NEXT response's request_body for tool msgs.
+                    # (This is handled naturally by the next iteration.)
+
+                    # Also check if the current request has tool result messages
+                    for msg_r in messages:
+                        if msg_r.get("role") == "tool":
+                            # This is a tool result from a previous call
+                            tool_content = msg_r.get("content", "")
+                            tool_call_id_r = msg_r.get("tool_call_id", "")
+                            try:
+                                result = json.loads(tool_content)
+                            except (json.JSONDecodeError, TypeError):
+                                result = {"output": tool_content}
+                            seq += 1
+                            state.agent_events.append({
+                                "ts": ts,
+                                "seq": seq,
+                                "event_type": "tool_call_finished",
+                                "payload": {
+                                    "tool_call_id": tool_call_id_r,
+                                    "tool_name": "unknown",
+                                    "duration_ms": duration_ms,
+                                    "result": result,
+                                },
+                                "_source": "mitm",
+                            })
+                elif msg.get("content"):
+                    # Pure text response — assistant_response
+                    # But first, emit any tool results from the request
+                    for msg_r in messages:
+                        if msg_r.get("role") == "tool":
+                            tool_content = msg_r.get("content", "")
+                            tool_call_id_r = msg_r.get("tool_call_id", "")
+                            try:
+                                result = json.loads(tool_content)
+                            except (json.JSONDecodeError, TypeError):
+                                result = {"output": tool_content}
+                            seq += 1
+                            state.agent_events.append({
+                                "ts": ts,
+                                "seq": seq,
+                                "event_type": "tool_call_finished",
+                                "payload": {
+                                    "tool_call_id": tool_call_id_r,
+                                    "tool_name": "unknown",
+                                    "duration_ms": duration_ms,
+                                    "result": result,
+                                },
+                                "_source": "mitm",
+                            })
+
+                    seq += 1
+                    state.agent_events.append({
+                        "ts": ts,
+                        "seq": seq,
+                        "event_type": "assistant_response",
+                        "payload": {
+                            "content": msg.get("content", ""),
+                            "model": model,
+                        },
+                        "_source": "mitm",
+                    })
+
+        state.mitm_offset = new_offset
         return True
 
     def _tail_strace(self, state: TraceState) -> bool:
@@ -1627,8 +1803,9 @@ def _resolve_paths() -> tuple[Path, Path]:
 
 
 WATCH_DIR, EVENTS_DIR = _resolve_paths()
+MITM_DIR = WATCH_DIR.parent / "mitm" if WATCH_DIR else None
 
-store = TraceStore(trace_dir=WATCH_DIR, events_dir=EVENTS_DIR)
+store = TraceStore(trace_dir=WATCH_DIR, events_dir=EVENTS_DIR, mitm_dir=MITM_DIR)
 
 STATIC_DIR = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

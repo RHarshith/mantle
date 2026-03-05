@@ -65,9 +65,11 @@ def log_event(verbose: bool, message: str) -> None:
         print(f"[agent] {message}")
 
 
-def prompt_user_approval(tool_name: str, tool_args: dict) -> bool:
+def prompt_user_approval(tool_name: str, tool_args: dict, auto_approve: bool = False) -> bool:
     """Ask the user to approve a tool call before execution.
     Returns True if approved, False if denied."""
+    if auto_approve:
+        return True
     print(f"\n{'='*60}")
     print(f"  TOOL CALL APPROVAL REQUIRED")
     print(f"{'='*60}")
@@ -272,6 +274,7 @@ def run_single_turn(
     shared_globals: dict,
     sink,
     verbose: bool = False,
+    auto_approve: bool = False,
 ) -> str:
     while True:
         log_event(verbose, f"sending request to model='{model}' with {len(messages)} messages")
@@ -340,7 +343,7 @@ def run_single_turn(
                     )
 
                     # Safety: require explicit user approval before execution
-                    if not prompt_user_approval(tool_name, tool_args):
+                    if not prompt_user_approval(tool_name, tool_args, auto_approve=auto_approve):
                         sink.emit(
                             "tool_call_denied",
                             {
@@ -422,6 +425,17 @@ def main() -> None:
         action="store_true",
         help="Show agent step logs (API calls, tool calls, and response flow).",
     )
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help="Auto-approve all tool calls (no manual approval prompts).",
+    )
+    parser.add_argument(
+        "--task",
+        type=str,
+        default=None,
+        help="Run agent in automated task mode: provide a task description and the agent loops until done.",
+    )
     args = parser.parse_args()
 
     api_key = os.getenv("OAK1")
@@ -437,9 +451,48 @@ def main() -> None:
     messages = []
     shared_globals = {"__builtins__": __builtins__}
     verbose = args.verbose or os.getenv("AGENT_VERBOSE", "").strip().lower() in {"1", "true", "yes", "on"}
+    auto_approve = args.auto or os.getenv("AGENT_AUTO_APPROVE", "").strip().lower() in {"1", "true", "yes", "on"}
 
     cli_prompt = " ".join(args.prompt).strip()
+    task_prompt = args.task
 
+    # ── Automated task mode ──────────────────────────────────────
+    if task_prompt:
+        log_event(verbose, "running automated task mode")
+        sink.emit(
+            "session_started",
+            {
+                "mode": "task",
+                "model": model,
+                "base_url": base_url,
+            },
+        )
+        sink.emit("user_prompt", {"content": task_prompt})
+        messages.append({"role": "user", "content": task_prompt})
+        max_turns = int(os.getenv("AGENT_MAX_TURNS", "20"))
+        for turn in range(max_turns):
+            log_event(verbose, f"task turn {turn + 1}/{max_turns}")
+            try:
+                assistant_output = run_single_turn(
+                    client, model, messages, shared_globals, sink,
+                    verbose=verbose, auto_approve=auto_approve,
+                )
+            except Exception as exc:
+                sink.emit("agent_error", {"error": str(exc)})
+                print(f"assistant> Request failed: {exc}")
+                break
+            sink.emit("assistant_response", {"content": assistant_output.strip()})
+            print(f"assistant> {assistant_output.strip()}")
+            # If the last response had no tool calls, agent is done
+            last_msg = messages[-1] if messages else {}
+            if last_msg.get("role") == "assistant" and not last_msg.get("tool_calls"):
+                log_event(verbose, "agent completed task (no more tool calls)")
+                break
+        sink.emit("session_ended", {"reason": "task_complete"})
+        sink.close()
+        return
+
+    # ── One-shot mode ────────────────────────────────────────────
     if cli_prompt:
         log_event(verbose, "running one-shot mode from CLI prompt")
         sink.emit(
@@ -453,7 +506,7 @@ def main() -> None:
         sink.emit("user_prompt", {"content": cli_prompt})
         messages.append({"role": "user", "content": cli_prompt})
         try:
-            assistant_output = run_single_turn(client, model, messages, shared_globals, sink, verbose=verbose)
+            assistant_output = run_single_turn(client, model, messages, shared_globals, sink, verbose=verbose, auto_approve=auto_approve)
         except Exception as exc:
             sink.emit("agent_error", {"error": str(exc)})
             print(f"assistant> Request failed: {exc}")
@@ -492,7 +545,7 @@ def main() -> None:
         messages.append({"role": "user", "content": user_prompt})
 
         try:
-            assistant_output = run_single_turn(client, model, messages, shared_globals, sink, verbose=verbose)
+            assistant_output = run_single_turn(client, model, messages, shared_globals, sink, verbose=verbose, auto_approve=auto_approve)
         except Exception as exc:
             sink.emit("agent_error", {"error": str(exc)})
             print(f"assistant> Request failed: {exc}")
