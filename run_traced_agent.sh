@@ -45,4 +45,7 @@ echo "Python: $PYTHON_BIN"
 export AGENT_TRACE_ID="$TRACE_ID"
 export AGENT_OBS_ROOT="$OBS_ROOT"
 
-strace -f -e trace=process,file -o "$TRACE_DIR/$TRACE_ID" "$PYTHON_BIN" simple_agent/cli_agent.py
+strace -f -e trace=process,file,network -o "$TRACE_DIR/$TRACE_ID" "$PYTHON_BIN" simple_agent/cli_agent.py
+
+
+strace -f -e trace=process,file,network -o "shared/simple_agent/traces/trace1.strace.log" codex

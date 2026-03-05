@@ -3,72 +3,274 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Agent Trace Dashboard</title>
-  <script src="https://unpkg.com/cytoscape@3.29.2/dist/cytoscape.min.js"></script>
+  <title>Agent Trace Observatory</title>
+  <script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
   <style>
-    * { box-sizing: border-box; }
-    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f7fb; color: #1b1f24; }
-    .layout { display: grid; grid-template-columns: 250px 1fr 340px; height: 100vh; }
-    .sidebar, .details { border-right: 1px solid #d0d7de; background: #fff; overflow: auto; }
-    .details { border-right: none; border-left: 1px solid #d0d7de; }
-    .main { display: grid; grid-template-rows: 48px 64px 1fr; }
-    .header { display: flex; align-items: center; justify-content: space-between; padding: 0 12px; border-bottom: 1px solid #d0d7de; background: #fff; }
-    .summary-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; padding: 8px 10px; border-bottom: 1px solid #d0d7de; background: #fff; }
-    .summary-card { background: #f8fafc; border: 1px solid #dbe4ee; border-radius: 8px; padding: 8px 10px; }
-    .summary-card .k { font-size: 11px; color: #64748b; }
-    .summary-card .v { font-size: 18px; font-weight: 700; }
-    .trace-item { padding: 10px 12px; border-bottom: 1px solid #eef1f4; cursor: pointer; }
-    .trace-item:hover { background: #f2f7ff; }
-    .trace-item.active { background: #dbeafe; }
-    .muted { color: #6b7280; font-size: 12px; }
-    #graph { width: 100%; height: 100%; }
-    .panel-title { margin: 0; padding: 12px; font-size: 14px; border-bottom: 1px solid #eef1f4; }
-    .details-body { padding: 12px; }
-    pre { white-space: pre-wrap; word-break: break-word; background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 8px; padding: 8px; font-size: 12px; }
-    button { border: 1px solid #d0d7de; background: #fff; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
-    .files-list { max-height: 45vh; overflow: auto; border: 1px solid #e5e7eb; border-radius: 8px; }
-    .file-row { padding: 8px; border-bottom: 1px solid #eef2f7; }
+    :root {
+      --bg: #f8fafc;
+      --surface: #ffffff;
+      --border: #e2e8f0;
+      --border-light: #f1f5f9;
+      --text-primary: #0f172a;
+      --text-secondary: #475569;
+      --text-muted: #94a3b8;
+      --blue-50: #eff6ff; --blue-100: #dbeafe; --blue-500: #3b82f6; --blue-600: #2563eb;
+      --amber-50: #fffbeb; --amber-100: #fef3c7; --amber-500: #f59e0b; --amber-600: #d97706;
+      --emerald-50: #ecfdf5; --emerald-100: #d1fae5; --emerald-500: #10b981; --emerald-600: #059669;
+      --orange-50: #fff7ed; --orange-100: #ffedd5; --orange-500: #f97316; --orange-600: #ea580c;
+      --cyan-50: #ecfeff; --cyan-100: #cffafe; --cyan-500: #06b6d4; --cyan-600: #0891b2;
+      --red-50: #fef2f2; --red-100: #fee2e2; --red-500: #ef4444; --red-600: #dc2626;
+      --slate-50: #f8fafc; --slate-100: #f1f5f9; --slate-200: #e2e8f0;
+      --slate-300: #cbd5e1; --slate-400: #94a3b8; --slate-500: #64748b;
+      --slate-700: #334155; --slate-900: #0f172a;
+      --shadow-sm: 0 1px 2px rgba(0,0,0,.05);
+      --shadow-md: 0 4px 6px -1px rgba(0,0,0,.07), 0 2px 4px -2px rgba(0,0,0,.05);
+      --shadow-lg: 0 10px 15px -3px rgba(0,0,0,.08), 0 4px 6px -4px rgba(0,0,0,.04);
+      --radius: 10px;
+      --radius-sm: 6px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", sans-serif; background: var(--bg); color: var(--text-primary); line-height: 1.5; }
+
+    /* === Layout === */
+    .layout { display: grid; grid-template-columns: 260px 1fr 360px; height: 100vh; }
+
+    /* === Left sidebar === */
+    .sidebar { background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
+    .sidebar-header { padding: 16px 16px 12px; border-bottom: 1px solid var(--border); }
+    .sidebar-header h2 { font-size: 15px; font-weight: 700; color: var(--text-primary); letter-spacing: -0.01em; }
+    .sidebar-header .subtitle { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+    #traceList { flex: 1; overflow-y: auto; }
+    .trace-item { padding: 12px 16px; border-bottom: 1px solid var(--border-light); cursor: pointer; transition: background .15s; }
+    .trace-item:hover { background: var(--slate-50); }
+    .trace-item.active { background: var(--blue-50); border-left: 3px solid var(--blue-500); }
+    .trace-item .trace-name { font-size: 13px; font-weight: 600; color: var(--text-primary); word-break: break-all; }
+    .trace-item .trace-meta { font-size: 11px; color: var(--text-muted); margin-top: 3px; }
+    .trace-item .trace-status { display: inline-block; padding: 1px 6px; border-radius: 10px; font-size: 10px; font-weight: 600; text-transform: uppercase; }
+    .trace-status.completed { background: var(--emerald-100); color: var(--emerald-600); }
+    .trace-status.active { background: var(--amber-100); color: var(--amber-600); }
+
+    /* === Main area === */
+    .main { display: flex; flex-direction: column; overflow: hidden; }
+    .header { display: flex; align-items: center; justify-content: space-between; padding: 0 16px; height: 48px; background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+    .breadcrumbs { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+    .breadcrumbs .crumb { color: var(--text-muted); cursor: pointer; transition: color .15s; }
+    .breadcrumbs .crumb:hover { color: var(--blue-500); }
+    .breadcrumbs .crumb.current { color: var(--text-primary); font-weight: 600; cursor: default; }
+    .breadcrumbs .sep { color: var(--slate-300); font-size: 11px; }
+    .controls { display: flex; align-items: center; gap: 6px; }
+    .btn { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--border); background: var(--surface); border-radius: var(--radius-sm); padding: 5px 10px; font-size: 12px; font-weight: 500; cursor: pointer; color: var(--text-secondary); transition: all .15s; }
+    .btn:hover { background: var(--slate-50); border-color: var(--slate-300); color: var(--text-primary); }
+    .btn-icon { padding: 5px 7px; font-size: 14px; }
+    .zoom-display { font-size: 11px; color: var(--text-muted); min-width: 36px; text-align: center; font-variant-numeric: tabular-nums; }
+
+    /* === Summary strip === */
+    .summary-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--surface); flex-shrink: 0; }
+    .summary-card { background: var(--slate-50); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; }
+    .summary-card .k { font-size: 11px; color: var(--text-muted); font-weight: 500; text-transform: uppercase; letter-spacing: 0.04em; }
+    .summary-card .v { font-size: 22px; font-weight: 700; color: var(--text-primary); margin-top: 2px; }
+
+    /* === Graph wrapper (scrollable) === */
+    .graph-wrapper { flex: 1; overflow: auto; background: var(--bg); position: relative; }
+    .graph-canvas { padding: 32px 24px 80px; transform-origin: top center; transition: transform .12s ease; }
+
+    /* === Timeline (high-level view) === */
+    .timeline { max-width: 700px; margin: 0 auto; }
+    .timeline-node { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow-sm); padding: 16px 20px; cursor: pointer; transition: all .18s; position: relative; border-left: 4px solid var(--slate-300); }
+    .timeline-node:hover { box-shadow: var(--shadow-md); transform: translateY(-1px); }
+    .timeline-node.selected { box-shadow: 0 0 0 2px var(--blue-500), var(--shadow-md); }
+    .timeline-node.kind-prompt { border-left-color: var(--blue-500); }
+    .timeline-node.kind-tool_step { border-left-color: var(--amber-500); }
+    .timeline-node.kind-assistant_response { border-left-color: var(--emerald-500); }
+    .timeline-node.kind-sys_command { border-left-color: var(--orange-500); }
+    .timeline-node.status-error { border-left-color: var(--red-500); }
+
+    .kind-sys_command .tnode-kind { background: var(--orange-50); color: var(--orange-600); }
+    .tnode-badges { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+    .tnode-badge { font-size: 10px; font-weight: 600; padding: 2px 8px; border-radius: 10px; }
+    .tnode-badge.files { background: var(--cyan-50); color: var(--cyan-600); }
+    .tnode-badge.net { background: var(--emerald-50); color: var(--emerald-600); }
+    .tnode-badge.pid { background: var(--slate-100); color: var(--slate-500); }
+    .strace-mode-banner { max-width: 700px; margin: 0 auto 16px; padding: 10px 16px; background: var(--orange-50); border: 1px solid var(--orange-100); border-radius: var(--radius); font-size: 12px; color: var(--orange-600); text-align: center; }
+
+    .tnode-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+    .tnode-step { font-size: 11px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .tnode-kind { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; }
+    .kind-prompt .tnode-kind { background: var(--blue-50); color: var(--blue-600); }
+    .kind-tool_step .tnode-kind { background: var(--amber-50); color: var(--amber-600); }
+    .kind-assistant_response .tnode-kind { background: var(--emerald-50); color: var(--emerald-600); }
+    .tnode-duration { font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+
+    .tnode-title { font-size: 15px; font-weight: 600; color: var(--text-primary); margin-bottom: 4px; }
+    .tnode-body { font-size: 13px; color: var(--text-secondary); line-height: 1.55; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; word-break: break-word; }
+    .tnode-body code { font-family: "SF Mono", "Fira Code", "Consolas", monospace; font-size: 12px; background: var(--slate-100); padding: 1px 5px; border-radius: 3px; }
+    .tnode-footer { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+    .status-badge { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; }
+    .status-badge.ok { background: var(--emerald-50); color: var(--emerald-600); }
+    .status-badge.error { background: var(--red-50); color: var(--red-600); }
+    .drilldown-hint { font-size: 11px; color: var(--text-muted); margin-left: auto; }
+    .drilldown-hint::after { content: " →"; }
+
+    .timeline-connector { display: flex; align-items: center; justify-content: center; height: 36px; position: relative; }
+    .timeline-connector::before { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; background: var(--slate-200); transform: translateX(-50%); }
+    .connector-arrow { width: 8px; height: 8px; border-right: 2px solid var(--slate-300); border-bottom: 2px solid var(--slate-300); transform: rotate(45deg); background: var(--bg); position: relative; z-index: 1; }
+
+    /* === DAG view (tool drilldown) === */
+    .dag-container { position: relative; margin: 0 auto; }
+    .dag-edges { position: absolute; top: 0; left: 0; pointer-events: none; overflow: visible; }
+    .dag-edge-path { fill: none; stroke: var(--slate-300); stroke-width: 2; }
+    .dag-edge-label { font-size: 11px; fill: var(--text-muted); text-anchor: middle; }
+    .dag-edge-label-bg { fill: var(--bg); }
+    .dag-arrowhead { fill: var(--slate-400); }
+
+    .dag-node { position: absolute; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow-sm); padding: 14px 18px; cursor: pointer; transition: all .18s; overflow: hidden; }
+    .dag-node:hover { box-shadow: var(--shadow-md); transform: translateY(-1px); z-index: 10; }
+    .dag-node.selected { box-shadow: 0 0 0 2px var(--blue-500), var(--shadow-md); z-index: 10; }
+    .dag-node.kind-tool_call { border-left: 4px solid var(--amber-500); }
+    .dag-node.kind-action { border-left: 4px solid var(--orange-500); }
+    .dag-node.kind-resource { border-left: 4px solid var(--cyan-500); }
+    .dag-node.kind-network { border-left: 4px solid var(--emerald-500); background: var(--emerald-50); }
+    .dag-node.kind-folder_group { border-left: 4px solid var(--blue-500); background: var(--blue-50); cursor: pointer; }
+    .dag-node.kind-placeholder { border-left: 4px solid var(--slate-400); background: var(--slate-50); }
+
+    .dag-node .dag-node-kind { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 4px; }
+    .kind-tool_call .dag-node-kind { color: var(--amber-600); }
+    .kind-action .dag-node-kind { color: var(--orange-600); }
+    .kind-resource .dag-node-kind { color: var(--cyan-600); }
+    .kind-network .dag-node-kind { color: var(--emerald-600); }
+    .kind-folder_group .dag-node-kind { color: var(--blue-600); }
+    .kind-placeholder .dag-node-kind { color: var(--slate-500); }
+
+    .dag-node .dag-node-label { font-size: 13px; font-weight: 600; color: var(--text-primary); word-break: break-word; line-height: 1.4; }
+    .dag-node.kind-resource .dag-node-label { font-family: "SF Mono", "Fira Code", "Consolas", monospace; font-size: 12px; font-weight: 500; }
+    .dag-node.kind-network .dag-node-label { font-family: "SF Mono", "Fira Code", "Consolas", monospace; font-size: 12px; font-weight: 500; }
+    .dag-node.kind-folder_group .dag-node-label { font-size: 12px; font-weight: 600; }
+    .dag-node.kind-folder_group .expand-hint { font-size: 10px; color: var(--blue-500); margin-top: 2px; }
+    .dag-node.kind-placeholder .dag-node-label { color: var(--text-muted); font-weight: 500; font-style: italic; }
+
+    /* === Right panel === */
+    .details-panel { background: var(--surface); border-left: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
+    .panel-section { border-bottom: 1px solid var(--border); }
+    .panel-section-header { padding: 12px 16px; font-size: 13px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; justify-content: space-between; }
+    .panel-section-body { padding: 0 16px 16px; }
+
+    /* File activity */
+    .file-filter { width: 100%; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 7px 10px; font-size: 12px; margin-bottom: 10px; outline: none; transition: border-color .15s; }
+    .file-filter:focus { border-color: var(--blue-500); }
+    .files-list { max-height: 50vh; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+    .files-list:empty::after { content: "No files to display"; display: block; padding: 16px; color: var(--text-muted); font-size: 12px; text-align: center; }
+    .file-row { padding: 10px 12px; border-bottom: 1px solid var(--border-light); transition: background .12s; }
     .file-row:last-child { border-bottom: none; }
-    .ops { font-size: 11px; color: #475569; }
+    .file-row:hover { background: var(--slate-50); }
+    .file-path { font-size: 12px; font-weight: 600; color: var(--text-primary); word-break: break-all; font-family: "SF Mono", "Fira Code", "Consolas", monospace; line-height: 1.4; }
+    .file-ops { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; align-items: center; }
+
+    /* Folder tree styles */
+    .folder-row { cursor: pointer; transition: background .12s; }
+    .folder-row:hover { background: var(--blue-50) !important; }
+    .folder-path { display: flex; align-items: center; gap: 5px; color: var(--text-primary); }
+    .folder-toggle { font-size: 9px; width: 14px; display: inline-flex; align-items: center; justify-content: center; color: var(--text-muted); user-select: none; flex-shrink: 0; transition: color .15s; }
+    .folder-row:hover .folder-toggle { color: var(--blue-500); }
+    .folder-icon { font-size: 13px; flex-shrink: 0; }
+    .folder-children { border-left: 1px solid var(--border-light); margin-left: 18px; }
+    .folder-wrapper { }
+    .grouped-files-row { background: var(--slate-50); }
+    .grouped-path { color: var(--text-muted); font-style: italic; display: flex; align-items: center; gap: 5px; }
+    .tree-root-prefix { background: var(--slate-50); border-bottom: 1px solid var(--border); }
+    .op-badge { font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 10px; text-transform: uppercase; letter-spacing: 0.03em; }
+    .op-badge.op-read { background: var(--blue-50); color: var(--blue-600); }
+    .op-badge.op-write { background: var(--amber-50); color: var(--amber-600); }
+    .op-badge.op-execute { background: var(--orange-50); color: var(--orange-600); }
+    .op-badge.op-delete { background: var(--red-50); color: var(--red-600); }
+    .op-badge.op-rename { background: var(--cyan-50); color: var(--cyan-600); }
+    .op-badge.op-connect { background: var(--emerald-50); color: var(--emerald-600); }
+    .op-badge.op-send { background: var(--orange-50); color: var(--orange-600); }
+    .op-badge.op-recv { background: var(--cyan-50); color: var(--cyan-600); }
+    .file-count { font-size: 10px; color: var(--text-muted); margin-left: 4px; }
+
+    /* Selection details */
+    .details-body { padding: 12px 16px; }
+    .details-body .detail-title { font-size: 14px; font-weight: 600; margin-bottom: 8px; word-break: break-word; }
+    .details-body pre { white-space: pre-wrap; word-break: break-word; background: var(--slate-50); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px; font-size: 11px; font-family: "SF Mono", "Fira Code", "Consolas", monospace; max-height: 40vh; overflow-y: auto; line-height: 1.5; }
+    .details-empty { color: var(--text-muted); font-size: 12px; padding: 16px; text-align: center; }
+
+    /* === Empty state === */
+    .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: var(--text-muted); text-align: center; padding: 40px; }
+    .empty-state h3 { font-size: 16px; color: var(--text-secondary); margin-bottom: 8px; }
+    .empty-state p { font-size: 13px; max-width: 360px; }
+
+    /* === Scrollbar === */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--slate-300); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--slate-400); }
+
+    /* === Utils === */
+    .muted { color: var(--text-muted); }
+    .file-scope-label { font-size: 11px; color: var(--text-muted); margin-bottom: 10px; }
   </style>
 </head>
 <body>
   <div class="layout">
+    <!-- Left Sidebar -->
     <aside class="sidebar">
-      <h3 class="panel-title">Trace IDs</h3>
+      <div class="sidebar-header">
+        <h2>Agent Traces</h2>
+        <div class="subtitle">System-call observability</div>
+      </div>
       <div id="traceList"></div>
     </aside>
 
+    <!-- Main Graph Area -->
     <section class="main">
       <div class="header">
-        <div>
-          <strong id="traceTitle">No trace selected</strong>
-          <span id="viewMode" class="muted" style="margin-left:8px;">High-level</span>
+        <div class="breadcrumbs" id="breadcrumbs">
+          <span class="crumb current">No trace selected</span>
         </div>
-        <div>
-          <button id="zoomOutBtn">−</button>
-          <button id="zoomInBtn">+</button>
-          <button id="fitBtn">Fit</button>
-          <button id="backBtn" style="display:none;">Back to high-level</button>
+        <div class="controls">
+          <button class="btn btn-icon" id="zoomOutBtn" title="Zoom out (Ctrl -)">−</button>
+          <span class="zoom-display" id="zoomDisplay">100%</span>
+          <button class="btn btn-icon" id="zoomInBtn" title="Zoom in (Ctrl +)">+</button>
+          <button class="btn" id="fitBtn">Reset</button>
         </div>
       </div>
       <div class="summary-strip" id="summaryStrip">
         <div class="summary-card"><div class="k">Prompts</div><div class="v" id="sumPrompts">0</div></div>
         <div class="summary-card"><div class="k">Tool Steps</div><div class="v" id="sumTools">0</div></div>
         <div class="summary-card"><div class="k">Responses</div><div class="v" id="sumResponses">0</div></div>
-        <div class="summary-card"><div class="k">Trace Status</div><div class="v" id="sumStatus">-</div></div>
+        <div class="summary-card"><div class="k">Status</div><div class="v" id="sumStatus">-</div></div>
       </div>
-      <div id="graph"></div>
+      <div class="graph-wrapper" id="graphWrapper">
+        <div class="graph-canvas" id="graphCanvas">
+          <div class="empty-state" id="emptyState">
+            <h3>No trace selected</h3>
+            <p>Select a trace from the sidebar, or run an agent with strace to begin capturing.</p>
+          </div>
+        </div>
+      </div>
     </section>
 
-    <aside class="details">
-      <h3 class="panel-title">File Activity Summary</h3>
-      <div class="details-body">
-        <div id="traceSummaryMeta" class="muted" style="margin-bottom:8px;">No trace selected.</div>
-        <div id="filesList" class="files-list"></div>
+    <!-- Right Details Panel -->
+    <aside class="details-panel">
+      <div class="panel-section">
+        <div class="panel-section-header">
+          <span>Files Affected</span>
+          <span class="muted" id="fileCountBadge"></span>
+        </div>
+        <div class="panel-section-body">
+          <div class="file-scope-label" id="fileScopeLabel">Select a trace to view file activity.</div>
+          <input type="text" class="file-filter" id="fileFilter" placeholder="Filter files..." style="display:none;" />
+          <div class="files-list" id="filesList"></div>
+        </div>
       </div>
-      <h3 class="panel-title">Selection Details</h3>
-      <div class="details-body" id="details">Select a node to inspect metadata.</div>
+      <div class="panel-section" style="flex:1; overflow:hidden; display:flex; flex-direction:column;">
+        <div class="panel-section-header">Selection Details</div>
+        <div style="flex:1; overflow-y:auto;">
+          <div class="details-body" id="details">
+            <div class="details-empty">Click a node to inspect its metadata.</div>
+          </div>
+        </div>
+      </div>
     </aside>
   </div>
   <script src="/static/app.js"></script>

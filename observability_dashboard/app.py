@@ -51,6 +51,7 @@ class TraceState:
     root_pid: int | None = None
     strace_pending: dict[tuple[int, str], str] = field(default_factory=dict)
     process_parent: dict[int, int] = field(default_factory=dict)
+    pid_fds: dict[tuple[int, int], dict[str, Any]] = field(default_factory=dict)  # (pid, fd) -> socket info
     sys_events: list[dict[str, Any]] = field(default_factory=list)
     agent_events: list[dict[str, Any]] = field(default_factory=list)
 
@@ -178,10 +179,18 @@ class TraceStore:
         if path.startswith("/home/"):
             return True
 
+        # macOS user directories
+        if path.startswith("/Users/"):
+            return True
+
         if not path.startswith("/"):
             return "/" in path or "." in path
 
         if "/workspace/" in path or "/simple_agent/" in path:
+            return True
+
+        # Catch-all for tmp and other workspace-like paths
+        if path.startswith("/tmp/"):
             return True
 
         return False
@@ -297,6 +306,104 @@ class TraceStore:
             )
             return True
 
+        # ── Network syscalls ──────────────────────────────────────
+        if syscall == "socket":
+            # socket(AF_INET, SOCK_STREAM, ...) = fd
+            fd_match = re.search(r"(\d+)\s*$", ret)
+            if fd_match and not ret.strip().startswith("-1"):
+                fd = int(fd_match.group(1))
+                family = "AF_INET" if "AF_INET" in args else ("AF_INET6" if "AF_INET6" in args else "other")
+                sock_type = "STREAM" if "SOCK_STREAM" in args else ("DGRAM" if "SOCK_DGRAM" in args else "other")
+                state.pid_fds[(pid, fd)] = {"family": family, "sock_type": sock_type}
+            return False  # don't emit event for socket() alone
+
+        if syscall == "connect":
+            if ret.strip().startswith("-1"):
+                return False
+            fd_match = re.match(r"(\d+)", args.strip())
+            fd = int(fd_match.group(1)) if fd_match else -1
+            # Extract address: sin_addr, sin6_addr, or sun_path
+            addr_match = re.search(r"sin6?_addr=inet_pton\([^,]+,\s*\"([^\"]+)\"\)", args)
+            if not addr_match:
+                addr_match = re.search(r"sin6?_addr=htons\(([^)]+)\)", args)
+            port_match = re.search(r"sin6?_port=htons\((\d+)\)", args)
+            addr = addr_match.group(1) if addr_match else "unknown"
+            port = port_match.group(1) if port_match else "?"
+            # Skip local/loopback unless it looks like an API call
+            if addr in ("127.0.0.1", "::1") and port not in ("80", "443", "8080", "8443"):
+                return False
+            dest = f"{addr}:{port}"
+            sock_info = state.pid_fds.get((pid, fd), {})
+            self._push_sys_event(
+                state,
+                {
+                    "type": "net_connect",
+                    "pid": pid,
+                    "dest": dest,
+                    "addr": addr,
+                    "port": port,
+                    "family": sock_info.get("family", "?"),
+                    "label": f"connect {dest}",
+                },
+            )
+            return True
+
+        if syscall in {"sendto", "sendmsg"}:
+            if ret.strip().startswith("-1"):
+                return False
+            fd_match = re.match(r"(\d+)", args.strip())
+            fd = int(fd_match.group(1)) if fd_match else -1
+            bytes_sent = 0
+            ret_bytes = re.match(r"(\d+)", ret.strip())
+            if ret_bytes:
+                bytes_sent = int(ret_bytes.group(1))
+            addr_match = re.search(r"sin6?_addr=inet_pton\([^,]+,\s*\"([^\"]+)\"\)", args)
+            port_match = re.search(r"sin6?_port=htons\((\d+)\)", args)
+            addr = addr_match.group(1) if addr_match else None
+            port = port_match.group(1) if port_match else None
+            dest = f"{addr}:{port}" if addr else "fd={fd}"
+            if addr and addr in ("127.0.0.1", "::1"):
+                return False
+            self._push_sys_event(
+                state,
+                {
+                    "type": "net_send",
+                    "pid": pid,
+                    "dest": dest,
+                    "bytes": bytes_sent,
+                    "label": f"send {bytes_sent}B -> {dest}",
+                },
+            )
+            return True
+
+        if syscall in {"recvfrom", "recvmsg"}:
+            if ret.strip().startswith("-1"):
+                return False
+            fd_match = re.match(r"(\d+)", args.strip())
+            fd = int(fd_match.group(1)) if fd_match else -1
+            bytes_recv = 0
+            ret_bytes = re.match(r"(\d+)", ret.strip())
+            if ret_bytes:
+                bytes_recv = int(ret_bytes.group(1))
+            addr_match = re.search(r"sin6?_addr=inet_pton\([^,]+,\s*\"([^\"]+)\"\)", args)
+            port_match = re.search(r"sin6?_port=htons\((\d+)\)", args)
+            addr = addr_match.group(1) if addr_match else None
+            port = port_match.group(1) if port_match else None
+            src = f"{addr}:{port}" if addr else "fd={fd}"
+            if addr and addr in ("127.0.0.1", "::1"):
+                return False
+            self._push_sys_event(
+                state,
+                {
+                    "type": "net_recv",
+                    "pid": pid,
+                    "dest": src,
+                    "bytes": bytes_recv,
+                    "label": f"recv {bytes_recv}B <- {src}",
+                },
+            )
+            return True
+
         return False
 
     def _ingest_strace_line(self, state: TraceState, line: str, line_no: int) -> bool:
@@ -360,6 +467,7 @@ class TraceStore:
                     "status": "completed" if t.complete else "active",
                     "sys_event_count": len(t.sys_events),
                     "agent_event_count": len(t.agent_events),
+                    "has_trajectory": len(t.agent_events) > 0,
                 }
             )
         return out
@@ -372,6 +480,10 @@ class TraceStore:
 
     def high_level_graph(self, trace_id: str) -> dict[str, Any]:
         t = self._get_trace(trace_id)
+
+        # ── Fallback: if no agent trajectory, build from strace ────────
+        if not t.agent_events and t.sys_events:
+            return self._strace_only_graph(t)
 
         nodes = []
         edges = []
@@ -455,6 +567,176 @@ class TraceStore:
         }
 
         return {"nodes": nodes, "edges": edges, "timeline": timeline, "summary": summary}
+
+    def _strace_only_graph(self, t: TraceState) -> dict[str, Any]:
+        """Build a high-level graph from sys_events when no agent trajectory is available."""
+        nodes: list[dict[str, Any]] = []
+        edges: list[dict[str, Any]] = []
+
+        # ── Gather command_exec events ─────────────────────────────────
+        command_events = [
+            e for e in t.sys_events if e.get("type") == "command_exec"
+        ]
+
+        # Filter to user-visible commands (skip runtime plumbing)
+        visible_commands: list[dict[str, Any]] = []
+        for cmd in command_events:
+            exec_path = str(cmd.get("exec_path") or "")
+            # Keep the command if it touches user-visible paths or is a
+            # recognisable tool (git, python, node, etc.)
+            base = Path(exec_path).name.lower() if exec_path else ""
+            if base in {
+                "sh", "bash", "zsh", "dash",
+                "python", "python3", "node", "git",
+                "cat", "ls", "grep", "find", "sed", "awk",
+                "cp", "mv", "rm", "mkdir", "touch", "chmod",
+                "curl", "wget",
+                "npm", "npx", "pip", "pip3",
+                "codex", "codex-linux-sandbox",
+            }:
+                visible_commands.append(cmd)
+            elif self._is_user_visible_path(exec_path):
+                visible_commands.append(cmd)
+
+        # If nothing matched the allowlist, fall back to all commands
+        if not visible_commands:
+            visible_commands = command_events
+
+        # ── Build per-command file & net aggregation ───────────────────
+        # Sort by line_no so we can attribute file/net events to commands
+        cmd_sorted = sorted(visible_commands, key=lambda e: int(e.get("line_no", 0)))
+        cmd_line_nos = [int(c.get("line_no", 0)) for c in cmd_sorted]
+
+        file_events = [
+            e for e in t.sys_events
+            if e.get("type") in {"file_read", "file_write", "file_delete", "file_rename"}
+            and isinstance(e.get("path"), str)
+            and self._is_user_visible_path(str(e.get("path")))
+        ]
+        net_events = [
+            e for e in t.sys_events
+            if e.get("type") in {"net_connect", "net_send", "net_recv"}
+        ]
+
+        def _find_owning_cmd_idx(line_no: int) -> int | None:
+            """Binary-search for the latest command at or before line_no."""
+            lo, hi = 0, len(cmd_line_nos) - 1
+            result = -1
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                if cmd_line_nos[mid] <= line_no:
+                    result = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            return result if result >= 0 else None
+
+        cmd_files: dict[int, list[str]] = defaultdict(list)
+        cmd_files_set: dict[int, set[str]] = defaultdict(set)
+        for fe in file_events:
+            idx = _find_owning_cmd_idx(int(fe.get("line_no", 0)))
+            if idx is not None:
+                path = str(fe.get("path"))
+                if path not in cmd_files_set[idx]:
+                    cmd_files_set[idx].add(path)
+                    cmd_files[idx].append(path)
+
+        cmd_net: dict[int, set[str]] = defaultdict(set)
+        for ne in net_events:
+            idx = _find_owning_cmd_idx(int(ne.get("line_no", 0)))
+            if idx is not None:
+                cmd_net[idx].add(str(ne.get("dest") or "unknown"))
+
+        # ── Collapse consecutive similar commands ──────────────────────
+        # e.g. many git rev-parse calls → single node
+        collapsed: list[dict[str, Any]] = []
+        MAX_NODES = 60
+
+        for i, cmd in enumerate(cmd_sorted):
+            label = self._short_command_label(cmd)
+            pid = int(cmd.get("pid", 0))
+            files_touched = cmd_files.get(i, [])
+            net_dests = sorted(cmd_net.get(i, set()))
+
+            # Try to merge with previous if same base command and no files/net
+            if collapsed and not files_touched and not net_dests:
+                prev = collapsed[-1]
+                if prev["_base_label"] == label and not prev.get("metadata", {}).get("files") and not prev.get("metadata", {}).get("network"):
+                    prev["_count"] += 1
+                    prev["label"] = f"{label} (×{prev['_count']})"
+                    continue
+
+            node_data = {
+                "_base_label": label,
+                "_count": 1,
+                "label": label,
+                "kind": "sys_command",
+                "metadata": {
+                    "pid": pid,
+                    "line_no": cmd.get("line_no"),
+                    "exec_path": cmd.get("exec_path"),
+                    "argv": cmd.get("argv", []),
+                    "command": cmd.get("command"),
+                    "files": files_touched[:20],
+                    "file_count": len(files_touched),
+                    "network": net_dests[:10],
+                    "net_count": len(net_dests),
+                },
+            }
+            collapsed.append(node_data)
+
+        # Trim to MAX_NODES, keeping first few and last few
+        if len(collapsed) > MAX_NODES:
+            head = collapsed[: MAX_NODES // 2]
+            tail = collapsed[-(MAX_NODES // 2):]
+            hidden = len(collapsed) - len(head) - len(tail)
+            collapsed = head + [{
+                "_base_label": "",
+                "_count": 0,
+                "label": f"… {hidden} commands hidden …",
+                "kind": "placeholder",
+                "metadata": {"hidden_commands": hidden},
+            }] + tail
+
+        # ── Emit nodes and edges ───────────────────────────────────────
+        prev_id: str | None = None
+        for i, item in enumerate(collapsed):
+            node_id = f"sys_{i}"
+            node = {
+                "id": node_id,
+                "label": item["label"],
+                "kind": item["kind"],
+                "metadata": item.get("metadata", {}),
+            }
+            nodes.append(node)
+
+            if prev_id is not None:
+                edges.append({"source": prev_id, "target": node_id, "label": "next"})
+            prev_id = node_id
+
+        # ── Collect unique files and network endpoints for summary ─────
+        all_files: set[str] = set()
+        all_net: set[str] = set()
+        for fe in file_events:
+            all_files.add(str(fe.get("path")))
+        for ne in net_events:
+            all_net.add(str(ne.get("dest") or "unknown"))
+
+        summary = {
+            "commands": len(visible_commands),
+            "files_touched": len(all_files),
+            "net_endpoints": len(all_net),
+            "strace_events": len(t.sys_events),
+            "trace_status": "completed" if t.complete else "active",
+        }
+
+        return {
+            "mode": "strace_only",
+            "nodes": nodes,
+            "edges": edges,
+            "timeline": nodes,
+            "summary": summary,
+        }
 
     def _tool_start_events(self, trace: TraceState) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -626,6 +908,214 @@ class TraceStore:
 
         return sorted(related, key=lambda x: int(x.get("line_no", 0)))
 
+    def _collapse_files_into_folders(
+        self,
+        file_items: list[dict[str, Any]],
+        source_ids: dict[str, set[str]],
+        start_index: int,
+        max_nodes: int = 8,
+    ) -> dict[str, Any]:
+        """Collapse file items into an OS-like folder hierarchy.
+
+        Simple algorithm like a file manager:
+        1.  Find the longest common prefix of all paths.
+        2.  Group by the *next* path segment after the common prefix.
+        3.  If a group has ≤ 2 items → emit individually.
+            Otherwise → emit a single folder_group node.
+        4.  If total emitted nodes > max_nodes, repeat at a higher
+            (shorter prefix) level until it fits.
+        5.  Children inside each folder_group are themselves grouped
+            the same way so the frontend can drill down recursively.
+
+        Returns {"nodes": [...], "edges": [...], "next_index": int}.
+        """
+
+        idx = start_index
+        nodes_out: list[dict[str, Any]] = []
+        edges_out: list[dict[str, Any]] = []
+
+        if not file_items:
+            return {"nodes": nodes_out, "edges": edges_out, "next_index": idx}
+
+        paths = [item["path"] for item in file_items]
+        item_by_path: dict[str, dict[str, Any]] = {it["path"]: it for it in file_items}
+
+        # ── Find longest common directory prefix ───────────────────
+        def _common_prefix(ps: list[str]) -> str:
+            if not ps:
+                return ""
+            parts0 = ps[0].split("/")
+            prefix_len = len(parts0)
+            for p in ps[1:]:
+                parts = p.split("/")
+                prefix_len = min(prefix_len, len(parts))
+                for i in range(prefix_len):
+                    if parts[i] != parts0[i]:
+                        prefix_len = i
+                        break
+            # We want directory prefix, not filename
+            # Remove the last segment if it's not shared by all
+            return "/".join(parts0[:prefix_len])
+
+        def _build_children(sub_paths: list[str], depth: int = 0) -> list[dict[str, Any]]:
+            """Recursively build hierarchical children list."""
+            if len(sub_paths) <= 3 or depth > 10:
+                # Leaf: return individual file entries
+                result = []
+                for p in sorted(sub_paths):
+                    it = item_by_path.get(p, {})
+                    result.append({
+                        "kind": "resource",
+                        "label": p,
+                        "path": p,
+                        "ops": sorted(t.replace("file_", "") for t in it.get("types", set())),
+                        "count": it.get("count", 1),
+                        "metadata": {"path": p},
+                    })
+                return result
+
+            # Group by next path segment
+            prefix = _common_prefix(sub_paths)
+            prefix_parts = prefix.split("/") if prefix else []
+            prefix_depth = len(prefix_parts) if prefix_parts != [""] else 0
+            groups: dict[str, list[str]] = defaultdict(list)
+            for p in sub_paths:
+                parts = p.split("/")
+                if len(parts) > prefix_depth + 1:
+                    key = "/".join(parts[: prefix_depth + 1])
+                else:
+                    # File is at or above this depth
+                    if prefix_depth > 0 and len(parts) > 1:
+                        key = "/".join(parts[:prefix_depth])
+                    else:
+                        key = "."
+                groups[key].append(p)
+
+            # If grouping didn't help (everything in one group), try deeper
+            if len(groups) <= 1 and depth < 10:
+                return _build_children(sub_paths, depth + 1)
+
+            children = []
+            for gkey in sorted(groups.keys()):
+                gpaths = groups[gkey]
+                if len(gpaths) == 1:
+                    p = gpaths[0]
+                    it = item_by_path.get(p, {})
+                    children.append({
+                        "kind": "resource",
+                        "label": p,
+                        "path": p,
+                        "ops": sorted(t.replace("file_", "") for t in it.get("types", set())),
+                        "count": it.get("count", 1),
+                        "metadata": {"path": p},
+                    })
+                else:
+                    display = gkey if len(gkey) <= 50 else ("…" + gkey[-45:])
+                    sub_children = _build_children(gpaths, depth + 1)
+                    children.append({
+                        "kind": "folder_group",
+                        "label": f"📁 {display}/ ({len(gpaths)} files)",
+                        "path": gkey,
+                        "metadata": {
+                            "folder": gkey,
+                            "file_count": len(gpaths),
+                            "children": sub_children,
+                        },
+                    })
+            return children
+
+        def _emit_groups(all_paths: list[str]) -> None:
+            """Group paths and emit nodes + edges."""
+            nonlocal idx
+
+            if len(all_paths) <= 3:
+                for p in sorted(all_paths):
+                    it = item_by_path.get(p, {})
+                    rid = f"res_{idx}"; idx += 1
+                    nodes_out.append({
+                        "id": rid, "label": p, "kind": "resource",
+                        "metadata": {"path": p},
+                    })
+                    types = sorted(it.get("types", set()))
+                    lbl = "/".join(t.replace("file_", "") for t in types)
+                    if it.get("count", 1) > 1:
+                        lbl += f" x{it['count']}"
+                    for src in source_ids.get(p, set()):
+                        edges_out.append({"source": src, "target": rid, "label": lbl})
+                return
+
+            # Build groups at increasing depth until we're under max_nodes
+            prefix = _common_prefix(all_paths)
+            prefix_parts = prefix.split("/") if prefix else []
+            prefix_depth = len(prefix_parts) if prefix_parts != [""] else 0
+
+            for level in range(12):
+                seg_depth = prefix_depth + level
+                groups: dict[str, list[str]] = defaultdict(list)
+                for p in all_paths:
+                    parts = p.split("/")
+                    if len(parts) > seg_depth + 1:
+                        # Has a directory component at this depth
+                        key = "/".join(parts[: seg_depth + 1])
+                    else:
+                        # File is at or above this depth — group under
+                        # parent dir, or "." if at root
+                        if seg_depth > 0 and len(parts) > 1:
+                            key = "/".join(parts[:seg_depth])
+                        else:
+                            key = "."
+                    groups[key].append(p)
+
+                if len(groups) <= max_nodes or level >= 11:
+                    break
+
+            # Emit one node per group
+            all_src: set[str] = set()
+            for p in all_paths:
+                all_src |= source_ids.get(p, set())
+
+            for gkey in sorted(groups.keys()):
+                gpaths = groups[gkey]
+                if len(gpaths) == 1:
+                    p = gpaths[0]
+                    it = item_by_path.get(p, {})
+                    rid = f"res_{idx}"; idx += 1
+                    nodes_out.append({
+                        "id": rid, "label": p, "kind": "resource",
+                        "metadata": {"path": p},
+                    })
+                    for src in source_ids.get(p, set()) or all_src:
+                        edges_out.append({"source": src, "target": rid, "label": ""})
+                else:
+                    display = gkey if len(gkey) <= 50 else ("…" + gkey[-45:])
+                    sub_children = _build_children(gpaths)
+                    fid = f"folder_{idx}"; idx += 1
+                    nodes_out.append({
+                        "id": fid,
+                        "label": f"📁 {display}/ ({len(gpaths)} files)",
+                        "kind": "folder_group",
+                        "metadata": {
+                            "folder": gkey,
+                            "file_count": len(gpaths),
+                            "children": sub_children,
+                        },
+                    })
+                    # Connect from all source commands
+                    grp_srcs: set[str] = set()
+                    for p in gpaths:
+                        grp_srcs |= source_ids.get(p, set())
+                    if not grp_srcs:
+                        grp_srcs = all_src
+                    for src in grp_srcs:
+                        edges_out.append({
+                            "source": src,
+                            "target": fid,
+                            "label": f"{len(gpaths)} files",
+                        })
+
+        _emit_groups(paths)
+        return {"nodes": nodes_out, "edges": edges_out, "next_index": idx}
+
     def tool_graph(self, trace_id: str, tool_call_id: str) -> dict[str, Any]:
         t = self._get_trace(trace_id)
 
@@ -744,6 +1234,13 @@ class TraceStore:
             and self._is_user_visible_path(str(e.get("path")))
         ]
 
+        # Collect network events
+        net_events = [
+            e
+            for e in related_sorted
+            if e.get("type") in {"net_connect", "net_send", "net_recv"}
+        ]
+
         resource_nodes: dict[str, str] = {}
         resource_index = 0
 
@@ -799,6 +1296,31 @@ class TraceStore:
 
         command_ids_with_files = {b["cmd_id"] for b in file_agg.values()}
 
+        # Aggregate network events per command
+        net_agg: dict[tuple[str, str], dict[str, Any]] = {}
+        for ne in net_events:
+            cmd_id = match_command_for_event(ne)
+            if cmd_id is None:
+                continue
+            dest = str(ne.get("dest") or "unknown")
+            key = (cmd_id, dest)
+            bucket = net_agg.setdefault(
+                key,
+                {
+                    "cmd_id": cmd_id,
+                    "dest": dest,
+                    "types": set(),
+                    "bytes_total": 0,
+                    "count": 0,
+                },
+            )
+            bucket["types"].add(str(ne.get("type")))
+            bucket["bytes_total"] += int(ne.get("bytes", 0))
+            bucket["count"] += 1
+
+        command_ids_with_net = {b["cmd_id"] for b in net_agg.values()}
+        command_ids_with_resources = command_ids_with_files | command_ids_with_net
+
         tool_payload = start_event.get("payload") or {}
         tool_cmd_text = ""
         if (tool_payload.get("tool_name") or "") == "command_exec":
@@ -809,7 +1331,7 @@ class TraceStore:
             cmd_id = node["id"]
             if idx == 0:
                 return True
-            if cmd_id in command_ids_with_files:
+            if cmd_id in command_ids_with_resources:
                 return True
 
             meta = node.get("metadata") or {}
@@ -861,29 +1383,53 @@ class TraceStore:
                 edges.append({"source": prev_cmd_id, "target": nid, "label": "next"})
             prev_cmd_id = nid
 
+        # ── Collapse file nodes into folder hierarchy ─────────────────
+        # Gather all file buckets across all visible commands,
+        # then collapse them in one pass like an OS folder tree.
+        all_file_items: list[dict[str, Any]] = []
+        file_source_ids: dict[str, set[str]] = defaultdict(set)  # path → set of cmd_ids
         for bucket in sorted(file_agg.values(), key=lambda b: (b["line_min"], b["path"])):
-            path = bucket["path"]
             if bucket["cmd_id"] not in visible_command_ids:
                 continue
-            if path not in resource_nodes:
-                res_id = f"res_{resource_index}"
-                resource_index += 1
-                resource_nodes[path] = res_id
-                nodes.append(
-                    {
-                        "id": res_id,
-                        "label": path,
-                        "kind": "resource",
-                        "metadata": {"path": path},
-                    }
-                )
+            all_file_items.append(bucket)
+            file_source_ids[bucket["path"]].add(bucket["cmd_id"])
 
+        collapsed = self._collapse_files_into_folders(
+            all_file_items, file_source_ids, resource_index, max_nodes=8,
+        )
+        nodes.extend(collapsed["nodes"])
+        edges.extend(collapsed["edges"])
+        resource_index = collapsed["next_index"]
+
+        # ── Network resource nodes ─────────────────────────────────────
+        net_node_ids: dict[str, str] = {}
+        net_index = 0
+        for bucket in sorted(net_agg.values(), key=lambda b: b["dest"]):
+            if bucket["cmd_id"] not in visible_command_ids:
+                continue
+            dest = bucket["dest"]
+            if dest not in net_node_ids:
+                nid = f"net_{net_index}"
+                net_index += 1
+                net_node_ids[dest] = nid
+                nodes.append({
+                    "id": nid,
+                    "label": dest,
+                    "kind": "network",
+                    "metadata": {"dest": dest},
+                })
             types = sorted(bucket["types"])
-            label = "/".join(t.replace("file_", "") for t in types)
+            label = "/".join(t.replace("net_", "") for t in types)
+            if bucket["bytes_total"] > 0:
+                if bucket["bytes_total"] > 1024 * 1024:
+                    label += f" {bucket['bytes_total'] / (1024*1024):.1f}MB"
+                elif bucket["bytes_total"] > 1024:
+                    label += f" {bucket['bytes_total'] / 1024:.1f}KB"
+                else:
+                    label += f" {bucket['bytes_total']}B"
             if bucket["count"] > 1:
                 label += f" x{bucket['count']}"
-
-            edges.append({"source": bucket["cmd_id"], "target": resource_nodes[path], "label": label})
+            edges.append({"source": bucket["cmd_id"], "target": net_node_ids[dest], "label": label})
 
         if command_overflow > 0 and prev_cmd_id is not None:
             nodes.append(
@@ -939,12 +1485,31 @@ class TraceStore:
         files = [{"path": v["path"], "ops": sorted(v["ops"]), "count": v["count"]} for v in file_agg.values()]
         files.sort(key=lambda x: (-x["count"], x["path"]))
 
+        # Collect network endpoints
+        net_agg: dict[str, dict[str, Any]] = {}
+        for event in t.sys_events:
+            event_type = str(event.get("type") or "")
+            if event_type not in {"net_connect", "net_send", "net_recv"}:
+                continue
+            dest = str(event.get("dest") or "unknown")
+            bucket = net_agg.setdefault(dest, {"dest": dest, "ops": set(), "bytes": 0, "count": 0})
+            bucket["ops"].add(event_type.replace("net_", ""))
+            bucket["bytes"] += int(event.get("bytes", 0))
+            bucket["count"] += 1
+        net_endpoints = [
+            {"dest": v["dest"], "ops": sorted(v["ops"]), "bytes": v["bytes"], "count": v["count"]}
+            for v in net_agg.values()
+        ]
+        net_endpoints.sort(key=lambda x: (-x["count"], x["dest"]))
+
         return {
             "trace_id": trace_id,
             "status": "completed" if t.complete else "active",
             "files": files[:250],
+            "network": net_endpoints[:100],
             "totals": {
                 "unique_files": len(files),
+                "network_endpoints": len(net_endpoints),
                 "events": len(t.sys_events),
                 "agent_events": len(t.agent_events),
             },
@@ -957,6 +1522,17 @@ class TraceStore:
             raise KeyError(tool_call_id)
 
         related = self._related_sys_events_for_tool(t, tool_call_id, start_event, end_event)
+
+        # If line-range / timestamp correlation found no events, try a wider
+        # window as a last resort (±10s around the start timestamp).
+        if not related:
+            start_ts = float(start_event.get("ts") or 0)
+            end_ts = float((end_event or {}).get("ts") or (start_ts + 10.0))
+            related = [
+                e for e in t.sys_events
+                if start_ts - 1.0 <= float(e.get("ts", 0)) <= end_ts + 2.0
+            ]
+
         file_agg: dict[str, dict[str, Any]] = {}
         for event in related:
             event_type = str(event.get("type") or "")
@@ -980,10 +1556,28 @@ class TraceStore:
         files = [{"path": v["path"], "ops": sorted(v["ops"]), "count": v["count"]} for v in file_agg.values()]
         files.sort(key=lambda x: (-x["count"], x["path"]))
 
+        # Network endpoints for this tool
+        net_agg: dict[str, dict[str, Any]] = {}
+        for event in related:
+            event_type = str(event.get("type") or "")
+            if event_type not in {"net_connect", "net_send", "net_recv"}:
+                continue
+            dest = str(event.get("dest") or "unknown")
+            bucket = net_agg.setdefault(dest, {"dest": dest, "ops": set(), "bytes": 0, "count": 0})
+            bucket["ops"].add(event_type.replace("net_", ""))
+            bucket["bytes"] += int(event.get("bytes", 0))
+            bucket["count"] += 1
+        net_endpoints = [
+            {"dest": v["dest"], "ops": sorted(v["ops"]), "bytes": v["bytes"], "count": v["count"]}
+            for v in net_agg.values()
+        ]
+        net_endpoints.sort(key=lambda x: (-x["count"], x["dest"]))
+
         return {
             "tool_call_id": tool_call_id,
             "files": files,
-            "totals": {"unique_files": len(files), "events": len(related)},
+            "network": net_endpoints,
+            "totals": {"unique_files": len(files), "network_endpoints": len(net_endpoints), "events": len(related)},
         }
 
 
