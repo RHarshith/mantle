@@ -29,6 +29,7 @@ _CAPTURE_PATTERNS = [
     "/chat/completions",
     "/v1/chat/completions",
     "/api/chat/completions",
+    "/v1/responses",
 ]
 
 # Track in-flight requests for timing
