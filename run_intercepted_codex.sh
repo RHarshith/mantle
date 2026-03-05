@@ -7,6 +7,8 @@
 # through mitmproxy — works even for binaries that ignore proxy
 # env vars (e.g. statically-linked Rust binaries).
 #
+# Requires: root, iptables, mitmproxy, mitmproxyuser system account
+#
 # Usage:
 #   ./run_intercepted_codex.sh "List files in the home directory"
 #   ./run_intercepted_codex.sh                    # interactive (no task)
@@ -20,6 +22,7 @@ TRACE_ID=""
 MITM_PORT=8899
 AGENT_BIN="codex"
 TASK=""
+MITM_USER="mitmproxyuser"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -49,6 +52,12 @@ MITMDUMP="$(command -v mitmdump 2>/dev/null || echo "$HOME/.local/bin/mitmdump")
 
 command -v "$AGENT_BIN" >/dev/null 2>&1 || { echo "Error: '$AGENT_BIN' not found in PATH" >&2; exit 1; }
 
+# Ensure mitmproxyuser exists
+if ! id "$MITM_USER" >/dev/null 2>&1; then
+    useradd -r -s /bin/false "$MITM_USER"
+    echo "[*] Created system user: $MITM_USER"
+fi
+
 echo "═══════════════════════════════════════════════════════════"
 echo "  Intercepted External Agent"
 echo "═══════════════════════════════════════════════════════════"
@@ -61,27 +70,47 @@ echo "  Strace:      $USE_STRACE"
 $USE_STRACE && echo "  Strace file: $STRACE_FILE"
 echo "═══════════════════════════════════════════════════════════"
 
-# Start mitmdump in TRANSPARENT mode (WireGuard/iptables redirect)
+# Make capture directory writable by mitmproxyuser
+chmod 777 "$OBS_ROOT/mitm"
+# Copy CA cert so mitmproxyuser can read it
+MITM_USER_HOME="$(eval echo ~$MITM_USER)"
+mkdir -p "$MITM_USER_HOME/.mitmproxy"
+cp "$MITM_CA" "$MITM_USER_HOME/.mitmproxy/"
+cp "${MITM_CA%.pem}-ca.pem" "$MITM_USER_HOME/.mitmproxy/" 2>/dev/null || true
+cp "$HOME/.mitmproxy/mitmproxy-ca.pem" "$MITM_USER_HOME/.mitmproxy/" 2>/dev/null || true
+cp "$HOME/.mitmproxy/mitmproxy-ca-cert.cer" "$MITM_USER_HOME/.mitmproxy/" 2>/dev/null || true
+# Copy the full mitmproxy config directory for key material
+cp -r "$HOME/.mitmproxy/"* "$MITM_USER_HOME/.mitmproxy/" 2>/dev/null || true
+chown -R "$MITM_USER":"$MITM_USER" "$MITM_USER_HOME/.mitmproxy"
+
+# Start mitmdump in TRANSPARENT mode, running as mitmproxyuser
+# This way its outbound connections are NOT caught by the iptables rule
 export MITM_CAPTURE_FILE="$MITM_JSONL"
-"$MITMDUMP" \
-    --mode transparent \
-    -p "$MITM_PORT" \
-    --ssl-insecure \
-    --set connection_strategy=lazy \
-    -s "$SCRIPT_DIR/mitm_capture.py" \
-    --set capture_file="$MITM_JSONL" \
-    -q &
+sudo -u "$MITM_USER" \
+    MITM_CAPTURE_FILE="$MITM_JSONL" \
+    HOME="$MITM_USER_HOME" \
+    "$MITMDUMP" \
+        --mode transparent \
+        -p "$MITM_PORT" \
+        --ssl-insecure \
+        --set connection_strategy=lazy \
+        -s "$SCRIPT_DIR/mitm_capture.py" \
+        --set capture_file="$MITM_JSONL" \
+        -q &
 MITM_PID=$!
 sleep 2
 kill -0 "$MITM_PID" 2>/dev/null || { echo "Error: mitmdump failed to start" >&2; exit 1; }
-echo "[*] mitmdump started in transparent mode (PID $MITM_PID)"
+echo "[*] mitmdump started as $MITM_USER (PID $MITM_PID)"
 
-# Set up iptables to redirect port 443 traffic to mitmproxy
+# Set up iptables to redirect port 443 traffic to mitmproxy,
+# EXCLUDING traffic from mitmproxyuser (to avoid redirect loop)
 IPTABLES_SETUP=false
 if command -v iptables >/dev/null 2>&1; then
-    iptables -t nat -A OUTPUT -p tcp --dport 443 -j REDIRECT --to-port "$MITM_PORT" 2>/dev/null && IPTABLES_SETUP=true
+    iptables -t nat -A OUTPUT -p tcp --dport 443 \
+        -m owner ! --uid-owner "$MITM_USER" \
+        -j REDIRECT --to-port "$MITM_PORT" 2>/dev/null && IPTABLES_SETUP=true
     if $IPTABLES_SETUP; then
-        echo "[*] iptables redirect: port 443 → $MITM_PORT"
+        echo "[*] iptables redirect: port 443 → $MITM_PORT (excluding $MITM_USER)"
     else
         echo "[!] iptables redirect failed (need root?), falling back to env vars"
     fi
@@ -103,7 +132,9 @@ cleanup() {
     echo ""
     # Remove iptables rule first
     if $IPTABLES_SETUP; then
-        iptables -t nat -D OUTPUT -p tcp --dport 443 -j REDIRECT --to-port "$MITM_PORT" 2>/dev/null || true
+        iptables -t nat -D OUTPUT -p tcp --dport 443 \
+            -m owner ! --uid-owner "$MITM_USER" \
+            -j REDIRECT --to-port "$MITM_PORT" 2>/dev/null || true
         echo "[*] iptables redirect removed"
     fi
     echo "[*] Stopping mitmdump (PID $MITM_PID)..."
