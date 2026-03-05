@@ -5,8 +5,8 @@
 #
 # Usage:
 #   ./run_intercepted_codex.sh "List files in the home directory"
+#   ./run_intercepted_codex.sh                    # interactive (no task)
 #   ./run_intercepted_codex.sh --no-strace "Explain this repo"
-#   ./run_intercepted_codex.sh --trace-id my_trace "Do something"
 #   ./run_intercepted_codex.sh --agent "aider" "Fix the bug"
 # ─────────────────────────────────────────────────────────────────
 set -euo pipefail
@@ -24,25 +24,9 @@ while [[ $# -gt 0 ]]; do
         --port)        MITM_PORT="$2"; shift 2 ;;
         --agent)       AGENT_BIN="$2"; shift 2 ;;
         -*)            echo "Unknown flag: $1" >&2; exit 1 ;;
-        *)             TASK="$*"; break ;;
+        *)             TASK="$1"; shift; break ;;
     esac
 done
-
-if [ -z "$TASK" ]; then
-    echo "Usage: $0 [OPTIONS] <task description>" >&2
-    echo ""
-    echo "Options:"
-    echo "  --no-strace       Skip strace (only intercept API calls)"
-    echo "  --trace-id ID     Custom trace ID (default: auto-generated)"
-    echo "  --port PORT       mitmproxy port (default: 8899)"
-    echo "  --agent CMD       Agent command to run (default: codex)"
-    echo ""
-    echo "Examples:"
-    echo "  $0 \"List files in the home directory\""
-    echo "  $0 --agent aider \"Fix the bug in main.py\""
-    echo "  $0 --no-strace \"Explain this repository\""
-    exit 1
-fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OBS_ROOT="${AGENT_OBS_ROOT:-$SCRIPT_DIR/obs}"
@@ -65,7 +49,7 @@ echo "════════════════════════�
 echo "  Intercepted External Agent"
 echo "═══════════════════════════════════════════════════════════"
 echo "  Agent:       $AGENT_BIN"
-echo "  Task:        $TASK"
+echo "  Task:        ${TASK:-<interactive>}"
 echo "  Trace ID:    $TRACE_ID"
 echo "  MITM proxy:  localhost:$MITM_PORT"
 echo "  MITM log:    $MITM_JSONL"
@@ -102,14 +86,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Build the agent command args
+AGENT_ARGS=()
+[ -n "$TASK" ] && AGENT_ARGS+=("$TASK")
+
 if $USE_STRACE; then
     echo "[*] Running $AGENT_BIN with strace..."
-    strace -f -e trace=process,file,network -o "$STRACE_FILE" $AGENT_BIN $TASK
+    strace -f -e trace=process,file,network -o "$STRACE_FILE" "$AGENT_BIN" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"
 else
     echo "[*] Running $AGENT_BIN..."
-    # Create an empty strace file so the dashboard can discover the trace
     touch "$STRACE_FILE"
-    $AGENT_BIN $TASK
+    "$AGENT_BIN" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"
 fi
 
 echo "[*] $AGENT_BIN finished."
