@@ -67,9 +67,13 @@ sleep 2
 kill -0 "$MITM_PID" 2>/dev/null || { echo "Error: mitmdump failed to start" >&2; exit 1; }
 echo "[*] mitmdump started (PID $MITM_PID)"
 
-# Proxy + TLS env vars (works for Python, Node.js, Go, curl, etc.)
+# Proxy + TLS env vars
+# IMPORTANT: Rust's reqwest uses LOWERCASE env vars, Node.js uses UPPERCASE.
+# We export both to cover all runtimes (Python, Node.js, Rust, Go, curl).
 export HTTPS_PROXY="http://127.0.0.1:$MITM_PORT"
 export HTTP_PROXY="http://127.0.0.1:$MITM_PORT"
+export https_proxy="http://127.0.0.1:$MITM_PORT"
+export http_proxy="http://127.0.0.1:$MITM_PORT"
 export SSL_CERT_FILE="$MITM_CA"
 export REQUESTS_CA_BUNDLE="$MITM_CA"
 export NODE_EXTRA_CA_CERTS="$MITM_CA"

@@ -133,8 +133,11 @@ fi
 echo "[*] mitmdump started (PID $MITM_PID)"
 
 # Set up environment for the agent
+# Both uppercase (Python/Node.js/curl) and lowercase (Rust/reqwest)
 export HTTPS_PROXY="http://127.0.0.1:$MITM_PORT"
 export HTTP_PROXY="http://127.0.0.1:$MITM_PORT"
+export https_proxy="http://127.0.0.1:$MITM_PORT"
+export http_proxy="http://127.0.0.1:$MITM_PORT"
 export SSL_CERT_FILE="$MITM_CA"
 export REQUESTS_CA_BUNDLE="$MITM_CA"
 export NODE_EXTRA_CA_CERTS="$MITM_CA"
