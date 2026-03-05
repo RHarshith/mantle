@@ -3,6 +3,10 @@
 # Run codex (or any external agent) with mitmproxy API interception
 # and optional strace syscall tracing.
 #
+# Uses iptables transparent redirect to force ALL HTTPS traffic
+# through mitmproxy — works even for binaries that ignore proxy
+# env vars (e.g. statically-linked Rust binaries).
+#
 # Usage:
 #   ./run_intercepted_codex.sh "List files in the home directory"
 #   ./run_intercepted_codex.sh                    # interactive (no task)
@@ -51,25 +55,41 @@ echo "════════════════════════�
 echo "  Agent:       $AGENT_BIN"
 echo "  Task:        ${TASK:-<interactive>}"
 echo "  Trace ID:    $TRACE_ID"
-echo "  MITM proxy:  localhost:$MITM_PORT"
+echo "  MITM proxy:  localhost:$MITM_PORT (transparent mode)"
 echo "  MITM log:    $MITM_JSONL"
 echo "  Strace:      $USE_STRACE"
 $USE_STRACE && echo "  Strace file: $STRACE_FILE"
 echo "═══════════════════════════════════════════════════════════"
 
-# Start mitmdump
+# Start mitmdump in TRANSPARENT mode (WireGuard/iptables redirect)
 export MITM_CAPTURE_FILE="$MITM_JSONL"
-"$MITMDUMP" -p "$MITM_PORT" --ssl-insecure \
+"$MITMDUMP" \
+    --mode transparent \
+    -p "$MITM_PORT" \
+    --ssl-insecure \
+    --set connection_strategy=lazy \
     -s "$SCRIPT_DIR/mitm_capture.py" \
-    --set capture_file="$MITM_JSONL" -q &
+    --set capture_file="$MITM_JSONL" \
+    -q &
 MITM_PID=$!
 sleep 2
 kill -0 "$MITM_PID" 2>/dev/null || { echo "Error: mitmdump failed to start" >&2; exit 1; }
-echo "[*] mitmdump started (PID $MITM_PID)"
+echo "[*] mitmdump started in transparent mode (PID $MITM_PID)"
 
-# Proxy + TLS env vars
-# IMPORTANT: Rust's reqwest uses LOWERCASE env vars, Node.js uses UPPERCASE.
-# We export both to cover all runtimes (Python, Node.js, Rust, Go, curl).
+# Set up iptables to redirect port 443 traffic to mitmproxy
+IPTABLES_SETUP=false
+if command -v iptables >/dev/null 2>&1; then
+    iptables -t nat -A OUTPUT -p tcp --dport 443 -j REDIRECT --to-port "$MITM_PORT" 2>/dev/null && IPTABLES_SETUP=true
+    if $IPTABLES_SETUP; then
+        echo "[*] iptables redirect: port 443 → $MITM_PORT"
+    else
+        echo "[!] iptables redirect failed (need root?), falling back to env vars"
+    fi
+else
+    echo "[!] iptables not available, falling back to env vars"
+fi
+
+# Also set proxy env vars as fallback (for agents that DO respect them)
 export HTTPS_PROXY="http://127.0.0.1:$MITM_PORT"
 export HTTP_PROXY="http://127.0.0.1:$MITM_PORT"
 export https_proxy="http://127.0.0.1:$MITM_PORT"
@@ -81,6 +101,11 @@ export NODE_TLS_REJECT_UNAUTHORIZED=0
 
 cleanup() {
     echo ""
+    # Remove iptables rule first
+    if $IPTABLES_SETUP; then
+        iptables -t nat -D OUTPUT -p tcp --dport 443 -j REDIRECT --to-port "$MITM_PORT" 2>/dev/null || true
+        echo "[*] iptables redirect removed"
+    fi
     echo "[*] Stopping mitmdump (PID $MITM_PID)..."
     kill "$MITM_PID" 2>/dev/null || true
     wait "$MITM_PID" 2>/dev/null || true
