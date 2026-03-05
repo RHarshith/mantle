@@ -20,6 +20,7 @@ set -euo pipefail
 USE_STRACE=true
 TRACE_ID=""
 MITM_PORT=8899
+MITM_REV_PORT=8898
 AGENT_BIN="codex"
 TASK=""
 MITM_USER="mitmproxyuser"
@@ -31,7 +32,7 @@ while [[ $# -gt 0 ]]; do
         --port)        MITM_PORT="$2"; shift 2 ;;
         --agent)       AGENT_BIN="$2"; shift 2 ;;
         -*)            echo "Unknown flag: $1" >&2; exit 1 ;;
-        *)             TASK="$1"; shift; break ;;
+        *)             TASK=("$@"); break ;;
     esac
 done
 
@@ -62,7 +63,7 @@ echo "════════════════════════�
 echo "  Intercepted External Agent"
 echo "═══════════════════════════════════════════════════════════"
 echo "  Agent:       $AGENT_BIN"
-echo "  Task:        ${TASK:-<interactive>}"
+echo "  Task:        ${TASK[*]:-<interactive>}"
 echo "  Trace ID:    $TRACE_ID"
 echo "  MITM proxy:  localhost:$MITM_PORT (transparent mode)"
 echo "  MITM log:    $MITM_JSONL"
@@ -90,8 +91,8 @@ sudo -u "$MITM_USER" \
     MITM_CAPTURE_FILE="$MITM_JSONL" \
     HOME="$MITM_USER_HOME" \
     "$MITMDUMP" \
-        --mode transparent \
-        -p "$MITM_PORT" \
+        --mode transparent@"$MITM_PORT" \
+        --mode reverse:https://api.openai.com@"$MITM_REV_PORT" \
         --ssl-insecure \
         --set connection_strategy=lazy \
         -s "$SCRIPT_DIR/mitm_capture.py" \
@@ -105,6 +106,7 @@ echo "[*] mitmdump started as $MITM_USER (PID $MITM_PID)"
 # Set up iptables to redirect port 443 traffic to mitmproxy,
 # EXCLUDING traffic from mitmproxyuser (to avoid redirect loop)
 IPTABLES_SETUP=false
+IP6TABLES_SETUP=false
 if command -v iptables >/dev/null 2>&1; then
     iptables -t nat -A OUTPUT -p tcp --dport 443 \
         -m owner ! --uid-owner "$MITM_USER" \
@@ -116,6 +118,21 @@ if command -v iptables >/dev/null 2>&1; then
     fi
 else
     echo "[!] iptables not available, falling back to env vars"
+fi
+
+if command -v ip6tables >/dev/null 2>&1; then
+    # Reject IPv6 traffic to force fallback to IPv4 (which is correctly proxied)
+    ip6tables -A OUTPUT -p tcp --dport 443 -j REJECT --reject-with tcp-reset 2>/dev/null && IP6TABLES_SETUP=true
+    if $IP6TABLES_SETUP; then
+        echo "[*] ip6tables reject: port 443 (forcing IPv4 fallback)"
+    fi
+fi
+
+# Install mitmproxy CA to system trust store (important for Rust binaries ignoring env vars)
+if [ -d "/usr/local/share/ca-certificates" ]; then
+    cp "$MITM_CA" /usr/local/share/ca-certificates/mitmproxy.crt
+    update-ca-certificates >/dev/null 2>&1
+    echo "[*] Installed mitmproxy CA to system trust store."
 fi
 
 # Create a combined CA bundle: system CAs + mitmproxy CA
@@ -130,10 +147,14 @@ export HTTPS_PROXY="http://127.0.0.1:$MITM_PORT"
 export HTTP_PROXY="http://127.0.0.1:$MITM_PORT"
 export https_proxy="http://127.0.0.1:$MITM_PORT"
 export http_proxy="http://127.0.0.1:$MITM_PORT"
+export NO_PROXY="127.0.0.1,localhost,::1"
+export no_proxy="127.0.0.1,localhost,::1"
 export SSL_CERT_FILE="$COMBINED_CA"
 export REQUESTS_CA_BUNDLE="$COMBINED_CA"
 export NODE_EXTRA_CA_CERTS="$COMBINED_CA"
 export NODE_TLS_REJECT_UNAUTHORIZED=0
+export OPENAI_API_BASE="http://127.0.0.1:$MITM_REV_PORT/v1"
+export OPENAI_BASE_URL="http://127.0.0.1:$MITM_REV_PORT/v1"
 
 cleanup() {
     echo ""
@@ -143,6 +164,14 @@ cleanup() {
             -m owner ! --uid-owner "$MITM_USER" \
             -j REDIRECT --to-port "$MITM_PORT" 2>/dev/null || true
         echo "[*] iptables redirect removed"
+    fi
+    if $IP6TABLES_SETUP; then
+        ip6tables -D OUTPUT -p tcp --dport 443 -j REJECT --reject-with tcp-reset 2>/dev/null || true
+        echo "[*] ip6tables reject removed"
+    fi
+    if [ -f "/usr/local/share/ca-certificates/mitmproxy.crt" ]; then
+        rm -f "/usr/local/share/ca-certificates/mitmproxy.crt"
+        update-ca-certificates >/dev/null 2>&1
     fi
     echo "[*] Stopping mitmdump (PID $MITM_PID)..."
     kill "$MITM_PID" 2>/dev/null || true
@@ -154,8 +183,7 @@ cleanup() {
 trap cleanup EXIT
 
 # Build the agent command args
-AGENT_ARGS=()
-[ -n "$TASK" ] && AGENT_ARGS+=("$TASK")
+AGENT_ARGS=("${TASK[@]:-}")
 
 if $USE_STRACE; then
     echo "[*] Running $AGENT_BIN with strace..."

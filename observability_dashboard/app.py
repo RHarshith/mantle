@@ -94,12 +94,22 @@ class TraceStore:
                 changed = True
 
         for state in self.traces.values():
+            if not state.mitm_path and self.mitm_dir:
+                state.mitm_path = self._find_mitm_file(state.trace_id)
+
             if state.strace_path.exists():
                 changed = self._tail_strace(state) or changed
-            changed = self._tail_events(state) or changed
-            # If no native events found, try loading from mitmproxy capture
-            if not state.agent_events and state.mitm_path:
-                changed = self._tail_mitm_events(state) or changed
+            has_native = self._tail_events(state)
+            changed = has_native or changed
+            # If no native events FILE exists, continuously tail mitmproxy capture
+            # (don't check `state.agent_events` — that becomes non-empty after the
+            #  first MITM read and would block all subsequent reads)
+            if state.mitm_path:
+                native_file_exists = any(
+                    c.exists() for c in state.events_path_candidates
+                )
+                if not native_file_exists:
+                    changed = self._tail_mitm_events(state) or changed
 
         if changed:
             async with self._lock:
@@ -195,32 +205,133 @@ class TraceStore:
             model = record.get("model", "")
 
             messages = req_body.get("messages", [])
+            if not messages and "input" in req_body:
+                messages = req_body["input"]
+
             choices = resp_body.get("choices", [])
 
-            # Extract the user prompt from request messages if this is the
-            # first call (seq == 0) — emit a user_prompt event
-            if seq == 0 and messages:
-                for msg in messages:
-                    if msg.get("role") == "user":
-                        seq += 1
-                        state.agent_events.append({
-                            "ts": ts,
-                            "seq": seq,
-                            "event_type": "user_prompt",
-                            "payload": {
-                                "content": msg.get("content", ""),
-                            },
-                            "_source": "mitm",
-                        })
+            # Auto-reconstruct SSE stream for /v1/responses
+            if not choices and resp_body.get("_raw"):
+                content_pieces = []
+                tool_calls_dict = {}
+                for rline in resp_body["_raw"].splitlines():
+                    if rline.startswith("data: "):
+                        try:
+                            data = json.loads(rline[6:])
+                            dtype = data.get("type")
+                            if dtype in ["response.text.delta", "response.output_text.delta"]:
+                                content_pieces.append(data.get("delta", ""))
+                            elif dtype == "response.output_item.added":
+                                item = data.get("item", {})
+                                if item.get("type") == "function_call":
+                                    item_id = item.get("id")
+                                    t_id = item.get("call_id")
+                                    tool_calls_dict[item_id] = {"call_id": t_id, "name": item.get("name"), "arguments": ""}
+                            elif dtype == "response.function_call_arguments.delta":
+                                item_id = data.get("item_id")
+                                if item_id in tool_calls_dict:
+                                    tool_calls_dict[item_id]["arguments"] += data.get("delta", "")
+                        except Exception:
+                            pass
+                
+                if content_pieces or tool_calls_dict:
+                    tcs = [{"id": tc.get("call_id", tid), "function": {"name": tc["name"], "arguments": tc["arguments"]}} for tid, tc in tool_calls_dict.items()]
+                    choices = [{"message": {"content": "".join(content_pieces), "tool_calls": tcs}}]
+
+            def _get_string_content(c: Any) -> str:
+                if isinstance(c, str):
+                    return c
+                if isinstance(c, list):
+                    texts = []
+                    for item in c:
+                        if isinstance(item, dict) and "text" in item:
+                            texts.append(item["text"])
+                        elif isinstance(item, str):
+                            texts.append(item)
+                    return "\n".join(texts)
+                return str(c)
+
+            # Deduplicate and emit user prompts
+            emitted_prompt_count = sum(1 for e in state.agent_events if e.get("event_type") == "user_prompt")
+            current_user_msgs = [m for m in messages if m.get("role") == "user"]
+            for msg in current_user_msgs[emitted_prompt_count:]:
+                seq += 1
+                state.agent_events.append({
+                    "ts": ts,
+                    "seq": seq,
+                    "event_type": "user_prompt",
+                    "payload": {
+                        "content": _get_string_content(msg.get("content", "")),
+                    },
+                    "_source": "mitm",
+                })
+
+            # Deduplicate and emit tool results from previous turns
+            # Supports both Chat Completions API (role=tool) and
+            # Responses API (type=function_call_output)
+            emitted_tool_results = {e["payload"]["tool_call_id"] for e in state.agent_events if e.get("event_type") == "tool_call_finished"}
+            for msg in messages:
+                # Chat Completions format: role=tool, tool_call_id, content
+                is_tool_chat = msg.get("role") == "tool"
+                # Responses API format: type=function_call_output, call_id, output
+                is_tool_resp = msg.get("type") == "function_call_output"
+
+                if not (is_tool_chat or is_tool_resp):
+                    continue
+
+                tid = msg.get("tool_call_id") or msg.get("call_id", "")
+                if not tid or tid in emitted_tool_results:
+                    continue
+
+                emitted_tool_results.add(tid)
+                raw_content = msg.get("content", msg.get("output", ""))
+                tool_content = _get_string_content(raw_content)
+                try:
+                    result = json.loads(tool_content)
+                except (json.JSONDecodeError, TypeError):
+                    result = {"output": tool_content}
+
+                # Try to find the tool name from a matching function_call item
+                tool_name = "unknown"
+                for m2 in messages:
+                    if m2.get("type") == "function_call" and m2.get("call_id") == tid:
+                        tool_name = m2.get("name", "unknown")
                         break
 
-            # Process the model's response choices
+                seq += 1
+                state.agent_events.append({
+                    "ts": ts,
+                    "seq": seq,
+                    "event_type": "tool_call_finished",
+                    "payload": {
+                        "tool_call_id": tid,
+                        "tool_name": tool_name,
+                        "duration_ms": duration_ms,
+                        "result": result,
+                    },
+                    "_source": "mitm",
+                })
+
+            # Process the model's response choices for current turn
             for choice in choices:
                 msg = choice.get("message") or {}
                 tool_calls = msg.get("tool_calls") or []
+                content = msg.get("content")
+
+                if content:
+                    seq += 1
+                    state.agent_events.append({
+                        "ts": ts,
+                        "seq": seq,
+                        "event_type": "assistant_response",
+                        "payload": {
+                            "content": content,
+                            "model": model,
+                        },
+                        "_source": "mitm",
+                    })
 
                 if tool_calls:
-                    # Emit tool_call events
                     for tc in tool_calls:
                         func = tc.get("function", {})
                         tool_name = func.get("name", "unknown")
@@ -244,72 +355,6 @@ class TraceStore:
                             "_source": "mitm",
                         })
 
-                    # For mitmproxy, we don't see the tool execution result
-                    # directly — but we know the next request will contain it.
-                    # Emit a tool_call_finished from the next request's tool
-                    # result message if available.
-                    # We look at the NEXT response's request_body for tool msgs.
-                    # (This is handled naturally by the next iteration.)
-
-                    # Also check if the current request has tool result messages
-                    for msg_r in messages:
-                        if msg_r.get("role") == "tool":
-                            # This is a tool result from a previous call
-                            tool_content = msg_r.get("content", "")
-                            tool_call_id_r = msg_r.get("tool_call_id", "")
-                            try:
-                                result = json.loads(tool_content)
-                            except (json.JSONDecodeError, TypeError):
-                                result = {"output": tool_content}
-                            seq += 1
-                            state.agent_events.append({
-                                "ts": ts,
-                                "seq": seq,
-                                "event_type": "tool_call_finished",
-                                "payload": {
-                                    "tool_call_id": tool_call_id_r,
-                                    "tool_name": "unknown",
-                                    "duration_ms": duration_ms,
-                                    "result": result,
-                                },
-                                "_source": "mitm",
-                            })
-                elif msg.get("content"):
-                    # Pure text response — assistant_response
-                    # But first, emit any tool results from the request
-                    for msg_r in messages:
-                        if msg_r.get("role") == "tool":
-                            tool_content = msg_r.get("content", "")
-                            tool_call_id_r = msg_r.get("tool_call_id", "")
-                            try:
-                                result = json.loads(tool_content)
-                            except (json.JSONDecodeError, TypeError):
-                                result = {"output": tool_content}
-                            seq += 1
-                            state.agent_events.append({
-                                "ts": ts,
-                                "seq": seq,
-                                "event_type": "tool_call_finished",
-                                "payload": {
-                                    "tool_call_id": tool_call_id_r,
-                                    "tool_name": "unknown",
-                                    "duration_ms": duration_ms,
-                                    "result": result,
-                                },
-                                "_source": "mitm",
-                            })
-
-                    seq += 1
-                    state.agent_events.append({
-                        "ts": ts,
-                        "seq": seq,
-                        "event_type": "assistant_response",
-                        "payload": {
-                            "content": msg.get("content", ""),
-                            "model": model,
-                        },
-                        "_source": "mitm",
-                    })
 
         state.mitm_offset = new_offset
         return True
@@ -674,6 +719,27 @@ class TraceStore:
             tool_call_id = payload.get("tool_call_id")
             if tool_call_id and tool_call_id not in tool_finish_by_id:
                 tool_finish_by_id[tool_call_id] = (i, event)
+
+        # ── Add Setup Phase Node ───────────────────────────────────────
+        if t.sys_events and t.agent_events:
+            first_event_ts = t.agent_events[0].get("ts", max(e.get("ts", 0) for e in t.sys_events))
+            setup_events = [e for e in t.sys_events if e.get("ts", 0) < first_event_ts - 0.1]
+            if setup_events:
+                setup_node = {
+                    "id": "setup_phase",
+                    "label": "Agent Setup",
+                    "kind": "tool_step",
+                    "metadata": {
+                        "tool_name": "Environment Setup",
+                        "arguments": {"sys_call_count": len(setup_events)},
+                        "status": "ok",
+                        "tool_call_id": "setup_phase"
+                    },
+                    "ts": setup_events[0].get("ts", 0),
+                }
+                nodes.append(setup_node)
+                timeline.append(setup_node)
+                prev_id = "setup_phase"
 
         consumed_finish_indices: set[int] = set()
 
@@ -1295,14 +1361,25 @@ class TraceStore:
     def tool_graph(self, trace_id: str, tool_call_id: str) -> dict[str, Any]:
         t = self._get_trace(trace_id)
 
-        start_event, end_event = self._find_tool_events(t, tool_call_id)
-
-        if start_event is None:
-            raise KeyError(tool_call_id)
-
-        tool_ranges = self._tool_line_ranges(t)
-        line_range = tool_ranges.get(tool_call_id)
-        related = self._related_sys_events_for_tool(t, tool_call_id, start_event, end_event)
+        if tool_call_id == "setup_phase":
+            first_event_ts = t.agent_events[0].get("ts", max(e.get("ts", 0) for e in t.sys_events)) if t.agent_events else max((e.get("ts", 0) for e in t.sys_events), default=0)
+            setup_events = [e for e in t.sys_events if e.get("ts", 0) < first_event_ts - 0.1]
+            start_event = {
+                "ts": setup_events[0].get("ts", 0) if setup_events else 0,
+                "payload": {"tool_name": "Environment Setup", "tool_call_id": "setup_phase"}
+            }
+            end_event = {
+                "ts": setup_events[-1].get("ts", 0) if setup_events else 0,
+            }
+            related = setup_events
+            line_range = (int(setup_events[0].get("line_no", 0)), int(setup_events[-1].get("line_no", 0))) if setup_events else None
+        else:
+            start_event, end_event = self._find_tool_events(t, tool_call_id)
+            if start_event is None:
+                raise KeyError(tool_call_id)
+            tool_ranges = self._tool_line_ranges(t)
+            line_range = tool_ranges.get(tool_call_id)
+            related = self._related_sys_events_for_tool(t, tool_call_id, start_event, end_event)
 
         nodes = [
             {
@@ -1693,21 +1770,26 @@ class TraceStore:
 
     def tool_summary(self, trace_id: str, tool_call_id: str) -> dict[str, Any]:
         t = self._get_trace(trace_id)
-        start_event, end_event = self._find_tool_events(t, tool_call_id)
-        if start_event is None:
-            raise KeyError(tool_call_id)
+        
+        if tool_call_id == "setup_phase":
+            first_event_ts = t.agent_events[0].get("ts", max(e.get("ts", 0) for e in t.sys_events)) if t.agent_events else max((e.get("ts", 0) for e in t.sys_events), default=0)
+            related = [e for e in t.sys_events if e.get("ts", 0) < first_event_ts - 0.1]
+        else:
+            start_event, end_event = self._find_tool_events(t, tool_call_id)
+            if start_event is None:
+                raise KeyError(tool_call_id)
 
-        related = self._related_sys_events_for_tool(t, tool_call_id, start_event, end_event)
+            related = self._related_sys_events_for_tool(t, tool_call_id, start_event, end_event)
 
-        # If line-range / timestamp correlation found no events, try a wider
-        # window as a last resort (±10s around the start timestamp).
-        if not related:
-            start_ts = float(start_event.get("ts") or 0)
-            end_ts = float((end_event or {}).get("ts") or (start_ts + 10.0))
-            related = [
-                e for e in t.sys_events
-                if start_ts - 1.0 <= float(e.get("ts", 0)) <= end_ts + 2.0
-            ]
+            # If line-range / timestamp correlation found no events, try a wider
+            # window as a last resort (±10s around the start timestamp).
+            if not related:
+                start_ts = float(start_event.get("ts") or 0)
+                end_ts = float((end_event or {}).get("ts") or (start_ts + 10.0))
+                related = [
+                    e for e in t.sys_events
+                    if start_ts - 1.0 <= float(e.get("ts", 0)) <= end_ts + 2.0
+                ]
 
         file_agg: dict[str, dict[str, Any]] = {}
         for event in related:
