@@ -118,14 +118,21 @@ else
     echo "[!] iptables not available, falling back to env vars"
 fi
 
+# Create a combined CA bundle: system CAs + mitmproxy CA
+# Rust's rustls reads SSL_CERT_FILE but needs ALL CAs (not just mitmproxy)
+COMBINED_CA="/tmp/ca-bundle-with-mitm.crt"
+cat /etc/ssl/certs/ca-certificates.crt "$MITM_CA" > "$COMBINED_CA" 2>/dev/null || \
+    cp "$MITM_CA" "$COMBINED_CA"
+echo "[*] Combined CA bundle: $COMBINED_CA"
+
 # Also set proxy env vars as fallback (for agents that DO respect them)
 export HTTPS_PROXY="http://127.0.0.1:$MITM_PORT"
 export HTTP_PROXY="http://127.0.0.1:$MITM_PORT"
 export https_proxy="http://127.0.0.1:$MITM_PORT"
 export http_proxy="http://127.0.0.1:$MITM_PORT"
-export SSL_CERT_FILE="$MITM_CA"
-export REQUESTS_CA_BUNDLE="$MITM_CA"
-export NODE_EXTRA_CA_CERTS="$MITM_CA"
+export SSL_CERT_FILE="$COMBINED_CA"
+export REQUESTS_CA_BUNDLE="$COMBINED_CA"
+export NODE_EXTRA_CA_CERTS="$COMBINED_CA"
 export NODE_TLS_REJECT_UNAUTHORIZED=0
 
 cleanup() {
