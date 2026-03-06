@@ -1,175 +1,202 @@
 # RTrace Observability
 
-Productionized tracing stack for coding agents (Codex-focused):
-- intercepts OpenAI API calls via mitmproxy,
-- captures system behavior via strace,
-- renders a live observability dashboard.
+RTrace is a productionized observability stack for coding agents.
 
-## Core Commands
+It captures:
+- API-level behavior via `mitmproxy`
+- system calls via `strace`
+- agent flow in a dashboard (`FastAPI` + static UI)
 
-After setup, these are the main commands:
+Current primary target is Codex, with an extension model for other agents.
 
-- `rtrace_monitor`: start dashboard server
-- `rtrace codex [--strace|--no-strace] <exec[optional] prompt>`: run traced codex session
+## Quick Start
 
-Examples:
-
-```bash
-rtrace_monitor
-rtrace codex
-rtrace codex --no-strace "quick run without syscall capture"
-rtrace codex "summarize this repository"
-rtrace codex exec "count shell scripts and print the result"
-```
-
-## Quick Start (Native Linux/macOS)
-
-1. Clone repo and install runtime:
+### Native (Linux/macOS)
 
 ```bash
 git clone <your-repo-url>
 cd simple_agent
 bash scripts/install_rtrace.sh
-```
-
-2. Ensure commands are in path (if needed):
-
-```bash
 export PATH="$HOME/.local/bin:$PATH"
-```
 
-3. Start dashboard:
-
-```bash
+# Terminal 1
 rtrace_monitor --host 0.0.0.0 --port 8099
+
+# Terminal 2
+rtrace codex exec "inspect this repository and summarize"
 ```
 
-4. In another shell, run traced codex:
+Open: `http://127.0.0.1:8099`
 
-```bash
-rtrace codex exec "inspect this codebase and list 3 improvements"
-```
-
-5. Open dashboard:
-
-```text
-http://127.0.0.1:8099
-```
-
-## Dockerized Environment (No VM Required)
-
-This is the recommended path for quick installation and testing in macOS/Windows/Linux.
-
-### 1) Build and launch persistent container
+### Docker (recommended for reproducibility)
 
 ```bash
 git clone <your-repo-url>
 cd simple_agent
 export OPENAI_API_KEY="<your_key_in_local_shell>"
 docker compose up -d --build
+
+# Terminal 1
+docker compose exec rtrace-lab bash -lc 'rtrace_monitor'
+
+# Terminal 2
+docker compose exec rtrace-lab bash -lc 'rtrace codex exec "count shell scripts and print result"'
 ```
 
-The container stays alive (`sleep infinity`) so you can exec into it anytime.
+Open: `http://127.0.0.1:8099`
 
-### 2) Enter container shell
+## Command Reference
 
+### `rtrace_monitor`
+
+Start dashboard server.
+
+Usage:
 ```bash
-docker compose exec rtrace-lab bash
+rtrace_monitor [--host <host>] [--port <port>] [--obs-root <path>]
 ```
 
-### 3) Inside container, run monitor and trace
+Options:
+- `--host`: bind host; defaults to `0.0.0.0` in Docker and `127.0.0.1` outside Docker.
+- `--port`: dashboard port (default `8099`).
+- `--obs-root`: observability root directory (default `<repo>/obs`).
 
-Terminal A:
+### `rtrace codex`
 
+Run Codex with interception and optional syscall tracing.
+
+Usage:
 ```bash
-rtrace_monitor --host 0.0.0.0 --port 8099
+rtrace codex [--strace|--no-strace] [exec] [prompt...]
 ```
 
-Terminal B:
-
+Examples:
 ```bash
-docker compose exec rtrace-lab bash
+rtrace codex
+rtrace codex "summarize this repository"
 rtrace codex exec "count shell scripts and print result"
+rtrace codex --no-strace exec "fast run without low-level syscall capture"
 ```
 
-### 4) Open dashboard from host
+Notes:
+- `--strace` is default.
+- `--no-strace` disables low-level syscall capture.
+- Under the hood this calls `run_intercepted_codex.sh`.
 
-The compose file publishes dashboard port directly:
+### `run_intercepted_codex.sh` (advanced)
+
+Usage:
+```bash
+./run_intercepted_codex.sh [--no-strace] [--mode proxy|transparent] [--trace-id <id>] [--agent <bin>] [prompt...]
+```
+
+Important options:
+- `--mode proxy`: default and recommended in Docker.
+- `--mode transparent`: iptables-based transparent interception.
+- `--no-strace`: disable syscall capture.
+
+## Folder Structure
 
 ```text
-http://127.0.0.1:8099
+.
+├── agent_setup/
+│   └── setup.yml                      # manifest for agent setup scripts
+├── bin/
+│   ├── rtrace                         # primary trace CLI
+│   └── rtrace_monitor                 # dashboard launcher
+├── docker/
+│   └── entrypoint.sh                  # container entrypoint + setup runner hook
+├── observability_dashboard/
+│   ├── app.py                         # dashboard API/backend
+│   ├── static/                        # frontend UI
+│   └── requirements.txt
+├── scripts/
+│   ├── install_rtrace.sh              # native installer
+│   └── agent_setup/
+│       ├── run_setup_scripts.sh       # executes scripts from setup.yml
+│       └── codex_setup.sh             # codex auth/env bootstrap
+├── simple_agent/
+│   ├── cli_agent.py                   # sample Python agent
+│   └── agent_observability.py
+├── Dockerfile
+├── docker-compose.yml
+├── mitm_capture.py                    # mitmproxy addon for capture
+├── requirements.runtime.txt
+├── run_intercepted_codex.sh
+└── obs/                               # generated traces and captures
 ```
 
-## Docker Notes
-
-- `docker-compose.yml` grants `NET_ADMIN`/`NET_RAW` capabilities required for transparent interception.
-- `@openai/codex` is installed in image so codex CLI setup is not required separately.
-- Secrets are read from host environment and synced by setup scripts at container startup.
-- Do not commit local secret files; `.env` is ignored by git.
-
-## Agent Setup Framework
-
-To support multiple agents and future custom configuration requirements, startup setup is manifest-driven:
-
-- Manifest: `agent_setup/setup.yml`
-- Setup scripts folder: `scripts/agent_setup/`
-- Setup runner: `scripts/agent_setup/run_setup_scripts.sh`
-
-At container startup, entrypoint reads `RTRACE_AGENT_SETUP_CONFIG` and executes each script listed in the YAML.
-
-Current script:
-
-- `scripts/agent_setup/codex_setup.sh`:
-  - reads `OPENAI_API_KEY` from host-passed env,
-  - writes container-local runtime env file (`/root/.config/rtrace/agent-env/codex.env`),
-  - runs `codex login --with-api-key` non-interactively to initialize Codex auth store,
-  - wires shell startup to source agent env snippets.
-
-You can add future scripts (e.g., writing agent config files, auth material, policy files) and register them in `agent_setup/setup.yml`.
-
-### Codex Auth Notes
-
-- `run_intercepted_codex.sh` uses transparent interception and does **not** force `OPENAI_BASE_URL` by default.
-- This avoids auth-header issues seen on newer Codex versions when base URL is plain `http://127.0.0.1:...`.
-- If you need the old behavior for debugging, set `RTRACE_FORCE_OPENAI_BASE=1` before running `rtrace codex ...`.
-
-Optional `.env` workflow (still local-only, never committed):
-
-```bash
-cp .env.example .env
-# edit .env locally
-docker compose up -d --build
-```
-
-## Legacy VM Workflow (Optional)
-
-If you still use VM-host split, port-forward dashboard with:
-
-```bash
-sshpass -p 'password' ssh -fN -p 2222 \
-  -L 8099:127.0.0.1:8099 \
-  -o ExitOnForwardFailure=yes \
-  -o StrictHostKeyChecking=no \
-  -o PreferredAuthentications=password \
-  -o PubkeyAuthentication=no \
-  root@127.0.0.1
-```
-
-Stop tunnel:
-
-```bash
-pkill -f "ssh.*-L 8099:127.0.0.1:8099"
-```
-
-## Output Layout
-
+Generated data:
 - `obs/traces/<trace_id>.strace.log`
 - `obs/mitm/<trace_id>.mitm.jsonl`
 - `obs/events/<trace_id>.events.jsonl`
 
-## Key Environment Variables
+## Environment Model
 
-- `AGENT_OBS_ROOT`: base output path (default: `<repo>/obs`)
-- `AGENT_TRACE_ID`: explicit trace id override
-- `RTRACE_VENV`: Python env used by wrappers
-- `OBS_TRACE_DIR`, `OBS_EVENTS_DIR`: dashboard parser overrides
+Secrets are not committed.
+
+Recommended:
+- export on host shell before `docker compose up`:
+
+```bash
+export OPENAI_API_KEY="<your_key>"
+```
+
+Optional local helper:
+```bash
+cp .env.example .env
+# edit .env locally (git-ignored)
+```
+
+Key runtime env vars:
+- `OPENAI_API_KEY`: OpenAI credential
+- `AGENT_OBS_ROOT`: output root (default `<repo>/obs`)
+- `RTRACE_VENV`: Python venv path used by wrappers
+- `RTRACE_INTERCEPT_MODE`: default intercept mode (`proxy` or `transparent`)
+- `RTRACE_FORCE_OPENAI_BASE=1`: force legacy local reverse base URL behavior (debug only)
+- `RTRACE_AGENT_SETUP_CONFIG`: path to setup manifest
+
+## Adding Support for Another Agent
+
+Use the setup manifest + script pattern.
+
+1. Add setup script:
+- Create `scripts/agent_setup/<agent>_setup.sh`
+- Keep script idempotent.
+- Use it to write required local config/auth files in container.
+
+2. Register in manifest:
+- Edit `agent_setup/setup.yml` and add script path under `setup_scripts`.
+
+3. Add runtime wrapper:
+- Extend `bin/rtrace` with new subcommand (e.g. `rtrace aider ...`).
+- Add corresponding run script (similar to `run_intercepted_codex.sh`) if behavior differs.
+
+4. Update docs:
+- Add command examples and required env vars.
+
+## Troubleshooting
+
+### No low-level syscall nodes in drilldown
+- Ensure you are not using `--no-strace`.
+- Confirm run output shows `Strace: true` and `Strace file: ...`.
+
+### Dashboard unreachable from host in Docker
+- Start monitor with `rtrace_monitor` (Docker-aware default bind is `0.0.0.0`).
+- Check mapping:
+  - `docker compose ps`
+  - `docker compose port rtrace-lab 8099`
+
+### Codex auth errors
+- Re-sync auth from current key:
+  - `docker compose exec rtrace-lab bash -lc 'printenv OPENAI_API_KEY | codex login --with-api-key && codex login status'`
+
+### Interception transport issues
+- Use proxy mode (default) first.
+- Transparent mode is advanced and depends on iptables behavior.
+
+## Development Notes
+
+- Keep `rtrace` UX stable: operator should need only `rtrace_monitor` + `rtrace <agent> ...`.
+- Prefer adding new agent support through setup scripts and wrapper subcommands rather than ad-hoc one-off scripts.
+- Preserve generated data in `obs/` for reproducible debugging and dashboard verification.

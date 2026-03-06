@@ -39,9 +39,7 @@ RUN chmod +x \
     /workspace/simple_agent/scripts/agent_setup/codex_setup.sh \
     /workspace/simple_agent/scripts/install_rtrace.sh \
     /workspace/simple_agent/docker/entrypoint.sh \
-    /workspace/simple_agent/run_intercepted_codex.sh \
-    /workspace/simple_agent/run_intercepted_agent.sh \
-    /workspace/simple_agent/run_interactive_intercepted.sh
+    /workspace/simple_agent/run_intercepted_codex.sh
 
 RUN ln -sf /workspace/simple_agent/bin/rtrace /usr/local/bin/rtrace && \
     ln -sf /workspace/simple_agent/bin/rtrace_monitor /usr/local/bin/rtrace_monitor
