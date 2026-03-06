@@ -1,0 +1,6 @@
+version: 1
+
+# List setup scripts to run at container startup.
+# Paths are relative to repository root.
+setup_scripts:
+  - scripts/agent_setup/codex_setup.sh

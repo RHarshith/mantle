@@ -1,6 +1,6 @@
-# Agent Observability Dashboard (Demo)
+# Agent Observability Dashboard
 
-This service monitors strace logs + agent instrumentation events and renders a realtime drilldown graph.
+This service monitors strace logs + agent instrumentation events + mitm captures and renders a realtime drilldown graph.
 
 ## Folder Convention
 
@@ -8,6 +8,14 @@ This service monitors strace logs + agent instrumentation events and renders a r
 - Agent event logs directory: `~/shared/simple_agent/obs/events`
 
 ## Run the Dashboard
+
+Recommended (from repo root):
+
+```bash
+rtrace_monitor --host 0.0.0.0 --port 8099
+```
+
+Direct uvicorn alternative:
 
 ```bash
 cd observability_dashboard
@@ -17,7 +25,7 @@ cd observability_dashboard
 
 Open: `http://127.0.0.1:8099`
 
-If dashboard runs inside the VM, forward it to host:
+If dashboard runs inside VM/container and is not already port-exposed, forward it to host:
 
 ```bash
 sshpass -p 'password' ssh -fN -p 2222 \

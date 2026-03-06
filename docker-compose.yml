@@ -1,0 +1,28 @@
+services:
+  rtrace-lab:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rtrace-lab:latest
+    container_name: rtrace-lab
+    tty: true
+    stdin_open: true
+    command: ["sleep", "infinity"]
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    security_opt:
+      - apparmor=unconfined
+    environment:
+      - OPENAI_API_KEY
+      - AGENT_OBS_ROOT=/workspace/simple_agent/obs
+      - RTRACE_VENV=/opt/rtrace-venv
+      - RTRACE_AGENT_SETUP_CONFIG=/workspace/simple_agent/agent_setup/setup.yml
+    volumes:
+      - ./:/workspace/simple_agent
+      - rtrace-home:/root
+    ports:
+      - "8099:8099"
+
+volumes:
+  rtrace-home:
