@@ -18,7 +18,7 @@ This project uses a split Host-VM architecture to securely trace agents:
 - **Workspace**: 
   - Host path: `/Users/harshithreddy/ubuntu_shared/simple_agent`
   - VM path: `/home/harshith/simple_agent_local`
-  - Both are linked to a remote github repo, so to make changes to the codebase, you can do so from either the host or the VM.
+  - Both are linked to a remote github repo, so to make changes to the codebase, edit in this workspace and push code to github.
 - **SSH Access**: You can execute commands in the VM seamlessly from the host using:
   ```bash
   sshpass -p 'password' ssh -p 2222 -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no root@127.0.0.1 "<command>"
@@ -50,7 +50,24 @@ cd /home/harshith/simple_agent_local
 source .venv/bin/activate  # Or use appropriate python if venv exists
 python3 -m uvicorn observability_dashboard.app:app --host 0.0.0.0 --port 8099
 ```
-Port forward port `8099` to your MacOS host (or access via VM IP) and view it at `http://127.0.0.1:8099`.
+
+From the host, create a local tunnel to the VM dashboard:
+```bash
+sshpass -p 'password' ssh -fN -p 2222 \
+  -L 8099:127.0.0.1:8099 \
+  -o ExitOnForwardFailure=yes \
+  -o StrictHostKeyChecking=no \
+  -o PreferredAuthentications=password \
+  -o PubkeyAuthentication=no \
+  root@127.0.0.1
+```
+
+Then open `http://127.0.0.1:8099` on the host.
+
+To stop the tunnel:
+```bash
+pkill -f "ssh.*-L 8099:127.0.0.1:8099"
+```
 
 ### 2) Run agent with tracing
 Run the tracing scripts in the VM:

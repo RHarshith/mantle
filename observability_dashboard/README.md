@@ -17,6 +17,20 @@ cd observability_dashboard
 
 Open: `http://127.0.0.1:8099`
 
+If dashboard runs inside the VM, forward it to host:
+
+```bash
+sshpass -p 'password' ssh -fN -p 2222 \
+	-L 8099:127.0.0.1:8099 \
+	-o ExitOnForwardFailure=yes \
+	-o StrictHostKeyChecking=no \
+	-o PreferredAuthentications=password \
+	-o PubkeyAuthentication=no \
+	root@127.0.0.1
+```
+
+Then open: `http://127.0.0.1:8099`
+
 ## Run Agent + Strace with Matching Trace ID
 
 Choose a trace id, e.g. `trace_001.strace.log`.
