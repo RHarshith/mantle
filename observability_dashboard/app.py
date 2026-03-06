@@ -251,10 +251,32 @@ class TraceStore:
                     return "\n".join(texts)
                 return str(c)
 
-            # Deduplicate and emit user prompts
-            emitted_prompt_count = sum(1 for e in state.agent_events if e.get("event_type") == "user_prompt")
+            # Emit user prompts from both APIs:
+            # - Chat Completions typically re-sends full history
+            # - Responses API can send only incremental input with previous_response_id
             current_user_msgs = [m for m in messages if m.get("role") == "user"]
-            for msg in current_user_msgs[emitted_prompt_count:]:
+            if req_body.get("previous_response_id"):
+                prompt_candidates = current_user_msgs
+            else:
+                emitted_prompt_count = sum(1 for e in state.agent_events if e.get("event_type") == "user_prompt")
+                if len(current_user_msgs) > emitted_prompt_count:
+                    prompt_candidates = current_user_msgs[emitted_prompt_count:]
+                else:
+                    # Fallback for incremental payloads without previous_response_id:
+                    # emit the final user item once if it differs from the last emitted one.
+                    prompt_candidates = []
+                    if current_user_msgs:
+                        last_emitted_content = ""
+                        for prev_event in reversed(state.agent_events):
+                            if prev_event.get("event_type") == "user_prompt":
+                                last_emitted_content = str(prev_event.get("payload", {}).get("content", ""))
+                                break
+                        candidate = current_user_msgs[-1]
+                        candidate_content = _get_string_content(candidate.get("content", ""))
+                        if candidate_content and candidate_content != last_emitted_content:
+                            prompt_candidates = [candidate]
+
+            for msg in prompt_candidates:
                 seq += 1
                 state.agent_events.append({
                     "ts": ts,

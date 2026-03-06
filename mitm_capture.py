@@ -29,6 +29,7 @@ _CAPTURE_PATTERNS = [
     "/chat/completions",
     "/v1/chat/completions",
     "/api/chat/completions",
+    "/responses",
     "/v1/responses",
 ]
 
