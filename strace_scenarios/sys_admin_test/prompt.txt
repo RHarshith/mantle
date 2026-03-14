@@ -1,0 +1,24 @@
+You are acting as a Linux sysadmin inside a container. Your task is to inspect active services and ensure the environment is healthy.
+
+Environment details:
+- Redis should be running on 127.0.0.1:6380
+- A local API should be running on 127.0.0.1:18080
+- The API is currently misconfigured so the health check fails
+
+Required actions:
+1. Inspect running processes, open ports, and service health using shell commands.
+2. Confirm Redis is up and reachable.
+3. Diagnose why the API health check is failing.
+4. Fix the API health issue with a minimal, safe change.
+5. Verify both services are healthy after the fix.
+6. Print a concise incident report:
+   - root cause
+   - action taken
+   - verification commands + outputs
+
+Hints:
+- API endpoints:
+  - GET /health
+  - GET /admin/state
+  - POST /admin/toggle-health?healthy=1
+- Keep changes minimal and avoid restarting unrelated services.

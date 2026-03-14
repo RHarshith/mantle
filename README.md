@@ -47,6 +47,26 @@ Open: `http://127.0.0.1:8099`
 
 ## Command Reference
 
+### `strace_test`
+
+Run a self-contained scenario suite that provisions services, injects faults, and executes a traced agent prompt.
+
+Usage:
+```bash
+strace_test --list
+strace_test <suite_name> [--no-cleanup] [--no-setup] [--no-strace] [--mode <proxy|transparent>] [--trace-id <id>] [--dry-run]
+```
+
+Examples:
+```bash
+strace_test --list
+strace_test sys_admin_test
+strace_test sys_admin_test --no-cleanup
+```
+
+Current suite:
+- `sys_admin_test`: starts Redis + a deliberately unhealthy API, then prompts the agent to inspect and fix health.
+
 ### `rtrace_monitor`
 
 Start dashboard server.
@@ -118,6 +138,15 @@ Important options:
 ├── simple_agent/
 │   ├── cli_agent.py                   # sample Python agent
 │   └── agent_observability.py
+├── strace_scenarios/
+│   ├── README.md
+│   └── sys_admin_test/
+│       ├── prompt.txt
+│       ├── setup.sh
+│       ├── verify.sh
+│       ├── cleanup.sh
+│       └── services/
+│           └── faulty_api.py
 ├── Dockerfile
 ├── docker-compose.yml
 ├── mitm_capture.py                    # mitmproxy addon for capture
@@ -176,6 +205,14 @@ Use the setup manifest + script pattern.
 - Add command examples and required env vars.
 
 ## Troubleshooting
+
+### `strace_test` fails in setup with package install errors
+- Run as root in the container (default in this image).
+- Verify network access for `apt-get` if `redis-server` is missing.
+
+### `strace_test` precheck says API is not faulted
+- The suite intentionally expects `/health` to return `500` before agent execution.
+- Re-run setup: `strace_test sys_admin_test --no-cleanup --dry-run` then `strace_test sys_admin_test`.
 
 ### No low-level syscall nodes in drilldown
 - Ensure you are not using `--no-strace`.

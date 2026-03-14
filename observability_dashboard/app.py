@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -184,6 +184,226 @@ class TraceStore:
             return False
 
         seq = len(state.agent_events)
+
+        def _get_string_content(content: Any) -> str:
+            if content is None:
+                return ""
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                texts: list[str] = []
+                for item in content:
+                    if isinstance(item, str):
+                        texts.append(item)
+                        continue
+                    if not isinstance(item, dict):
+                        continue
+                    text_value = item.get("text")
+                    if isinstance(text_value, str):
+                        texts.append(text_value)
+                        continue
+                    text_value = item.get("output_text")
+                    if isinstance(text_value, str):
+                        texts.append(text_value)
+                        continue
+                    if item.get("type") in {"input_text", "output_text", "summary_text"}:
+                        maybe_text = item.get("text")
+                        if isinstance(maybe_text, str):
+                            texts.append(maybe_text)
+                return "\n".join([t for t in texts if t])
+            if isinstance(content, dict):
+                if isinstance(content.get("text"), str):
+                    return str(content.get("text"))
+                if isinstance(content.get("output_text"), str):
+                    return str(content.get("output_text"))
+                if isinstance(content.get("content"), (str, list, dict)):
+                    return _get_string_content(content.get("content"))
+                return json.dumps(content, ensure_ascii=False)
+            return str(content)
+
+        def _extract_user_prompts(messages: list[dict[str, Any]]) -> list[str]:
+            prompts: list[str] = []
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                role = msg.get("role")
+                if role == "user":
+                    text = _get_string_content(msg.get("content"))
+                    if text:
+                        prompts.append(text)
+                    continue
+
+                msg_type = msg.get("type")
+                if msg_type == "message" and msg.get("role") == "user":
+                    text = _get_string_content(msg.get("content"))
+                    if text:
+                        prompts.append(text)
+            return prompts
+
+        def _extract_available_tools(req: dict[str, Any]) -> list[str]:
+            tools = req.get("tools")
+            if not isinstance(tools, list):
+                return []
+
+            out: list[str] = []
+            for item in tools:
+                if not isinstance(item, dict):
+                    continue
+
+                # Responses API function tools usually carry `name`.
+                if isinstance(item.get("name"), str) and item.get("name"):
+                    out.append(str(item.get("name")))
+                    continue
+
+                # Some formats embed function metadata.
+                fn = item.get("function")
+                if isinstance(fn, dict) and isinstance(fn.get("name"), str) and fn.get("name"):
+                    out.append(str(fn.get("name")))
+                    continue
+
+                t = item.get("type")
+                if isinstance(t, str) and t:
+                    out.append(t)
+
+            # Preserve order while de-duplicating.
+            seen: set[str] = set()
+            uniq: list[str] = []
+            for name in out:
+                if name in seen:
+                    continue
+                seen.add(name)
+                uniq.append(name)
+            return uniq
+
+        def _parse_responses_sse(raw: str) -> dict[str, Any]:
+            parsed: dict[str, Any] = {
+                "assistant_messages": [],
+                "tool_calls": [],
+                "reasoning_summary": "",
+            }
+            if not raw:
+                return parsed
+
+            message_by_item: dict[str, dict[str, Any]] = {}
+            tool_by_item: dict[str, dict[str, Any]] = {}
+            reasoning_parts: dict[tuple[str, int], str] = {}
+
+            for line in raw.splitlines():
+                if not line.startswith("data: "):
+                    continue
+                payload = line[6:].strip()
+                if not payload or payload == "[DONE]":
+                    continue
+                try:
+                    data = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+
+                dtype = data.get("type", "")
+                if dtype == "response.output_item.added":
+                    item = data.get("item") or {}
+                    item_id = str(item.get("id") or "")
+                    item_type = item.get("type")
+                    if item_type == "message":
+                        message_by_item[item_id] = {
+                            "id": item_id,
+                            "role": item.get("role"),
+                            "phase": item.get("phase"),
+                            "parts": [],
+                        }
+                    elif item_type == "function_call":
+                        tool_by_item[item_id] = {
+                            "id": item_id,
+                            "tool_call_id": item.get("call_id") or item_id,
+                            "tool_name": item.get("name") or "unknown",
+                            "arguments": item.get("arguments") or "",
+                        }
+                    continue
+
+                if dtype in {"response.output_text.delta", "response.text.delta"}:
+                    item_id = str(data.get("item_id") or "")
+                    if item_id in message_by_item:
+                        message_by_item[item_id]["parts"].append(str(data.get("delta", "")))
+                    continue
+
+                if dtype == "response.output_item.done":
+                    item = data.get("item") or {}
+                    item_id = str(item.get("id") or "")
+                    item_type = item.get("type")
+                    if item_type == "message":
+                        entry = message_by_item.setdefault(
+                            item_id,
+                            {
+                                "id": item_id,
+                                "role": item.get("role"),
+                                "phase": item.get("phase"),
+                                "parts": [],
+                            },
+                        )
+                        text = _get_string_content(item.get("content"))
+                        if text:
+                            entry["parts"] = [text]
+                    elif item_type == "function_call":
+                        entry = tool_by_item.setdefault(
+                            item_id,
+                            {
+                                "id": item_id,
+                                "tool_call_id": item.get("call_id") or item_id,
+                                "tool_name": item.get("name") or "unknown",
+                                "arguments": "",
+                            },
+                        )
+                        entry["arguments"] = item.get("arguments") or entry.get("arguments") or ""
+                    continue
+
+                if dtype == "response.function_call_arguments.delta":
+                    item_id = str(data.get("item_id") or "")
+                    if item_id in tool_by_item:
+                        tool_by_item[item_id]["arguments"] = str(tool_by_item[item_id].get("arguments") or "") + str(data.get("delta", ""))
+                    continue
+
+                if dtype == "response.reasoning_summary_text.delta":
+                    key = (str(data.get("item_id") or ""), int(data.get("summary_index") or 0))
+                    reasoning_parts[key] = reasoning_parts.get(key, "") + str(data.get("delta", ""))
+                    continue
+
+                if dtype == "response.reasoning_summary_text.done":
+                    key = (str(data.get("item_id") or ""), int(data.get("summary_index") or 0))
+                    reasoning_parts[key] = str(data.get("text") or "")
+
+            parsed["assistant_messages"] = [
+                {
+                    "role": msg.get("role") or "assistant",
+                    "phase": msg.get("phase") or "final",
+                    "content": "".join(msg.get("parts") or []).strip(),
+                }
+                for msg in message_by_item.values()
+                if "".join(msg.get("parts") or []).strip()
+            ]
+
+            tool_calls: list[dict[str, Any]] = []
+            for tc in tool_by_item.values():
+                raw_args = str(tc.get("arguments") or "")
+                args_obj: Any
+                try:
+                    args_obj = json.loads(raw_args) if raw_args else {}
+                except json.JSONDecodeError:
+                    args_obj = {"_raw": raw_args}
+                tool_calls.append(
+                    {
+                        "tool_call_id": tc.get("tool_call_id"),
+                        "tool_name": tc.get("tool_name") or "unknown",
+                        "arguments": args_obj,
+                    }
+                )
+            parsed["tool_calls"] = tool_calls
+
+            if reasoning_parts:
+                keys = sorted(reasoning_parts.keys(), key=lambda x: (x[0], x[1]))
+                parsed["reasoning_summary"] = "\n".join([reasoning_parts[k] for k in keys if reasoning_parts[k]]).strip()
+
+            return parsed
+
         for line in lines:
             line = line.strip()
             if not line:
@@ -202,91 +422,114 @@ class TraceStore:
             resp_body = record.get("response_body") or {}
             ts = record.get("ts", 0)
             duration_ms = record.get("duration_ms")
-            model = record.get("model", "")
+            model = record.get("model") or req_body.get("model") or ""
+            endpoint = record.get("url") or ""
+            status_code = record.get("status_code")
 
             messages = req_body.get("messages", [])
             if not messages and "input" in req_body:
-                messages = req_body["input"]
+                messages = req_body.get("input") or []
+            if not isinstance(messages, list):
+                messages = []
 
-            choices = resp_body.get("choices", [])
+            sse_parsed = _parse_responses_sse(str(resp_body.get("_raw") or ""))
+            available_tools = _extract_available_tools(req_body)
 
-            # Auto-reconstruct SSE stream for /v1/responses
-            if not choices and resp_body.get("_raw"):
-                content_pieces = []
-                tool_calls_dict = {}
-                for rline in resp_body["_raw"].splitlines():
-                    if rline.startswith("data: "):
-                        try:
-                            data = json.loads(rline[6:])
-                            dtype = data.get("type")
-                            if dtype in ["response.text.delta", "response.output_text.delta"]:
-                                content_pieces.append(data.get("delta", ""))
-                            elif dtype == "response.output_item.added":
-                                item = data.get("item", {})
-                                if item.get("type") == "function_call":
-                                    item_id = item.get("id")
-                                    t_id = item.get("call_id")
-                                    tool_calls_dict[item_id] = {"call_id": t_id, "name": item.get("name"), "arguments": ""}
-                            elif dtype == "response.function_call_arguments.delta":
-                                item_id = data.get("item_id")
-                                if item_id in tool_calls_dict:
-                                    tool_calls_dict[item_id]["arguments"] += data.get("delta", "")
-                        except Exception:
-                            pass
-                
-                if content_pieces or tool_calls_dict:
-                    tcs = [{"id": tc.get("call_id", tid), "function": {"name": tc["name"], "arguments": tc["arguments"]}} for tid, tc in tool_calls_dict.items()]
-                    choices = [{"message": {"content": "".join(content_pieces), "tool_calls": tcs}}]
-
-            def _get_string_content(c: Any) -> str:
-                if isinstance(c, str):
-                    return c
-                if isinstance(c, list):
-                    texts = []
-                    for item in c:
-                        if isinstance(item, dict) and "text" in item:
-                            texts.append(item["text"])
-                        elif isinstance(item, str):
-                            texts.append(item)
-                    return "\n".join(texts)
-                return str(c)
-
-            # Emit user prompts from both APIs:
-            # - Chat Completions typically re-sends full history
-            # - Responses API can send only incremental input with previous_response_id
-            current_user_msgs = [m for m in messages if m.get("role") == "user"]
-            if req_body.get("previous_response_id"):
-                prompt_candidates = current_user_msgs
-            else:
-                emitted_prompt_count = sum(1 for e in state.agent_events if e.get("event_type") == "user_prompt")
-                if len(current_user_msgs) > emitted_prompt_count:
-                    prompt_candidates = current_user_msgs[emitted_prompt_count:]
-                else:
-                    # Fallback for incremental payloads without previous_response_id:
-                    # emit the final user item once if it differs from the last emitted one.
-                    prompt_candidates = []
-                    if current_user_msgs:
-                        last_emitted_content = ""
-                        for prev_event in reversed(state.agent_events):
-                            if prev_event.get("event_type") == "user_prompt":
-                                last_emitted_content = str(prev_event.get("payload", {}).get("content", ""))
-                                break
-                        candidate = current_user_msgs[-1]
-                        candidate_content = _get_string_content(candidate.get("content", ""))
-                        if candidate_content and candidate_content != last_emitted_content:
-                            prompt_candidates = [candidate]
-
-            for msg in prompt_candidates:
-                seq += 1
-                state.agent_events.append({
+            seq += 1
+            state.agent_events.append(
+                {
                     "ts": ts,
                     "seq": seq,
-                    "event_type": "user_prompt",
+                    "event_type": "api_call",
                     "payload": {
-                        "content": _get_string_content(msg.get("content", "")),
+                        "endpoint": endpoint,
+                        "method": record.get("method", "POST"),
+                        "model": model,
+                        "duration_ms": duration_ms,
+                        "status_code": status_code,
+                        "reasoning": (req_body.get("reasoning") or {}).get("effort"),
+                        "available_tools": available_tools,
                     },
                     "_source": "mitm",
-                })
+                }
+            )
+
+            instructions = req_body.get("instructions")
+            if isinstance(instructions, str) and instructions.strip():
+                seq += 1
+                state.agent_events.append(
+                    {
+                        "ts": ts,
+                        "seq": seq,
+                        "event_type": "system_instruction",
+                        "payload": {
+                            "content": instructions,
+                        },
+                        "_source": "mitm",
+                    }
+                )
+
+            user_prompts = _extract_user_prompts(messages)
+            if user_prompts:
+                seq += 1
+                state.agent_events.append(
+                    {
+                        "ts": ts,
+                        "seq": seq,
+                        "event_type": "user_prompt_batch",
+                        "payload": {
+                            "prompts": user_prompts,
+                            "count": len(user_prompts),
+                        },
+                        "_source": "mitm",
+                    }
+                )
+
+            if sse_parsed.get("reasoning_summary"):
+                seq += 1
+                state.agent_events.append(
+                    {
+                        "ts": ts,
+                        "seq": seq,
+                        "event_type": "reasoning_summary",
+                        "payload": {
+                            "content": sse_parsed.get("reasoning_summary", ""),
+                        },
+                        "_source": "mitm",
+                    }
+                )
+
+            for tool_start in sse_parsed.get("tool_calls", []):
+                seq += 1
+                state.agent_events.append(
+                    {
+                        "ts": ts,
+                        "seq": seq,
+                        "event_type": "tool_call_started",
+                        "payload": {
+                            "tool_call_id": tool_start.get("tool_call_id") or f"mitm_tc_{seq}",
+                            "tool_name": tool_start.get("tool_name") or "unknown",
+                            "arguments": tool_start.get("arguments") or {},
+                        },
+                        "_source": "mitm",
+                    }
+                )
+
+            for assistant_msg in sse_parsed.get("assistant_messages", []):
+                seq += 1
+                state.agent_events.append(
+                    {
+                        "ts": ts,
+                        "seq": seq,
+                        "event_type": "assistant_response",
+                        "payload": {
+                            "content": assistant_msg.get("content", ""),
+                            "phase": assistant_msg.get("phase"),
+                            "model": model,
+                        },
+                        "_source": "mitm",
+                    }
+                )
 
             # Deduplicate and emit tool results from previous turns
             # Supports both Chat Completions API (role=tool) and
@@ -333,50 +576,6 @@ class TraceStore:
                     },
                     "_source": "mitm",
                 })
-
-            # Process the model's response choices for current turn
-            for choice in choices:
-                msg = choice.get("message") or {}
-                tool_calls = msg.get("tool_calls") or []
-                content = msg.get("content")
-
-                if content:
-                    seq += 1
-                    state.agent_events.append({
-                        "ts": ts,
-                        "seq": seq,
-                        "event_type": "assistant_response",
-                        "payload": {
-                            "content": content,
-                            "model": model,
-                        },
-                        "_source": "mitm",
-                    })
-
-                if tool_calls:
-                    for tc in tool_calls:
-                        func = tc.get("function", {})
-                        tool_name = func.get("name", "unknown")
-                        tool_call_id = tc.get("id", f"mitm_tc_{seq}")
-                        args_raw = func.get("arguments", "{}")
-                        try:
-                            args = json.loads(args_raw)
-                        except json.JSONDecodeError:
-                            args = {"_raw": args_raw}
-
-                        seq += 1
-                        state.agent_events.append({
-                            "ts": ts,
-                            "seq": seq,
-                            "event_type": "tool_call_started",
-                            "payload": {
-                                "tool_call_id": tool_call_id,
-                                "tool_name": tool_name,
-                                "arguments": args,
-                            },
-                            "_source": "mitm",
-                        })
-
 
         state.mitm_offset = new_offset
         return True
@@ -447,6 +646,87 @@ class TraceStore:
         event["ts"] = time.time()
         event["line_no"] = state.strace_line_no
         state.sys_events.append(event)
+
+    def _extract_fd(self, args: str) -> int:
+        fd_match = re.match(r"(\d+)", args.strip())
+        return int(fd_match.group(1)) if fd_match else -1
+
+    def _socket_family(self, args: str) -> str:
+        if "AF_INET6" in args:
+            return "AF_INET6"
+        if "AF_INET" in args:
+            return "AF_INET"
+        if "AF_UNIX" in args:
+            return "AF_UNIX"
+        return "other"
+
+    def _socket_transport(self, args: str) -> str:
+        if "SOCK_DGRAM" in args:
+            return "udp"
+        if "SOCK_STREAM" in args:
+            return "tcp"
+        return "other"
+
+    def _parse_socket_address(self, args: str) -> dict[str, str]:
+        # AF_INET/AF_INET6: prefer inet_pton output when available.
+        addr_match = re.search(r"sin6?_addr=inet_pton\([^,]+,\s*\"([^\"]+)\"\)", args)
+        if not addr_match:
+            # Some traces contain inet_addr("x.x.x.x") style output.
+            addr_match = re.search(r"sin_addr=inet_addr\(\"([^\"]+)\"\)", args)
+        port_match = re.search(r"sin6?_port=htons\((\d+)\)", args)
+
+        if addr_match:
+            addr = addr_match.group(1)
+            port = port_match.group(1) if port_match else "?"
+            return {
+                "host": addr,
+                "port": port,
+                "endpoint": f"{addr}:{port}",
+            }
+
+        # AF_UNIX
+        unix_match = re.search(r"sun_path=\"([^\"]+)\"", args)
+        if unix_match:
+            path = unix_match.group(1)
+            return {
+                "host": "unix",
+                "port": "",
+                "endpoint": f"unix:{path}",
+            }
+
+        return {"host": "unknown", "port": "", "endpoint": "unknown"}
+
+    def _parse_ret_status(self, ret: str) -> dict[str, Any]:
+        raw = ret.strip()
+        if raw.startswith("-1"):
+            err_match = re.search(r"\b([A-Z][A-Z0-9_]+)\b", raw)
+            err_code = err_match.group(1) if err_match else "ERROR"
+            return {"ok": False, "error": err_code, "raw": raw}
+
+        n_match = re.match(r"(\d+)", raw)
+        return {
+            "ok": True,
+            "value": int(n_match.group(1)) if n_match else 0,
+            "raw": raw,
+        }
+
+    def _network_display_label(self, event: dict[str, Any]) -> str:
+        dest = str(event.get("dest") or "unknown")
+        transport = str(event.get("transport") or "").strip()
+        family = str(event.get("family") or "").strip()
+
+        if dest.startswith("fd="):
+            if transport:
+                return f"{transport} unresolved ({dest})"
+            if family:
+                return f"{family} unresolved ({dest})"
+            return f"unresolved ({dest})"
+
+        if transport and transport != "other":
+            return f"{transport} {dest}"
+        if family and family != "other":
+            return f"{family} {dest}"
+        return dest
 
     def _handle_syscall(self, state: TraceState, pid: int, syscall: str, args: str, ret: str) -> bool:
         if state.root_pid is None and syscall == "execve":
@@ -555,94 +835,98 @@ class TraceStore:
             fd_match = re.search(r"(\d+)\s*$", ret)
             if fd_match and not ret.strip().startswith("-1"):
                 fd = int(fd_match.group(1))
-                family = "AF_INET" if "AF_INET" in args else ("AF_INET6" if "AF_INET6" in args else "other")
-                sock_type = "STREAM" if "SOCK_STREAM" in args else ("DGRAM" if "SOCK_DGRAM" in args else "other")
-                state.pid_fds[(pid, fd)] = {"family": family, "sock_type": sock_type}
+                state.pid_fds[(pid, fd)] = {
+                    "family": self._socket_family(args),
+                    "transport": self._socket_transport(args),
+                }
             return False  # don't emit event for socket() alone
 
+        if syscall == "close":
+            fd = self._extract_fd(args)
+            if fd >= 0:
+                state.pid_fds.pop((pid, fd), None)
+            return False
+
         if syscall == "connect":
-            if ret.strip().startswith("-1"):
-                return False
-            fd_match = re.match(r"(\d+)", args.strip())
-            fd = int(fd_match.group(1)) if fd_match else -1
-            # Extract address: sin_addr, sin6_addr, or sun_path
-            addr_match = re.search(r"sin6?_addr=inet_pton\([^,]+,\s*\"([^\"]+)\"\)", args)
-            if not addr_match:
-                addr_match = re.search(r"sin6?_addr=htons\(([^)]+)\)", args)
-            port_match = re.search(r"sin6?_port=htons\((\d+)\)", args)
-            addr = addr_match.group(1) if addr_match else "unknown"
-            port = port_match.group(1) if port_match else "?"
-            # Skip local/loopback unless it looks like an API call
-            if addr in ("127.0.0.1", "::1") and port not in ("80", "443", "8080", "8443"):
-                return False
-            dest = f"{addr}:{port}"
+            fd = self._extract_fd(args)
+            status = self._parse_ret_status(ret)
+            parsed_addr = self._parse_socket_address(args)
+            dest = parsed_addr["endpoint"]
             sock_info = state.pid_fds.get((pid, fd), {})
+            if fd >= 0 and status.get("ok"):
+                sock_info["dest"] = dest
+                state.pid_fds[(pid, fd)] = sock_info
+            transport = str(sock_info.get("transport") or self._socket_transport(args))
+            family = str(sock_info.get("family") or self._socket_family(args))
+            label_status = "ok" if status.get("ok") else f"failed ({status.get('error')})"
             self._push_sys_event(
                 state,
                 {
                     "type": "net_connect",
                     "pid": pid,
+                    "fd": fd,
                     "dest": dest,
-                    "addr": addr,
-                    "port": port,
-                    "family": sock_info.get("family", "?"),
-                    "label": f"connect {dest}",
+                    "addr": parsed_addr["host"],
+                    "port": parsed_addr["port"],
+                    "family": family,
+                    "transport": transport,
+                    "ok": status.get("ok", False),
+                    "error": status.get("error"),
+                    "label": f"connect {transport} {dest} [{label_status}]",
                 },
             )
             return True
 
         if syscall in {"sendto", "sendmsg"}:
-            if ret.strip().startswith("-1"):
-                return False
-            fd_match = re.match(r"(\d+)", args.strip())
-            fd = int(fd_match.group(1)) if fd_match else -1
-            bytes_sent = 0
-            ret_bytes = re.match(r"(\d+)", ret.strip())
-            if ret_bytes:
-                bytes_sent = int(ret_bytes.group(1))
-            addr_match = re.search(r"sin6?_addr=inet_pton\([^,]+,\s*\"([^\"]+)\"\)", args)
-            port_match = re.search(r"sin6?_port=htons\((\d+)\)", args)
-            addr = addr_match.group(1) if addr_match else None
-            port = port_match.group(1) if port_match else None
-            dest = f"{addr}:{port}" if addr else "fd={fd}"
-            if addr and addr in ("127.0.0.1", "::1"):
-                return False
+            fd = self._extract_fd(args)
+            status = self._parse_ret_status(ret)
+            bytes_sent = int(status.get("value", 0)) if status.get("ok") else 0
+            parsed_addr = self._parse_socket_address(args)
+            sock_info = state.pid_fds.get((pid, fd), {})
+            transport = str(sock_info.get("transport") or "other")
+            family = str(sock_info.get("family") or "other")
+            dest = parsed_addr["endpoint"] if parsed_addr["endpoint"] != "unknown" else str(sock_info.get("dest") or f"fd={fd}")
+            label_status = "ok" if status.get("ok") else f"failed ({status.get('error')})"
             self._push_sys_event(
                 state,
                 {
                     "type": "net_send",
                     "pid": pid,
+                    "fd": fd,
                     "dest": dest,
                     "bytes": bytes_sent,
-                    "label": f"send {bytes_sent}B -> {dest}",
+                    "family": family,
+                    "transport": transport,
+                    "ok": status.get("ok", False),
+                    "error": status.get("error"),
+                    "label": f"send {bytes_sent}B -> {dest} [{label_status}]",
                 },
             )
             return True
 
         if syscall in {"recvfrom", "recvmsg"}:
-            if ret.strip().startswith("-1"):
-                return False
-            fd_match = re.match(r"(\d+)", args.strip())
-            fd = int(fd_match.group(1)) if fd_match else -1
-            bytes_recv = 0
-            ret_bytes = re.match(r"(\d+)", ret.strip())
-            if ret_bytes:
-                bytes_recv = int(ret_bytes.group(1))
-            addr_match = re.search(r"sin6?_addr=inet_pton\([^,]+,\s*\"([^\"]+)\"\)", args)
-            port_match = re.search(r"sin6?_port=htons\((\d+)\)", args)
-            addr = addr_match.group(1) if addr_match else None
-            port = port_match.group(1) if port_match else None
-            src = f"{addr}:{port}" if addr else "fd={fd}"
-            if addr and addr in ("127.0.0.1", "::1"):
-                return False
+            fd = self._extract_fd(args)
+            status = self._parse_ret_status(ret)
+            bytes_recv = int(status.get("value", 0)) if status.get("ok") else 0
+            parsed_addr = self._parse_socket_address(args)
+            sock_info = state.pid_fds.get((pid, fd), {})
+            transport = str(sock_info.get("transport") or "other")
+            family = str(sock_info.get("family") or "other")
+            src = parsed_addr["endpoint"] if parsed_addr["endpoint"] != "unknown" else str(sock_info.get("dest") or f"fd={fd}")
+            label_status = "ok" if status.get("ok") else f"failed ({status.get('error')})"
             self._push_sys_event(
                 state,
                 {
                     "type": "net_recv",
                     "pid": pid,
+                    "fd": fd,
                     "dest": src,
                     "bytes": bytes_recv,
-                    "label": f"recv {bytes_recv}B <- {src}",
+                    "family": family,
+                    "transport": transport,
+                    "ok": status.get("ok", False),
+                    "error": status.get("error"),
+                    "label": f"recv {bytes_recv}B <- {src} [{label_status}]",
                 },
             )
             return True
@@ -776,6 +1060,35 @@ class TraceStore:
                 label = "Prompt"
                 kind = "prompt"
                 metadata = {"content": payload.get("content", "")}
+            elif event_type == "user_prompt_batch":
+                prompts = payload.get("prompts") or []
+                label = f"User Prompts ({len(prompts)})"
+                kind = "prompt_batch"
+                metadata = {
+                    "prompts": prompts,
+                    "count": len(prompts),
+                }
+            elif event_type == "system_instruction":
+                label = "System Instructions"
+                kind = "system_instruction"
+                metadata = {"content": payload.get("content", "")}
+            elif event_type == "reasoning_summary":
+                label = "Reasoning"
+                kind = "reasoning"
+                metadata = {"content": payload.get("content", "")}
+            elif event_type == "api_call":
+                endpoint = str(payload.get("endpoint") or "")
+                model = str(payload.get("model") or "")
+                label = "API Call"
+                kind = "api_call"
+                metadata = {
+                    "endpoint": endpoint,
+                    "method": payload.get("method", "POST"),
+                    "model": model,
+                    "reasoning": payload.get("reasoning"),
+                    "duration_ms": payload.get("duration_ms"),
+                    "status_code": payload.get("status_code"),
+                }
             elif event_type == "tool_call_started":
                 tool_call_id = payload.get("tool_call_id")
                 finish_tuple = tool_finish_by_id.get(str(tool_call_id)) if tool_call_id else None
@@ -801,6 +1114,49 @@ class TraceStore:
                     "result": result,
                     "duration_ms": finish_payload.get("duration_ms"),
                 }
+
+                node_id = f"hl_{len(nodes)}"
+                node = {
+                    "id": node_id,
+                    "label": label,
+                    "kind": kind,
+                    "metadata": metadata,
+                    "ts": event.get("ts"),
+                }
+                nodes.append(node)
+                timeline.append(node)
+
+                if prev_id is not None:
+                    edges.append({"source": prev_id, "target": node_id, "label": "next"})
+                prev_id = node_id
+
+                if finish_event is not None:
+                    output_node_id = f"hl_{len(nodes)}"
+                    output_result = finish_payload.get("result")
+                    output_status = "ok"
+                    if isinstance(output_result, dict) and output_result.get("ok") is False:
+                        output_status = "error"
+                    elif finish_event.get("event_type") != "tool_call_finished":
+                        output_status = "error"
+
+                    output_node = {
+                        "id": output_node_id,
+                        "label": "Tool Output",
+                        "kind": "tool_output",
+                        "metadata": {
+                            "tool_call_id": tool_call_id,
+                            "tool_name": payload.get("tool_name"),
+                            "status": output_status,
+                            "result": output_result,
+                            "duration_ms": finish_payload.get("duration_ms"),
+                        },
+                        "ts": finish_event.get("ts") or event.get("ts"),
+                    }
+                    nodes.append(output_node)
+                    timeline.append(output_node)
+                    edges.append({"source": node_id, "target": output_node_id, "label": "output"})
+                    prev_id = output_node_id
+                continue
             elif event_type == "assistant_response":
                 label = "Agent Response"
                 kind = "assistant_response"
@@ -824,7 +1180,7 @@ class TraceStore:
             prev_id = node_id
 
         summary = {
-            "prompts": sum(1 for n in nodes if n["kind"] == "prompt"),
+            "prompts": sum(1 for n in nodes if n["kind"] == "prompt") + sum(int(n.get("metadata", {}).get("count", 0)) for n in nodes if n["kind"] == "prompt_batch"),
             "tool_steps": sum(1 for n in nodes if n["kind"] == "tool_step"),
             "responses": sum(1 for n in nodes if n["kind"] == "assistant_response"),
             "trace_status": "completed" if t.complete else "active",
@@ -909,7 +1265,7 @@ class TraceStore:
         for ne in net_events:
             idx = _find_owning_cmd_idx(int(ne.get("line_no", 0)))
             if idx is not None:
-                cmd_net[idx].add(str(ne.get("dest") or "unknown"))
+                cmd_net[idx].add(self._network_display_label(ne))
 
         # ── Collapse consecutive similar commands ──────────────────────
         # e.g. many git rev-parse calls → single node
@@ -984,7 +1340,7 @@ class TraceStore:
         for fe in file_events:
             all_files.add(str(fe.get("path")))
         for ne in net_events:
-            all_net.add(str(ne.get("dest") or "unknown"))
+            all_net.add(self._network_display_label(ne))
 
         summary = {
             "commands": len(visible_commands),
@@ -1037,8 +1393,22 @@ class TraceStore:
                 return 0
             if tool_n in exec_n:
                 return len(tool_n)
-            tokens = [tok for tok in re.split(r"\s+", tool_n) if len(tok) >= 3]
-            return sum(1 for tok in tokens if tok in exec_n)
+            tool_tokens = [tok for tok in re.findall(r"[A-Za-z0-9_./-]+", tool_n) if len(tok) >= 2]
+            exec_tokens = [tok for tok in re.findall(r"[A-Za-z0-9_./-]+", exec_n) if len(tok) >= 2]
+            if not tool_tokens or not exec_tokens:
+                return 0
+
+            score = 0
+            exec_base_tokens = {Path(tok).name.lower() for tok in exec_tokens}
+            primary = Path(tool_tokens[0]).name.lower()
+            if primary in exec_base_tokens:
+                score += 10
+
+            for tok in tool_tokens:
+                if tok.lower() in exec_n:
+                    score += 1
+
+            return score
 
         for start in starts:
             payload = start.get("payload") or {}
@@ -1048,7 +1418,13 @@ class TraceStore:
 
             tool_name = payload.get("tool_name")
             tool_args = payload.get("arguments") or {}
-            tool_cmd = str(tool_args.get("command") or "") if tool_name == "command_exec" else ""
+            tool_cmd = ""
+            if isinstance(tool_args, dict):
+                # Support both command_exec-style {command: ...} and exec_command-style {cmd: ...}.
+                tool_cmd = str(tool_args.get("command") or tool_args.get("cmd") or "")
+            if not tool_cmd and isinstance(tool_name, str):
+                # Last-resort fallback: use tool name as weak signal.
+                tool_cmd = tool_name
 
             chosen_idx = None
 
@@ -1577,13 +1953,13 @@ class TraceStore:
             cmd_id = match_command_for_event(ne)
             if cmd_id is None:
                 continue
-            dest = str(ne.get("dest") or "unknown")
-            key = (cmd_id, dest)
+            display = self._network_display_label(ne)
+            key = (cmd_id, display)
             bucket = net_agg.setdefault(
                 key,
                 {
                     "cmd_id": cmd_id,
-                    "dest": dest,
+                    "dest": display,
                     "types": set(),
                     "bytes_total": 0,
                     "count": 0,
@@ -1733,6 +2109,29 @@ class TraceStore:
     def trace_summary(self, trace_id: str) -> dict[str, Any]:
         t = self._get_trace(trace_id)
 
+        tools_set: set[str] = set()
+        tool_calls: list[dict[str, str]] = []
+        seen_tool_call_ids: set[str] = set()
+        for event in t.agent_events:
+            payload = event.get("payload") or {}
+            if event.get("event_type") == "tool_call_started":
+                name = payload.get("tool_name")
+                if isinstance(name, str) and name:
+                    tools_set.add(name)
+                call_id = payload.get("tool_call_id")
+                if isinstance(call_id, str) and call_id and call_id not in seen_tool_call_ids:
+                    seen_tool_call_ids.add(call_id)
+                    tool_calls.append(
+                        {
+                            "tool_call_id": call_id,
+                            "tool_name": str(name or "unknown"),
+                        }
+                    )
+            if event.get("event_type") == "api_call":
+                for name in payload.get("available_tools") or []:
+                    if isinstance(name, str) and name:
+                        tools_set.add(name)
+
         file_agg: dict[str, dict[str, Any]] = {}
         for event in t.sys_events:
             event_type = str(event.get("type") or "")
@@ -1761,18 +2160,46 @@ class TraceStore:
         files.sort(key=lambda x: (-x["count"], x["path"]))
 
         # Collect network endpoints
-        net_agg: dict[str, dict[str, Any]] = {}
+        net_agg: dict[tuple[str, str], dict[str, Any]] = {}
         for event in t.sys_events:
             event_type = str(event.get("type") or "")
             if event_type not in {"net_connect", "net_send", "net_recv"}:
                 continue
-            dest = str(event.get("dest") or "unknown")
-            bucket = net_agg.setdefault(dest, {"dest": dest, "ops": set(), "bytes": 0, "count": 0})
+            display = self._network_display_label(event)
+            transport = str(event.get("transport") or "other")
+            key = (display, transport)
+            bucket = net_agg.setdefault(
+                key,
+                {
+                    "dest": display,
+                    "ops": set(),
+                    "bytes": 0,
+                    "count": 0,
+                    "transport": transport,
+                    "family": str(event.get("family") or "other"),
+                    "failed": 0,
+                    "errors": set(),
+                },
+            )
             bucket["ops"].add(event_type.replace("net_", ""))
             bucket["bytes"] += int(event.get("bytes", 0))
             bucket["count"] += 1
+            if event.get("ok") is False:
+                bucket["failed"] += 1
+                err = str(event.get("error") or "")
+                if err:
+                    bucket["errors"].add(err)
         net_endpoints = [
-            {"dest": v["dest"], "ops": sorted(v["ops"]), "bytes": v["bytes"], "count": v["count"]}
+            {
+                "dest": v["dest"],
+                "ops": sorted(v["ops"]),
+                "bytes": v["bytes"],
+                "count": v["count"],
+                "transport": v["transport"],
+                "family": v["family"],
+                "failed": v["failed"],
+                "errors": sorted(v["errors"]),
+            }
             for v in net_agg.values()
         ]
         net_endpoints.sort(key=lambda x: (-x["count"], x["dest"]))
@@ -1782,6 +2209,8 @@ class TraceStore:
             "status": "completed" if t.complete else "active",
             "files": files[:250],
             "network": net_endpoints[:100],
+            "tools": sorted(tools_set),
+            "tool_calls": tool_calls,
             "totals": {
                 "unique_files": len(files),
                 "network_endpoints": len(net_endpoints),
@@ -1837,18 +2266,46 @@ class TraceStore:
         files.sort(key=lambda x: (-x["count"], x["path"]))
 
         # Network endpoints for this tool
-        net_agg: dict[str, dict[str, Any]] = {}
+        net_agg: dict[tuple[str, str], dict[str, Any]] = {}
         for event in related:
             event_type = str(event.get("type") or "")
             if event_type not in {"net_connect", "net_send", "net_recv"}:
                 continue
-            dest = str(event.get("dest") or "unknown")
-            bucket = net_agg.setdefault(dest, {"dest": dest, "ops": set(), "bytes": 0, "count": 0})
+            display = self._network_display_label(event)
+            transport = str(event.get("transport") or "other")
+            key = (display, transport)
+            bucket = net_agg.setdefault(
+                key,
+                {
+                    "dest": display,
+                    "ops": set(),
+                    "bytes": 0,
+                    "count": 0,
+                    "transport": transport,
+                    "family": str(event.get("family") or "other"),
+                    "failed": 0,
+                    "errors": set(),
+                },
+            )
             bucket["ops"].add(event_type.replace("net_", ""))
             bucket["bytes"] += int(event.get("bytes", 0))
             bucket["count"] += 1
+            if event.get("ok") is False:
+                bucket["failed"] += 1
+                err = str(event.get("error") or "")
+                if err:
+                    bucket["errors"].add(err)
         net_endpoints = [
-            {"dest": v["dest"], "ops": sorted(v["ops"]), "bytes": v["bytes"], "count": v["count"]}
+            {
+                "dest": v["dest"],
+                "ops": sorted(v["ops"]),
+                "bytes": v["bytes"],
+                "count": v["count"],
+                "transport": v["transport"],
+                "family": v["family"],
+                "failed": v["failed"],
+                "errors": sorted(v["errors"]),
+            }
             for v in net_agg.values()
         ]
         net_endpoints.sort(key=lambda x: (-x["count"], x["dest"]))
@@ -1862,6 +2319,18 @@ class TraceStore:
 
 
 app = FastAPI(title="Agent System Observability Dashboard")
+
+
+@app.middleware("http")
+async def disable_frontend_cache(request: Request, call_next):
+    """Avoid stale JS/HTML in browser cache, especially across Docker rebuilds."""
+    response = await call_next(request)
+    path = request.url.path
+    if path == "/" or path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
 
 
 def _resolve_paths() -> tuple[Path, Path]:

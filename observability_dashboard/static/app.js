@@ -13,6 +13,7 @@ let latestVersion = -1;
 let zoomLevel = 1;
 let selectedNodeId = null;
 let cachedTraceFiles = []; // trace-level files cache
+let cachedTraceTools = [];
 let currentStraceMode = false; // true when showing strace-only (no trajectory)
 
 // ─── DOM refs ─────────────────────────────────────────────────────
@@ -27,6 +28,11 @@ const filesListEl = $("filesList");
 const fileScopeLabel = $("fileScopeLabel");
 const fileCountBadge = $("fileCountBadge");
 const fileFilterEl = $("fileFilter");
+const toolsListEl = $("toolsList");
+const toolsCountBadge = $("toolsCountBadge");
+const toolsToggle = $("toolsToggle");
+const toolsSectionBody = $("toolsSectionBody");
+const toolsCaret = $("toolsCaret");
 const zoomInBtn = $("zoomInBtn");
 const zoomOutBtn = $("zoomOutBtn");
 const fitBtn = $("fitBtn");
@@ -55,6 +61,56 @@ function escapeHtml(str) {
   const div = document.createElement("div");
   div.textContent = str;
   return div.innerHTML;
+}
+
+let toolsExpanded = true;
+async function openToolDrilldown(toolCallId, toolName) {
+  if (!selectedTraceId || !toolCallId) return;
+  currentMode = "tool";
+  currentToolCallId = toolCallId;
+  zoomLevel = 1;
+  applyZoom();
+  renderBreadcrumbs();
+  await loadToolGraph(toolCallId);
+
+  try {
+    const summary = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/tool-summary/${encodeURIComponent(toolCallId)}`);
+    const files = summary.files || [];
+    const net = summary.network || [];
+    window._lastToolFiles = files;
+    window._lastToolNetwork = net;
+    if (files.length > 0 || net.length > 0) {
+      renderFiles(files, `Files for: ${toolName || toolCallId}`, files.length, net);
+    } else {
+      renderFiles(cachedTraceFiles, "No tool-specific files - showing trace-level activity", cachedTraceFiles.length, window._cachedTraceNetwork);
+    }
+  } catch (_) {
+    renderFiles(cachedTraceFiles, "Trace-level file activity", cachedTraceFiles.length, window._cachedTraceNetwork);
+  }
+}
+
+function renderTools(tools) {
+  cachedTraceTools = Array.isArray(tools) ? tools : [];
+  toolsCountBadge.textContent = `${cachedTraceTools.length}`;
+  toolsListEl.innerHTML = "";
+
+  if (cachedTraceTools.length === 0) {
+    toolsListEl.innerHTML = '<div class="tools-empty">No tool metadata captured yet.</div>';
+    return;
+  }
+
+  for (const name of cachedTraceTools) {
+    const row = document.createElement("div");
+    row.className = "tool-item";
+    row.textContent = name;
+    toolsListEl.appendChild(row);
+  }
+}
+
+function setToolsExpanded(expanded) {
+  toolsExpanded = expanded;
+  toolsSectionBody.style.display = expanded ? "block" : "none";
+  toolsCaret.textContent = expanded ? "▼" : "▶";
 }
 
 // ─── API ──────────────────────────────────────────────────────────
@@ -181,6 +237,10 @@ document.addEventListener("keydown", (e) => {
     goBackToHighLevel();
   }
 });
+
+if (toolsToggle) {
+  toolsToggle.addEventListener("click", () => setToolsExpanded(!toolsExpanded));
+}
 
 // ─── File Tree Building ────────────────────────────────────────────
 function buildFileTree(files) {
@@ -402,11 +462,20 @@ function renderFiles(files, scopeLabel, totalCount, network) {
         const opsHtml = (n.ops || [])
           .map((op) => `<span class="op-badge op-${op}">${op}</span>`)
           .join("");
+        const metaBadges = [];
+        if (n.transport && n.transport !== "other") metaBadges.push(`<span class="file-count">${escapeHtml(n.transport)}</span>`);
+        if (n.family && n.family !== "other") metaBadges.push(`<span class="file-count">${escapeHtml(n.family)}</span>`);
+        if ((n.failed || 0) > 0) metaBadges.push(`<span class="file-count" style="color:var(--orange-600);">fail:${n.failed}</span>`);
+        if (Array.isArray(n.errors) && n.errors.length > 0) {
+          const err = n.errors.slice(0, 2).join(",");
+          metaBadges.push(`<span class="file-count" title="${escapeHtml(n.errors.join(", "))}">${escapeHtml(err)}</span>`);
+        }
         const bytesStr = n.bytes > 1024 ? `${(n.bytes / 1024).toFixed(1)}KB` : (n.bytes > 0 ? `${n.bytes}B` : "");
         row.innerHTML = `
           <div class="file-path" style="color:var(--emerald-600);">${escapeHtml(n.dest)}</div>
           <div class="file-ops">
             ${opsHtml}
+            ${metaBadges.join("")}
             ${bytesStr ? `<span class="file-count">${bytesStr}</span>` : ""}
             <span class="file-count">×${n.count || 0}</span>
           </div>`;
@@ -503,16 +572,40 @@ function renderHighLevelGraph(payload) {
     el.dataset.nodeId = node.id;
 
     // Header
-    const kindLabels = { prompt: "User Prompt", tool_step: "Tool Call", assistant_response: "Agent Response" };
+    const kindLabels = {
+      api_call: "API Call",
+      system_instruction: "System Prompt",
+      prompt: "User Prompt",
+      prompt_batch: "User Prompts",
+      reasoning: "Reasoning",
+      tool_step: "Tool Call",
+      tool_output: "Tool Output",
+      assistant_response: "Agent Response",
+    };
     const kindLabel = kindLabels[kind] || kind;
     const duration = formatDuration(meta.duration_ms);
 
     let titleText = "";
     let bodyText = "";
 
-    if (kind === "prompt") {
+    if (kind === "api_call") {
+      titleText = `${meta.method || "POST"} ${meta.endpoint || "API"}`;
+      const lineBits = [];
+      if (meta.model) lineBits.push(`model=${meta.model}`);
+      if (meta.reasoning) lineBits.push(`reasoning=${meta.reasoning}`);
+      if (meta.status_code != null) lineBits.push(`status=${meta.status_code}`);
+      bodyText = lineBits.join(" | ");
+    } else if (kind === "system_instruction") {
+      titleText = "System Instructions";
+      bodyText = truncate(meta.content, 420);
+    } else if (kind === "prompt") {
       titleText = "User Prompt";
       bodyText = truncate(meta.content);
+    } else if (kind === "prompt_batch") {
+      titleText = `User Prompts (${meta.count || 0})`;
+      const prompts = Array.isArray(meta.prompts) ? meta.prompts : [];
+      const preview = prompts.length > 0 ? truncate(prompts[0], 200) : "";
+      bodyText = preview || `${meta.count || 0} prompts captured. Double-click to expand.`;
     } else if (kind === "tool_step") {
       titleText = meta.tool_name || "Tool";
       const args = meta.arguments || {};
@@ -521,13 +614,19 @@ function renderHighLevelGraph(payload) {
       } else {
         bodyText = truncate(JSON.stringify(args));
       }
+    } else if (kind === "tool_output") {
+      titleText = `${meta.tool_name || "Tool"} Output`;
+      bodyText = truncate(JSON.stringify(meta.result || {}), 420);
+    } else if (kind === "reasoning") {
+      titleText = "Reasoning Summary";
+      bodyText = truncate(meta.content, 420);
     } else if (kind === "assistant_response") {
       titleText = "Agent Response";
       bodyText = truncate(meta.content);
     }
 
     let footerHtml = "";
-    if (kind === "tool_step") {
+    if (kind === "tool_step" || kind === "tool_output") {
       const statusBadge = meta.status === "error"
         ? '<span class="status-badge error">✗ Error</span>'
         : '<span class="status-badge ok">✓ Success</span>';
@@ -545,7 +644,7 @@ function renderHighLevelGraph(payload) {
         ${duration ? `<span class="tnode-duration">${duration}</span>` : ""}
       </div>
       <div class="tnode-title">${escapeHtml(titleText)}</div>
-      <div class="tnode-body"><code>${escapeHtml(bodyText)}</code></div>
+      <div class="tnode-body">${kind === "prompt_batch" ? escapeHtml(bodyText) : `<code>${escapeHtml(bodyText)}</code>`}</div>
       ${footerHtml}`;
 
     // Click → show details + tool files
@@ -579,27 +678,22 @@ function renderHighLevelGraph(payload) {
     // Double-click → drill down into tool
     el.addEventListener("dblclick", async (e) => {
       e.stopPropagation();
-      if ((kind === "tool_step" || kind === "tool_call") && meta.tool_call_id) {
-        currentMode = "tool";
-        currentToolCallId = meta.tool_call_id;
-        zoomLevel = 1;
-        applyZoom();
-        await loadToolGraph(meta.tool_call_id);
-
-        try {
-          const summary = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/tool-summary/${encodeURIComponent(meta.tool_call_id)}`);
-          const files = summary.files || [];
-          const net = summary.network || [];
-          window._lastToolFiles = files;
-          window._lastToolNetwork = net;
-          if (files.length > 0 || net.length > 0) {
-            renderFiles(files, `Files for: ${meta.tool_name || meta.tool_call_id}`, files.length, net);
-          } else {
-            renderFiles(cachedTraceFiles, "No tool-specific files — showing trace-level activity", cachedTraceFiles.length, window._cachedTraceNetwork);
-          }
-        } catch (_) {
-          renderFiles(cachedTraceFiles, "Trace-level file activity", cachedTraceFiles.length, window._cachedTraceNetwork);
+      if (kind === "prompt_batch") {
+        const prompts = Array.isArray(meta.prompts) ? meta.prompts : [];
+        const bodyEl = el.querySelector(".tnode-body");
+        if (!bodyEl) return;
+        const expanded = el.classList.toggle("expanded");
+        if (!expanded) {
+          bodyEl.textContent = `${meta.count || 0} prompts captured. Double-click to expand.`;
+          return;
         }
+        const lines = prompts.map((p, i) => `${i + 1}. ${p}`).join("\n\n");
+        bodyEl.innerHTML = `<code>${escapeHtml(lines || "No prompts")}</code>`;
+        return;
+      }
+
+      if ((kind === "tool_step" || kind === "tool_call") && meta.tool_call_id) {
+        await openToolDrilldown(meta.tool_call_id, meta.tool_name || meta.tool_call_id);
       }
     });
 
@@ -998,11 +1092,13 @@ async function loadTraceSummary() {
   try {
     const summary = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/summary`);
     cachedTraceFiles = summary.files || [];
+    renderTools(summary.tools || []);
     window._cachedTraceNetwork = summary.network || [];
     const total = summary.totals?.unique_files ?? cachedTraceFiles.length;
     renderFiles(cachedTraceFiles, "Trace-level file activity", total, window._cachedTraceNetwork);
   } catch {
     cachedTraceFiles = [];
+    renderTools([]);
     window._cachedTraceNetwork = [];
     renderFiles([], "Unable to load file summary.");
   }
@@ -1034,6 +1130,7 @@ async function refreshTraces(keepView = true, force = false) {
 
 // ─── Init ─────────────────────────────────────────────────────────
 async function init() {
+  setToolsExpanded(true);
   await refreshTraces(false);
 
   // Polling fallback

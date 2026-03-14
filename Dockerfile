@@ -35,6 +35,7 @@ COPY . /workspace/simple_agent
 RUN chmod +x \
     /workspace/simple_agent/bin/rtrace \
     /workspace/simple_agent/bin/rtrace_monitor \
+    /workspace/simple_agent/bin/strace_test \
     /workspace/simple_agent/scripts/agent_setup/run_setup_scripts.sh \
     /workspace/simple_agent/scripts/agent_setup/codex_setup.sh \
     /workspace/simple_agent/scripts/install_rtrace.sh \
@@ -42,7 +43,8 @@ RUN chmod +x \
     /workspace/simple_agent/run_intercepted_codex.sh
 
 RUN ln -sf /workspace/simple_agent/bin/rtrace /usr/local/bin/rtrace && \
-    ln -sf /workspace/simple_agent/bin/rtrace_monitor /usr/local/bin/rtrace_monitor
+    ln -sf /workspace/simple_agent/bin/rtrace_monitor /usr/local/bin/rtrace_monitor && \
+    ln -sf /workspace/simple_agent/bin/strace_test /usr/local/bin/strace_test
 
 ENV PATH="/opt/rtrace-venv/bin:/usr/local/bin:${PATH}" \
     RTRACE_VENV="/opt/rtrace-venv" \

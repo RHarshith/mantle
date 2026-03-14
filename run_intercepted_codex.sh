@@ -249,7 +249,9 @@ AGENT_ARGS=("${TASK[@]:-}")
 
 if $USE_STRACE; then
     echo "[*] Running $AGENT_BIN with strace..."
-    strace -f -e trace=process,file,network -o "$STRACE_FILE" "$AGENT_BIN" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"
+    # -yy decodes socket FDs to endpoint hints, -s raises captured string size.
+    STRACE_STR_SIZE="${RTRACE_STRACE_STRING_SIZE:-512}"
+    strace -f -yy -s "$STRACE_STR_SIZE" -e trace=process,file,network -o "$STRACE_FILE" "$AGENT_BIN" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"
 else
     echo "[*] Running $AGENT_BIN..."
     touch "$STRACE_FILE"
