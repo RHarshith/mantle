@@ -84,7 +84,8 @@ case "$SUBCOMMAND" in
         fi
 
         if [[ "${EUID}" -ne 0 ]]; then
-            exec sudo "$RUNNER" "${ARGS[@]}"
+            PRESERVE_ENV_VARS="OPENAI_API_KEY,AGENT_OBS_ROOT,RTRACE_VENV,RTRACE_INTERCEPT_MODE,RTRACE_FORCE_OPENAI_BASE,RTRACE_STRACE_STRING_SIZE"
+            exec sudo --preserve-env="$PRESERVE_ENV_VARS" "$RUNNER" "${ARGS[@]}"
         fi
         exec "$RUNNER" "${ARGS[@]}"
         ;;

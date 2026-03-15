@@ -106,6 +106,50 @@ def _safe_int(value: str, default: int = 0) -> int:
         return default
 
 
+def _command_for_bpftrace(command: list[str]) -> list[str]:
+    """Normalize command argv for bpftrace -c.
+
+    Some bpftrace builds fail to launch script entrypoints directly (for example,
+    a Node CLI script with a shebang). If argv[0] is a shebang script, run it via
+    its declared interpreter so child process launch is reliable.
+    """
+    if not command:
+        return command
+
+    exe = Path(command[0])
+    if not exe.exists() or not exe.is_file():
+        return command
+
+    try:
+        with exe.open("rb") as fh:
+            header = fh.read(4)
+            fh.seek(0)
+            first_line = fh.readline().decode("utf-8", errors="replace").strip()
+    except OSError:
+        return command
+
+    # Native binaries should run as-is.
+    if header == b"\x7fELF":
+        return command
+
+    if not first_line.startswith("#!"):
+        return command
+
+    shebang = first_line[2:].strip()
+    if not shebang:
+        return command
+
+    try:
+        interpreter_argv = shlex.split(shebang)
+    except ValueError:
+        return command
+
+    if not interpreter_argv:
+        return command
+
+    return interpreter_argv + [str(exe)] + command[1:]
+
+
 def _event_from_line(raw: str, seq: int, cmdline_cache: dict[int, str]) -> dict[str, Any] | None:
     line = raw.strip()
     if not line.startswith("EVT|"):
@@ -287,10 +331,18 @@ def run_capture(output_file: Path, command: list[str]) -> int:
         script_file.write(BPFTRACE_PROGRAM)
         script_path = Path(script_file.name)
 
+    launch_argv = _command_for_bpftrace(command)
+    with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as runner_file:
+        runner_file.write("#!/usr/bin/env bash\n")
+        runner_file.write("set -euo pipefail\n")
+        runner_file.write(f"exec {shlex.join(launch_argv)}\n")
+        runner_path = Path(runner_file.name)
+    runner_path.chmod(0o700)
+
     cmdline_cache: dict[int, str] = {}
     seq = 0
 
-    shell_cmd = shlex.join(command)
+    shell_cmd = f"/bin/bash {runner_path}"
     proc = subprocess.Popen(
         ["bpftrace", "-q", "-c", shell_cmd, str(script_path)],
         stdout=subprocess.PIPE,
@@ -310,6 +362,7 @@ def run_capture(output_file: Path, command: list[str]) -> int:
                 out_fh.write(json.dumps(event, ensure_ascii=False) + "\n")
     finally:
         script_path.unlink(missing_ok=True)
+        runner_path.unlink(missing_ok=True)
 
     stderr = ""
     if proc.stderr is not None:

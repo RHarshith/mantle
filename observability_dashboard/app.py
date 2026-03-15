@@ -1563,15 +1563,37 @@ class TraceStore:
             return [], []
 
         tool_cmd = self._extract_tool_command_text(tool_payload)
+        has_tool_cmd = bool(self._normalize_command_text(tool_cmd))
+        min_tool_match_score = 8
         non_wrapper_exists = any(not self._is_shell_wrapper_command(cmd) for cmd in command_events)
 
         relevant: list[dict[str, Any]] = []
         internal: list[dict[str, Any]] = []
 
+        scored: list[tuple[dict[str, Any], int, bool, bool]] = []
         for cmd in command_events:
             score = self._command_match_score(tool_cmd, cmd)
             is_wrapper = self._is_shell_wrapper_command(cmd)
             is_internal = self._is_agent_internal_command(cmd)
+            cmd["_tool_match_score"] = score
+            scored.append((cmd, score, is_wrapper, is_internal))
+
+        matched_external_exists = any(
+            (not is_internal) and score >= min_tool_match_score
+            for cmd, score, _is_wrapper, is_internal in scored
+        )
+
+        for cmd, score, is_wrapper, is_internal in scored:
+            # If we have at least one user-relevant external command, keep the
+            # drilldown focused on those and demote internal runtime wrappers.
+            if matched_external_exists and is_internal:
+                internal.append(cmd)
+                continue
+
+            # When tool command text is known, ignore unrelated command noise.
+            if has_tool_cmd and score < min_tool_match_score and not is_internal:
+                internal.append(cmd)
+                continue
 
             if non_wrapper_exists and is_wrapper:
                 internal.append(cmd)
@@ -1670,6 +1692,53 @@ class TraceStore:
 
         command = str(event.get("command") or "exec")
         return command[:140]
+
+    def _extract_shell_steps(self, tool_payload: dict[str, Any]) -> list[str]:
+        cmd = self._extract_tool_command_text(tool_payload)
+        if not cmd:
+            return []
+
+        # Split common shell separators to expose the user-facing sequence.
+        raw_steps = [
+            part.strip()
+            for part in re.split(r"\s*(?:&&|;|\n)\s*", cmd)
+            if part and part.strip()
+        ]
+
+        steps: list[str] = []
+        for step in raw_steps:
+            compact = re.sub(r"\s+", " ", step).strip()
+            if not compact:
+                continue
+            if compact in steps:
+                continue
+            steps.append(compact)
+
+        return steps[:8]
+
+    def _shell_step_needs_synthetic_node(self, step: str, visible_exec_events: list[dict[str, Any]]) -> bool:
+        step_norm = self._normalize_command_text(step)
+        if not step_norm:
+            return False
+
+        exec_texts = [self._normalize_command_text(self._event_command_text(e)) for e in visible_exec_events]
+        if any(step_norm in text for text in exec_texts):
+            return False
+
+        first_tok = step_norm.split(" ", 1)[0]
+        shell_builtins = {
+            "cd", "echo", "export", "alias", "set", "unset", "readonly", "local",
+            "source", ".", "test", "[", "printf", "read",
+        }
+        if first_tok in shell_builtins:
+            return True
+
+        # Variable assignment / arithmetic steps often do useful work but do not
+        # create separate execve events.
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", step.strip()):
+            return True
+
+        return False
 
     def _find_tool_events(self, trace: TraceState, tool_call_id: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         start_event = None
@@ -2024,6 +2093,7 @@ class TraceStore:
                     "exec_path": cmd.get("exec_path"),
                     "argv": cmd.get("argv", []),
                     "command": cmd.get("command"),
+                    "tool_match_score": int(cmd.get("_tool_match_score", 0)),
                 },
             }
             command_nodes.append(node)
@@ -2126,9 +2196,14 @@ class TraceStore:
 
         def command_is_relevant(node: dict[str, Any], idx: int) -> bool:
             cmd_id = node["id"]
+            match_score = int((node.get("metadata") or {}).get("tool_match_score", 0))
             if idx == 0:
                 return True
             if cmd_id in command_ids_with_resources:
+                return True
+            # Keep command-chain steps that strongly match the tool command text
+            # even if they do not have direct file/network events.
+            if match_score >= 8:
                 return True
             return False
 
@@ -2159,6 +2234,33 @@ class TraceStore:
                     "metadata": {"hidden_commands": hidden_count},
                 }
             )
+
+        shell_steps = self._extract_shell_steps(tool_payload)
+        synthetic_shell_nodes: list[dict[str, Any]] = []
+        if shell_steps:
+            for idx, step in enumerate(shell_steps):
+                if not self._shell_step_needs_synthetic_node(step, command_events):
+                    continue
+                synthetic_shell_nodes.append(
+                    {
+                        "id": f"shell_step_{idx}",
+                        "label": step[:140],
+                        "kind": "action",
+                        "metadata": {
+                            "synthetic": True,
+                            "source": "tool_command",
+                            "command": step,
+                            "line_no": None,
+                            "pid": None,
+                            "exec_path": "shell-builtin",
+                            "argv": [],
+                            "tool_match_score": 100,
+                        },
+                    }
+                )
+
+        if synthetic_shell_nodes:
+            filtered_nodes = synthetic_shell_nodes + filtered_nodes
 
         internal_visible = [
             e for e in internal_command_events

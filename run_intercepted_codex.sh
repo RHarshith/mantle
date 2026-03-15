@@ -45,6 +45,9 @@ OBS_ROOT="${AGENT_OBS_ROOT:-$SCRIPT_DIR/obs}"
 AGENT_TAG="$(basename "$AGENT_BIN")"
 [ -z "$TRACE_ID" ] && TRACE_ID="${AGENT_TAG}_$(date +%Y%m%d_%H%M%S).ebpf.jsonl"
 
+# Resolve runtime venv path (allows consistent tool discovery under sudo).
+RUNTIME_VENV="${RTRACE_VENV:-$SCRIPT_DIR/.venv}"
+
 mkdir -p "$OBS_ROOT/traces" "$OBS_ROOT/events" "$OBS_ROOT/mitm"
 
 TRACE_BASENAME="$TRACE_ID"
@@ -57,8 +60,21 @@ MITM_CA="${HOME}/.mitmproxy/mitmproxy-ca-cert.pem"
 EBPF_CAPTURE_SCRIPT="$SCRIPT_DIR/ebpf_capture.py"
 
 # Find mitmdump
-MITMDUMP="$(command -v mitmdump 2>/dev/null || echo "$HOME/.local/bin/mitmdump")"
-[ -x "$MITMDUMP" ] || { echo "Error: mitmdump not found. Install with: pipx install mitmproxy" >&2; exit 1; }
+MITMDUMP=""
+if [ -x "$RUNTIME_VENV/bin/mitmdump" ]; then
+    MITMDUMP="$RUNTIME_VENV/bin/mitmdump"
+elif [ -x "$SCRIPT_DIR/.venv/bin/mitmdump" ]; then
+    MITMDUMP="$SCRIPT_DIR/.venv/bin/mitmdump"
+elif command -v mitmdump >/dev/null 2>&1; then
+    MITMDUMP="$(command -v mitmdump)"
+elif [ -x "$HOME/.local/bin/mitmdump" ]; then
+    MITMDUMP="$HOME/.local/bin/mitmdump"
+fi
+
+[ -n "$MITMDUMP" ] || {
+    echo "Error: mitmdump not found. Run scripts/install_rtrace.sh or install with: pipx install mitmproxy" >&2
+    exit 1
+}
 
 # First-run bootstrap: generate mitmproxy CA material if missing.
 if [ ! -f "$MITM_CA" ]; then
@@ -76,6 +92,7 @@ fi
 [ -f "$MITM_CA" ] || { echo "Error: mitmproxy CA cert not found after bootstrap at $MITM_CA" >&2; exit 1; }
 
 command -v "$AGENT_BIN" >/dev/null 2>&1 || { echo "Error: '$AGENT_BIN' not found in PATH" >&2; exit 1; }
+AGENT_BIN_PATH="$(command -v "$AGENT_BIN")"
 
 # Ensure Codex auth is initialized from current environment key for this run.
 if [[ "$AGENT_BIN" == "codex" ]]; then
@@ -269,7 +286,7 @@ if $USE_EBPF; then
 
     if $RUN_EBPF; then
         echo "[*] Running $AGENT_BIN with eBPF capture..."
-        if ! python3 "$EBPF_CAPTURE_SCRIPT" --output "$EBPF_FILE" -- "$AGENT_BIN" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"; then
+        if ! python3 "$EBPF_CAPTURE_SCRIPT" --output "$EBPF_FILE" -- "$AGENT_BIN_PATH" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"; then
             RUN_EBPF=false
             echo "[!] eBPF capture failed at runtime, falling back to strace capture."
         fi
@@ -278,12 +295,12 @@ if $USE_EBPF; then
     if ! $RUN_EBPF; then
         STRACE_STR_SIZE="${RTRACE_STRACE_STRING_SIZE:-512}"
         echo "[*] Running $AGENT_BIN with strace fallback..."
-        strace -f -yy -s "$STRACE_STR_SIZE" -e trace=process,file,network -o "$STRACE_FALLBACK_FILE" "$AGENT_BIN" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"
+        strace -f -yy -s "$STRACE_STR_SIZE" -e trace=process,file,network -o "$STRACE_FALLBACK_FILE" "$AGENT_BIN_PATH" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"
     fi
 else
     echo "[*] Running $AGENT_BIN..."
     touch "$EBPF_FILE"
-    "$AGENT_BIN" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"
+    "$AGENT_BIN_PATH" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"
 fi
 
 echo "[*] $AGENT_BIN finished."
