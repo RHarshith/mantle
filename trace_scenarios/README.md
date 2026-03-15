@@ -1,4 +1,4 @@
-# Strace Scenario Suites
+# Trace Scenario Suites
 
 This directory contains self-contained scenario suites used to test low-level agent observability under realistic conditions.
 
@@ -12,5 +12,5 @@ Each suite lives in its own subfolder and should include:
 Run a suite using:
 
 ```bash
-strace_test <suite_name>
+rtrace_test <suite_name>
 ```

@@ -65,7 +65,6 @@ apt_install \
   python3 \
   python3-pip \
   python3-venv \
-  strace \
   sudo \
   bpftrace
 
@@ -101,4 +100,4 @@ echo ""
 echo "Next steps:"
 echo "  1) reload your shell: source ~/.bashrc  (or source ~/.zshrc)"
 echo "  2) set key for current shell: export OPENAI_API_KEY=YOUR_KEY"
-echo "  3) verify commands: rtrace_monitor --help && rtrace codex --help && strace_test --list"
+echo "  3) verify commands: rtrace_monitor --help && rtrace codex --help && rtrace_test --list"

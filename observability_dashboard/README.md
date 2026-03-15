@@ -1,10 +1,10 @@
 # Agent Observability Dashboard
 
-This service monitors low-level trace logs (strace or eBPF JSONL) + agent instrumentation events + mitm captures and renders a realtime drilldown graph.
+This service monitors low-level eBPF JSONL trace logs + agent instrumentation events + mitm captures and renders a realtime drilldown graph.
 
 ## Folder Convention
 
-- Strace logs directory (watched): `~/shared/simple_agent/obs/traces`
+- eBPF logs directory (watched): `~/shared/simple_agent/obs/traces`
 - Agent event logs directory: `~/shared/simple_agent/obs/events`
 
 ## Run the Dashboard
@@ -39,7 +39,7 @@ sshpass -p 'password' ssh -fN -p 2222 \
 
 Then open: `http://127.0.0.1:8099`
 
-## Run Agent + Strace with Matching Trace ID
+## Run Agent + eBPF with Matching Trace ID
 
 Choose a trace id, e.g. `trace_001.ebpf.jsonl`.
 

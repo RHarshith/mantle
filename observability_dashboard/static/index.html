@@ -96,7 +96,7 @@
     .tnode-badge.files { background: var(--cyan-50); color: var(--cyan-600); }
     .tnode-badge.net { background: var(--emerald-50); color: var(--emerald-600); }
     .tnode-badge.pid { background: var(--slate-100); color: var(--slate-500); }
-    .strace-mode-banner { max-width: 700px; margin: 0 auto 16px; padding: 10px 16px; background: var(--orange-50); border: 1px solid var(--orange-100); border-radius: var(--radius); font-size: 12px; color: var(--orange-600); text-align: center; }
+    .syscall-mode-banner { max-width: 700px; margin: 0 auto 16px; padding: 10px 16px; background: var(--orange-50); border: 1px solid var(--orange-100); border-radius: var(--radius); font-size: 12px; color: var(--orange-600); text-align: center; }
 
     .tnode-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
     .tnode-step { font-size: 11px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
@@ -262,7 +262,7 @@
         <div class="graph-canvas" id="graphCanvas">
           <div class="empty-state" id="emptyState">
             <h3>No trace selected</h3>
-            <p>Select a trace from the sidebar, or run an agent with strace to begin capturing.</p>
+            <p>Select a trace from the sidebar, or run an agent with eBPF capture to begin.</p>
           </div>
         </div>
       </div>

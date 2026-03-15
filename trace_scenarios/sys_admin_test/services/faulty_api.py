@@ -74,7 +74,7 @@ class ScenarioHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fault-injectable API service for strace test scenarios")
+    parser = argparse.ArgumentParser(description="Fault-injectable API service for trace test scenarios")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18080)
     parser.add_argument("--state-file", required=True)

@@ -42,17 +42,17 @@ SYSTEM_PREFIXES = (
 @dataclass
 class TraceState:
     trace_id: str
-    strace_path: Path
+    trace_path: Path
     events_path_candidates: list[Path]
-    trace_format: str = "strace"
-    strace_offset: int = 0
-    strace_line_no: int = 0
+    trace_format: str = "ebpf"
+    trace_offset: int = 0
+    trace_line_no: int = 0
     events_offset: int = 0
     mitm_offset: int = 0
     mitm_path: Path | None = None
     complete: bool = False
     root_pid: int | None = None
-    strace_pending: dict[tuple[int, str], str] = field(default_factory=dict)
+    pending_syscalls: dict[tuple[int, str], str] = field(default_factory=dict)
     process_parent: dict[int, int] = field(default_factory=dict)
     pid_fds: dict[tuple[int, int], dict[str, Any]] = field(default_factory=dict)  # (pid, fd) -> socket info
     sys_events: list[dict[str, Any]] = field(default_factory=list)
@@ -76,26 +76,20 @@ class TraceStore:
             self.events_dir / f"{no_ext}.events.jsonl",
         ]
 
-    def _detect_trace_format(self, path: Path) -> str:
-        if path.name.endswith(".ebpf.jsonl"):
-            return "ebpf"
-        return "strace"
-
     async def poll_once(self) -> None:
         changed = False
 
         self.trace_dir.mkdir(parents=True, exist_ok=True)
         self.events_dir.mkdir(parents=True, exist_ok=True)
 
-        trace_files = sorted(self.trace_dir.glob("*.log")) + sorted(self.trace_dir.glob("*.ebpf.jsonl"))
+        trace_files = sorted(self.trace_dir.glob("*.ebpf.jsonl"))
         for file_path in trace_files:
             trace_id = file_path.name
             if trace_id not in self.traces:
                 mitm_path = self._find_mitm_file(trace_id) if self.mitm_dir else None
                 self.traces[trace_id] = TraceState(
                     trace_id=trace_id,
-                    strace_path=file_path,
-                    trace_format=self._detect_trace_format(file_path),
+                    trace_path=file_path,
                     events_path_candidates=self._trace_to_event_candidates(file_path),
                     mitm_path=mitm_path,
                 )
@@ -105,11 +99,8 @@ class TraceStore:
             if not state.mitm_path and self.mitm_dir:
                 state.mitm_path = self._find_mitm_file(state.trace_id)
 
-            if state.strace_path.exists():
-                if state.trace_format == "ebpf":
-                    changed = self._tail_ebpf_events(state) or changed
-                else:
-                    changed = self._tail_strace(state) or changed
+            if state.trace_path.exists():
+                changed = self._tail_ebpf_events(state) or changed
             has_native = self._tail_events(state)
             changed = has_native or changed
             # If no native events FILE exists, continuously tail mitmproxy capture
@@ -172,14 +163,11 @@ class TraceStore:
         if not self.mitm_dir or not self.mitm_dir.exists():
             return None
         stem = trace_id
-        no_ext = Path(trace_id).stem  # strip .log
+        no_ext = Path(trace_id).stem
         candidates = [
             self.mitm_dir / f"{stem}.mitm.jsonl",
             self.mitm_dir / f"{no_ext}.mitm.jsonl",
         ]
-        # Also strip .strace from e.g. trace_xxx.strace.log
-        if no_ext.endswith(".strace"):
-            candidates.append(self.mitm_dir / f"{no_ext[:-7]}.mitm.jsonl")
         if trace_id.endswith(".ebpf.jsonl"):
             base = trace_id[: -len(".ebpf.jsonl")]
             candidates.append(self.mitm_dir / f"{base}.mitm.jsonl")
@@ -594,21 +582,21 @@ class TraceStore:
         state.mitm_offset = new_offset
         return True
 
-    def _tail_strace(self, state: TraceState) -> bool:
-        lines, new_offset = self._read_new_lines(state.strace_path, state.strace_offset)
+    def _tail_trace_log(self, state: TraceState) -> bool:
+        lines, new_offset = self._read_new_lines(state.trace_path, state.trace_offset)
         if not lines:
             return False
 
         changed = False
         for line in lines:
-            state.strace_line_no += 1
-            changed = self._ingest_strace_line(state, line, state.strace_line_no) or changed
+            state.trace_line_no += 1
+            changed = self._ingest_trace_line(state, line, state.trace_line_no) or changed
 
-        state.strace_offset = new_offset
+        state.trace_offset = new_offset
         return changed
 
     def _tail_ebpf_events(self, state: TraceState) -> bool:
-        lines, new_offset = self._read_new_lines(state.strace_path, state.strace_offset)
+        lines, new_offset = self._read_new_lines(state.trace_path, state.trace_offset)
         if not lines:
             return False
 
@@ -622,11 +610,11 @@ class TraceStore:
             except json.JSONDecodeError:
                 continue
 
-            state.strace_line_no += 1
+            state.trace_line_no += 1
             event_type = str(event.get("type") or "")
 
             normalized = dict(event)
-            normalized["line_no"] = int(normalized.get("line_no") or state.strace_line_no)
+            normalized["line_no"] = int(normalized.get("line_no") or state.trace_line_no)
             normalized["ts"] = float(normalized.get("ts") or time.time())
             state.sys_events.append(normalized)
             changed = True
@@ -645,7 +633,7 @@ class TraceStore:
                 if pid == state.root_pid:
                     state.complete = True
 
-        state.strace_offset = new_offset
+        state.trace_offset = new_offset
         return changed
 
     def _extract_quoted(self, text: str) -> list[str]:
@@ -699,7 +687,7 @@ class TraceStore:
 
     def _push_sys_event(self, state: TraceState, event: dict[str, Any]) -> None:
         event["ts"] = time.time()
-        event["line_no"] = state.strace_line_no
+        event["line_no"] = state.trace_line_no
         state.sys_events.append(event)
 
     def _extract_fd(self, args: str) -> int:
@@ -988,7 +976,7 @@ class TraceStore:
 
         return False
 
-    def _ingest_strace_line(self, state: TraceState, line: str, line_no: int) -> bool:
+    def _ingest_trace_line(self, state: TraceState, line: str, line_no: int) -> bool:
         m_exit = re.match(r"^(?P<pid>\d+)\s+\+\+\+ exited with", line)
         if m_exit:
             pid = int(m_exit.group("pid"))
@@ -1022,7 +1010,7 @@ class TraceStore:
             pid = int(m_unfinished.group("pid"))
             syscall = m_unfinished.group("syscall")
             args = m_unfinished.group("args")
-            state.strace_pending[(pid, syscall)] = args
+            state.pending_syscalls[(pid, syscall)] = args
             return False
 
         m_resumed = RESUMED_RE.match(line)
@@ -1034,7 +1022,7 @@ class TraceStore:
             if not ret_match:
                 return False
             ret = ret_match.group(1).strip()
-            args = state.strace_pending.pop((pid, syscall), "")
+            args = state.pending_syscalls.pop((pid, syscall), "")
             return self._handle_syscall(state, pid, syscall, args, ret)
 
         return False
@@ -1063,9 +1051,9 @@ class TraceStore:
     def high_level_graph(self, trace_id: str) -> dict[str, Any]:
         t = self._get_trace(trace_id)
 
-        # ── Fallback: if no agent trajectory, build from strace ────────
+        # ── Fallback: if no agent trajectory, build from syscall events ────────
         if not t.agent_events and t.sys_events:
-            return self._strace_only_graph(t)
+            return self._syscall_only_graph(t)
 
         nodes = []
         edges = []
@@ -1243,7 +1231,7 @@ class TraceStore:
 
         return {"nodes": nodes, "edges": edges, "timeline": timeline, "summary": summary}
 
-    def _strace_only_graph(self, t: TraceState) -> dict[str, Any]:
+    def _syscall_only_graph(self, t: TraceState) -> dict[str, Any]:
         """Build a high-level graph from sys_events when no agent trajectory is available."""
         nodes: list[dict[str, Any]] = []
         edges: list[dict[str, Any]] = []
@@ -1401,12 +1389,12 @@ class TraceStore:
             "commands": len(visible_commands),
             "files_touched": len(all_files),
             "net_endpoints": len(all_net),
-            "strace_events": len(t.sys_events),
+            "syscall_events": len(t.sys_events),
             "trace_status": "completed" if t.complete else "active",
         }
 
         return {
-            "mode": "strace_only",
+            "mode": "syscall_only",
             "nodes": nodes,
             "edges": edges,
             "timeline": nodes,
@@ -1534,7 +1522,7 @@ class TraceStore:
                     if cur_line < best_line:
                         best_idx = idx
 
-            # Weak threshold to still support truncated strace strings.
+            # Weak threshold to still support truncated command strings.
             if best_idx is None or best_score < 12:
                 continue
 
@@ -2648,7 +2636,7 @@ def _resolve_paths() -> tuple[Path, Path]:
     best_score = -1
 
     for trace_dir, events_dir in candidate_pairs:
-        trace_logs = len(list(trace_dir.glob("*.log"))) if trace_dir.exists() else 0
+        trace_logs = len(list(trace_dir.glob("*.ebpf.jsonl"))) if trace_dir.exists() else 0
         event_logs = len(list(events_dir.glob("*.events.jsonl"))) if events_dir.exists() else 0
         score = trace_logs + event_logs
 

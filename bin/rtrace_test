@@ -14,19 +14,19 @@ done
 
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 REPO_ROOT="${RTRACE_REPO_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
-SCENARIOS_DIR="$REPO_ROOT/strace_scenarios"
+SCENARIOS_DIR="$REPO_ROOT/trace_scenarios"
 RUNNER="$REPO_ROOT/run_intercepted_codex.sh"
 
 usage() {
     cat <<'EOF'
 Usage:
-  strace_test --list
-  strace_test <suite_name> [--no-cleanup] [--no-setup] [--no-strace] [--mode <proxy|transparent>] [--trace-id <id>] [--dry-run]
+    rtrace_test --list
+    rtrace_test <suite_name> [--no-cleanup] [--no-setup] [--mode <proxy|transparent>] [--trace-id <id>] [--dry-run]
 
 Examples:
-  strace_test sys_admin_test
-  strace_test sys_admin_test --no-cleanup
-  strace_test --list
+    rtrace_test sys_admin_test
+    rtrace_test sys_admin_test --no-cleanup
+    rtrace_test --list
 EOF
 }
 
@@ -41,7 +41,6 @@ fi
 
 NO_SETUP=false
 NO_CLEANUP=false
-USE_STRACE=true
 DRY_RUN=false
 MODE="${RTRACE_INTERCEPT_MODE:-proxy}"
 TRACE_ID=""
@@ -63,14 +62,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-cleanup)
             NO_CLEANUP=true
-            shift
-            ;;
-        --no-strace)
-            USE_STRACE=false
-            shift
-            ;;
-        --strace)
-            USE_STRACE=true
             shift
             ;;
         --dry-run)
@@ -134,43 +125,39 @@ fi
 
 PROMPT_CONTENT="$(cat "$PROMPT_FILE")"
 
-echo "[strace_test] Suite: $SUITE_NAME"
-echo "[strace_test] Mode: $MODE"
-echo "[strace_test] Strace: $USE_STRACE"
+echo "[rtrace_test] Suite: $SUITE_NAME"
+echo "[rtrace_test] Mode: $MODE"
 
 ARGS=(--mode "$MODE")
 if [[ -n "$TRACE_ID" ]]; then
     ARGS+=(--trace-id "$TRACE_ID")
 fi
-if ! $USE_STRACE; then
-    ARGS+=(--no-strace)
-fi
 ARGS+=(exec "$PROMPT_CONTENT")
 
 if $DRY_RUN; then
-    echo "[strace_test] Dry run only. No setup/verify/cleanup executed."
-    echo "[strace_test] Would run: $RUNNER ${ARGS[*]}"
+    echo "[rtrace_test] Dry run only. No setup/verify/cleanup executed."
+    echo "[rtrace_test] Would run: $RUNNER ${ARGS[*]}"
     exit 0
 fi
 
 if ! $NO_SETUP; then
-    echo "[strace_test] Running setup..."
+    echo "[rtrace_test] Running setup..."
     "$SETUP_SCRIPT"
 fi
 
-echo "[strace_test] Validating preconditions..."
+echo "[rtrace_test] Validating preconditions..."
 "$VERIFY_SCRIPT"
 
 cleanup() {
     if ! $NO_CLEANUP; then
-        echo "[strace_test] Running cleanup..."
+        echo "[rtrace_test] Running cleanup..."
         "$CLEANUP_SCRIPT" || true
     fi
 }
 
 trap cleanup EXIT
 
-echo "[strace_test] Running traced agent..."
+echo "[rtrace_test] Running traced agent..."
 "$RUNNER" "${ARGS[@]}"
 
-echo "[strace_test] Post-run API /health status: $(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18080/health || echo fail)"
+echo "[rtrace_test] Post-run API /health status: $(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18080/health || echo fail)"

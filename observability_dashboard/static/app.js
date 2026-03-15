@@ -14,7 +14,7 @@ let zoomLevel = 1;
 let selectedNodeId = null;
 let cachedTraceFiles = []; // trace-level files cache
 let cachedTraceTools = [];
-let currentStraceMode = false; // true when showing strace-only (no trajectory)
+let currentSyscallMode = false; // true when showing syscall-only (no trajectory)
 
 // ─── DOM refs ─────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
@@ -153,8 +153,8 @@ async function selectTrace(traceId) {
 
 // ─── Summary cards ────────────────────────────────────────────────
 function updateSummaryCards(summary) {
-  if (currentStraceMode) {
-    // Strace-only mode: show system-level stats
+  if (currentSyscallMode) {
+    // Syscall-only mode: show system-level stats
     const strip = document.getElementById("summaryStrip");
     strip.innerHTML = `
       <div class="summary-card"><div class="k">Commands</div><div class="v">${summary.commands ?? 0}</div></div>
@@ -974,21 +974,21 @@ function expandFolderGroup(folderNode, payload) {
   renderDAGGraph(newPayload);
 }
 
-// ─── Strace-Only Timeline Renderer ────────────────────────────────
-function renderStraceTimeline(payload) {
+// ─── Syscall-Only Timeline Renderer ────────────────────────────────
+function renderSyscallTimeline(payload) {
   graphCanvas.innerHTML = "";
   emptyState.style.display = "none";
 
   const nodes = payload.nodes || [];
   if (nodes.length === 0) {
-    graphCanvas.innerHTML = '<div class="empty-state"><h3>No system events</h3><p>The strace log contained no recognizable commands.</p></div>';
+    graphCanvas.innerHTML = '<div class="empty-state"><h3>No system events</h3><p>No recognizable syscall command events were found.</p></div>';
     return;
   }
 
   // Banner
   const banner = document.createElement("div");
-  banner.className = "strace-mode-banner";
-  banner.textContent = "⚡ Strace-only mode — no agent trajectory available. Showing system-level command timeline.";
+  banner.className = "syscall-mode-banner";
+  banner.textContent = "System-call-only mode - no agent trajectory available. Showing system-level command timeline.";
 
   const timeline = document.createElement("div");
   timeline.className = "timeline";
@@ -1069,12 +1069,12 @@ async function loadHighLevelGraph() {
   renderBreadcrumbs();
   const payload = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/high-level-graph`);
 
-  if (payload.mode === "strace_only") {
-    currentStraceMode = true;
+  if (payload.mode === "syscall_only") {
+    currentSyscallMode = true;
     updateSummaryCards(payload.summary || {});
-    renderStraceTimeline(payload);
+    renderSyscallTimeline(payload);
   } else {
-    currentStraceMode = false;
+    currentSyscallMode = false;
     updateSummaryCards(payload.summary || {});
     renderHighLevelGraph(payload);
   }

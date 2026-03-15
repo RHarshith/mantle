@@ -18,7 +18,7 @@ REPO_ROOT="${RTRACE_REPO_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 usage() {
     cat <<'EOF'
 Usage:
-    rtrace codex [--strace|--no-strace] [exec] [prompt...]
+    rtrace codex [exec] [prompt...]
 
 Examples:
   rtrace codex
@@ -27,7 +27,7 @@ Examples:
 
 Notes:
   - This command wraps run_intercepted_codex.sh.
-    - Low-level capture is eBPF-based (prototype); flags are kept for compatibility.
+        - Low-level capture is eBPF-based.
   - For transparent interception, root privileges may be required.
 EOF
 }
@@ -48,28 +48,16 @@ case "$SUBCOMMAND" in
             exit 1
         fi
 
-        USE_STRACE=true
-        while [[ $# -gt 0 ]]; do
+        if [[ $# -gt 0 ]]; then
             case "$1" in
-                --no-strace)
-                    USE_STRACE=false
-                    shift
-                    ;;
-                --strace)
-                    USE_STRACE=true
-                    shift
-                    ;;
-                *)
-                    break
+                -h|--help|help)
+                    usage
+                    exit 0
                     ;;
             esac
-        done
-
-        ARGS=()
-        if ! $USE_STRACE; then
-            ARGS+=(--no-strace)
         fi
 
+        ARGS=()
         if [[ $# -eq 0 ]]; then
             :
         elif [[ "$1" == "exec" ]]; then
@@ -84,7 +72,7 @@ case "$SUBCOMMAND" in
         fi
 
         if [[ "${EUID}" -ne 0 ]]; then
-            PRESERVE_ENV_VARS="OPENAI_API_KEY,AGENT_OBS_ROOT,RTRACE_VENV,RTRACE_INTERCEPT_MODE,RTRACE_FORCE_OPENAI_BASE,RTRACE_STRACE_STRING_SIZE"
+            PRESERVE_ENV_VARS="OPENAI_API_KEY,AGENT_OBS_ROOT,RTRACE_VENV,RTRACE_INTERCEPT_MODE,RTRACE_FORCE_OPENAI_BASE"
             exec sudo --preserve-env="$PRESERVE_ENV_VARS" "$RUNNER" "${ARGS[@]}"
         fi
         exec "$RUNNER" "${ARGS[@]}"

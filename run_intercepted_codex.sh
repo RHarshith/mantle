@@ -12,12 +12,10 @@
 # Usage:
 #   ./run_intercepted_codex.sh "List files in the home directory"
 #   ./run_intercepted_codex.sh                    # interactive (no task)
-#   ./run_intercepted_codex.sh --no-strace "Explain this repo"
 #   ./run_intercepted_codex.sh --agent "aider" "Fix the bug"
 # ─────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-USE_EBPF=true
 TRACE_ID=""
 MITM_PORT=8899
 MITM_REV_PORT=8898
@@ -29,8 +27,6 @@ AGENT_TAG="codex"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --no-strace)   USE_EBPF=false; shift ;;
-        --strace)      USE_EBPF=true; shift ;;
         --trace-id)    TRACE_ID="$2"; shift 2 ;;
         --port)        MITM_PORT="$2"; shift 2 ;;
         --mode)        INTERCEPT_MODE="$2"; shift 2 ;;
@@ -51,11 +47,9 @@ RUNTIME_VENV="${RTRACE_VENV:-$SCRIPT_DIR/.venv}"
 mkdir -p "$OBS_ROOT/traces" "$OBS_ROOT/events" "$OBS_ROOT/mitm"
 
 TRACE_BASENAME="$TRACE_ID"
-TRACE_BASENAME="${TRACE_BASENAME%.strace.log}"
 TRACE_BASENAME="${TRACE_BASENAME%.ebpf.jsonl}"
 MITM_JSONL="$OBS_ROOT/mitm/${TRACE_BASENAME}.mitm.jsonl"
 EBPF_FILE="$OBS_ROOT/traces/$TRACE_ID"
-STRACE_FALLBACK_FILE="$OBS_ROOT/traces/${TRACE_BASENAME}.strace.log"
 MITM_CA="${HOME}/.mitmproxy/mitmproxy-ca-cert.pem"
 EBPF_CAPTURE_SCRIPT="$SCRIPT_DIR/ebpf_capture.py"
 
@@ -130,8 +124,8 @@ echo "  Trace ID:    $TRACE_ID"
 echo "  MITM mode:   $INTERCEPT_MODE"
 echo "  MITM proxy:  localhost:$MITM_PORT"
 echo "  MITM log:    $MITM_JSONL"
-echo "  eBPF trace:  $USE_EBPF"
-$USE_EBPF && echo "  eBPF file:   $EBPF_FILE"
+echo "  eBPF trace:  true"
+echo "  eBPF file:   $EBPF_FILE"
 echo "═══════════════════════════════════════════════════════════"
 
 export MITM_CAPTURE_FILE="$MITM_JSONL"
@@ -265,42 +259,23 @@ cleanup() {
     wait "$MITM_PID" 2>/dev/null || true
     echo "[*] Done. Captured data:"
     [ -f "$MITM_JSONL" ] && echo "    MITM log:   $MITM_JSONL ($(wc -l < "$MITM_JSONL") lines)"
-    $USE_EBPF && [ -f "$EBPF_FILE" ] && echo "    eBPF log:   $EBPF_FILE ($(wc -l < "$EBPF_FILE") lines)"
-    [ -f "$STRACE_FALLBACK_FILE" ] && echo "    Strace log: $STRACE_FALLBACK_FILE ($(wc -l < "$STRACE_FALLBACK_FILE") lines)"
+    [ -f "$EBPF_FILE" ] && echo "    eBPF log:   $EBPF_FILE ($(wc -l < "$EBPF_FILE") lines)"
 }
 trap cleanup EXIT
 
 # Build the agent command args
 AGENT_ARGS=("${TASK[@]:-}")
 
-if $USE_EBPF; then
-    RUN_EBPF=true
-    if ! command -v bpftrace >/dev/null 2>&1; then
-        RUN_EBPF=false
-        echo "[!] bpftrace not found, falling back to strace capture."
-    fi
-    if [ ! -f "$EBPF_CAPTURE_SCRIPT" ]; then
-        RUN_EBPF=false
-        echo "[!] $EBPF_CAPTURE_SCRIPT not found, falling back to strace capture."
-    fi
-
-    if $RUN_EBPF; then
-        echo "[*] Running $AGENT_BIN with eBPF capture..."
-        if ! python3 "$EBPF_CAPTURE_SCRIPT" --output "$EBPF_FILE" -- "$AGENT_BIN_PATH" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"; then
-            RUN_EBPF=false
-            echo "[!] eBPF capture failed at runtime, falling back to strace capture."
-        fi
-    fi
-
-    if ! $RUN_EBPF; then
-        STRACE_STR_SIZE="${RTRACE_STRACE_STRING_SIZE:-512}"
-        echo "[*] Running $AGENT_BIN with strace fallback..."
-        strace -f -yy -s "$STRACE_STR_SIZE" -e trace=process,file,network -o "$STRACE_FALLBACK_FILE" "$AGENT_BIN_PATH" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"
-    fi
-else
-    echo "[*] Running $AGENT_BIN..."
-    touch "$EBPF_FILE"
-    "$AGENT_BIN_PATH" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"
+if ! command -v bpftrace >/dev/null 2>&1; then
+    echo "Error: bpftrace is required for BPF tracing but was not found in PATH." >&2
+    exit 1
 fi
+if [ ! -f "$EBPF_CAPTURE_SCRIPT" ]; then
+    echo "Error: eBPF capture wrapper not found at $EBPF_CAPTURE_SCRIPT" >&2
+    exit 1
+fi
+
+echo "[*] Running $AGENT_BIN with eBPF capture..."
+python3 "$EBPF_CAPTURE_SCRIPT" --output "$EBPF_FILE" -- "$AGENT_BIN_PATH" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"
 
 echo "[*] $AGENT_BIN finished."

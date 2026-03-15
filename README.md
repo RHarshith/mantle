@@ -47,21 +47,21 @@ Open: `http://127.0.0.1:8099`
 
 ## Command Reference
 
-### `strace_test`
+### `rtrace_test`
 
 Run a self-contained scenario suite that provisions services, injects faults, and executes a traced agent prompt.
 
 Usage:
 ```bash
-strace_test --list
-strace_test <suite_name> [--no-cleanup] [--no-setup] [--no-strace] [--mode <proxy|transparent>] [--trace-id <id>] [--dry-run]
+rtrace_test --list
+rtrace_test <suite_name> [--no-cleanup] [--no-setup] [--mode <proxy|transparent>] [--trace-id <id>] [--dry-run]
 ```
 
 Examples:
 ```bash
-strace_test --list
-strace_test sys_admin_test
-strace_test sys_admin_test --no-cleanup
+rtrace_test --list
+rtrace_test sys_admin_test
+rtrace_test sys_admin_test --no-cleanup
 ```
 
 Current suite:
@@ -87,7 +87,7 @@ Run Codex with interception and optional low-level tracing.
 
 Usage:
 ```bash
-rtrace codex [--strace|--no-strace] [exec] [prompt...]
+rtrace codex [exec] [prompt...]
 ```
 
 Examples:
@@ -95,27 +95,23 @@ Examples:
 rtrace codex
 rtrace codex "summarize this repository"
 rtrace codex exec "count shell scripts and print result"
-rtrace codex --no-strace exec "fast run without low-level syscall capture"
 ```
 
 Notes:
-- `--strace` keeps backward-compatible flag semantics and enables low-level capture.
-- Implementation now uses eBPF capture (prototype) under the hood.
-- `--no-strace` disables low-level capture.
-- If eBPF is unavailable on the host kernel/container runtime, capture falls back to strace automatically.
+- Low-level capture is eBPF-based.
+- If eBPF prerequisites are missing, the run fails with a clear error.
 - Under the hood this calls `run_intercepted_codex.sh`.
 
 ### `run_intercepted_codex.sh` (advanced)
 
 Usage:
 ```bash
-./run_intercepted_codex.sh [--no-strace] [--mode proxy|transparent] [--trace-id <id>] [--agent <bin>] [prompt...]
+./run_intercepted_codex.sh [--mode proxy|transparent] [--trace-id <id>] [--agent <bin>] [prompt...]
 ```
 
 Important options:
 - `--mode proxy`: default and recommended in Docker.
 - `--mode transparent`: iptables-based transparent interception.
-- `--no-strace`: disable syscall capture.
 
 ## Folder Structure
 
@@ -140,7 +136,7 @@ Important options:
 ├── simple_agent/
 │   ├── cli_agent.py                   # sample Python agent
 │   └── agent_observability.py
-├── strace_scenarios/
+├── trace_scenarios/
 │   ├── README.md
 │   └── sys_admin_test/
 │       ├── prompt.txt
@@ -208,16 +204,16 @@ Use the setup manifest + script pattern.
 
 ## Troubleshooting
 
-### `strace_test` fails in setup with package install errors
+### `rtrace_test` fails in setup with package install errors
 - Run as root in the container (default in this image).
 - Verify network access for `apt-get` if `redis-server` is missing.
 
-### `strace_test` precheck says API is not faulted
+### `rtrace_test` precheck says API is not faulted
 - The suite intentionally expects `/health` to return `500` before agent execution.
-- Re-run setup: `strace_test sys_admin_test --no-cleanup --dry-run` then `strace_test sys_admin_test`.
+- Re-run setup: `rtrace_test sys_admin_test --no-cleanup --dry-run` then `rtrace_test sys_admin_test`.
 
 ### No low-level syscall nodes in drilldown
-- Ensure you are not using `--no-strace`.
+- Ensure `bpftrace` is installed and runnable as root.
 - Confirm run output shows `eBPF trace: true` and `eBPF file: ...`.
 
 ### Dashboard unreachable from host in Docker
