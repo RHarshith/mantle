@@ -1367,48 +1367,94 @@ class TraceStore:
                     out.append(event)
         return out
 
-    def _tool_line_ranges(self, trace: TraceState) -> dict[str, tuple[int, int | None]]:
+    def _normalize_command_text(self, text: str) -> str:
+        return re.sub(r"\s+", " ", str(text or "").strip().lower())
+
+    def _command_tokens(self, text: str) -> list[str]:
+        norm = self._normalize_command_text(text)
+        return [tok for tok in re.findall(r"[A-Za-z0-9_./:\-]+", norm) if len(tok) >= 2]
+
+    def _extract_tool_command_text(self, payload: dict[str, Any]) -> str:
+        args = payload.get("arguments") or {}
+        if isinstance(args, dict):
+            for key in ("command", "cmd", "script", "path"):
+                value = args.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+        return str(payload.get("tool_name") or "")
+
+    def _event_command_text(self, event: dict[str, Any]) -> str:
+        command = str(event.get("command") or "")
+        argv = event.get("argv") or []
+        if isinstance(argv, list) and argv:
+            argv_text = " ".join(str(a) for a in argv if isinstance(a, str))
+            if len(argv_text) > len(command):
+                command = argv_text
+        return command
+
+    def _command_match_score(self, tool_cmd: str, event: dict[str, Any]) -> int:
+        tool_n = self._normalize_command_text(tool_cmd)
+        exec_n = self._normalize_command_text(self._event_command_text(event))
+        if not tool_n or not exec_n:
+            return 0
+
+        score = 0
+        if tool_n in exec_n:
+            score += 200 + min(len(tool_n), 80)
+
+        tool_tokens = self._command_tokens(tool_n)
+        exec_tokens = self._command_tokens(exec_n)
+        exec_set = {t.lower() for t in exec_tokens}
+        exec_basenames = {Path(t).name.lower() for t in exec_tokens}
+
+        for tok in tool_tokens:
+            t = tok.lower()
+            base = Path(t).name.lower()
+            if t in exec_n:
+                score += 8
+            elif t in exec_set:
+                score += 6
+            elif base in exec_basenames:
+                score += 4
+
+        if tool_tokens:
+            primary = Path(tool_tokens[0]).name.lower()
+            if primary in exec_basenames:
+                score += 30
+
+        return score
+
+    def _is_shell_wrapper_command(self, event: dict[str, Any]) -> bool:
+        exec_path = str(event.get("exec_path") or "")
+        base = Path(exec_path).name.lower() if exec_path else ""
+        command = self._normalize_command_text(self._event_command_text(event))
+        if base in {"sh", "bash", "zsh", "dash"} and " -c " in f" {command} ":
+            return True
+        return False
+
+    def _is_agent_internal_command(self, event: dict[str, Any]) -> bool:
+        exec_path = str(event.get("exec_path") or "")
+        base = Path(exec_path).name.lower() if exec_path else ""
+        command = self._normalize_command_text(self._event_command_text(event))
+
+        if base in {"codex", "codex-linux-sandbox", "node"}:
+            return True
+        if "codex-linux-sandbox" in command or "--sandbox-policy" in command:
+            return True
+        if "/root/.codex/" in command or "shell_snapsho" in command:
+            return True
+        if base in {"bash", "sh", "zsh", "dash"} and "/root/.codex/" in command:
+            return True
+        return False
+
+    def _match_tool_root_commands(self, trace: TraceState) -> dict[str, dict[str, Any]]:
         starts = self._tool_start_events(trace)
-        exec_events = sorted(
-            [e for e in trace.sys_events if e.get("type") == "command_exec"],
-            key=lambda x: int(x.get("line_no", 0)),
-        )
+        exec_events = [e for e in trace.sys_events if e.get("type") == "command_exec"]
         if not starts or not exec_events:
             return {}
 
-        assigned_starts: dict[str, int] = {}
-        used_indices: set[int] = set()
-        cursor = 0
-
-        def norm(text: str) -> str:
-            text = re.sub(r"\s+", " ", text.strip().lower())
-            return text
-
-        def command_match_score(tool_cmd: str, exec_cmd: str) -> int:
-            if not tool_cmd or not exec_cmd:
-                return 0
-            tool_n = norm(tool_cmd)
-            exec_n = norm(exec_cmd)
-            if not tool_n or not exec_n:
-                return 0
-            if tool_n in exec_n:
-                return len(tool_n)
-            tool_tokens = [tok for tok in re.findall(r"[A-Za-z0-9_./-]+", tool_n) if len(tok) >= 2]
-            exec_tokens = [tok for tok in re.findall(r"[A-Za-z0-9_./-]+", exec_n) if len(tok) >= 2]
-            if not tool_tokens or not exec_tokens:
-                return 0
-
-            score = 0
-            exec_base_tokens = {Path(tok).name.lower() for tok in exec_tokens}
-            primary = Path(tool_tokens[0]).name.lower()
-            if primary in exec_base_tokens:
-                score += 10
-
-            for tok in tool_tokens:
-                if tok.lower() in exec_n:
-                    score += 1
-
-            return score
+        used_exec_indices: set[int] = set()
+        matched: dict[str, dict[str, Any]] = {}
 
         for start in starts:
             payload = start.get("payload") or {}
@@ -1416,53 +1462,113 @@ class TraceStore:
             if not tool_call_id:
                 continue
 
-            tool_name = payload.get("tool_name")
-            tool_args = payload.get("arguments") or {}
-            tool_cmd = ""
-            if isinstance(tool_args, dict):
-                # Support both command_exec-style {command: ...} and exec_command-style {cmd: ...}.
-                tool_cmd = str(tool_args.get("command") or tool_args.get("cmd") or "")
-            if not tool_cmd and isinstance(tool_name, str):
-                # Last-resort fallback: use tool name as weak signal.
-                tool_cmd = tool_name
+            tool_cmd = self._extract_tool_command_text(payload)
+            best_idx: int | None = None
+            best_score = 0
 
-            chosen_idx = None
+            for idx, exec_event in enumerate(exec_events):
+                if idx in used_exec_indices:
+                    continue
+                score = self._command_match_score(tool_cmd, exec_event)
+                if score > best_score:
+                    best_score = score
+                    best_idx = idx
+                elif score == best_score and score > 0 and best_idx is not None:
+                    cur_line = int(exec_event.get("line_no", 0))
+                    best_line = int(exec_events[best_idx].get("line_no", 0))
+                    if cur_line < best_line:
+                        best_idx = idx
 
-            if tool_cmd:
-                best_score = 0
-                for idx in range(cursor, len(exec_events)):
-                    if idx in used_indices:
-                        continue
-                    score = command_match_score(tool_cmd, str(exec_events[idx].get("command") or ""))
-                    if score > best_score:
-                        best_score = score
-                        chosen_idx = idx
-
-            if chosen_idx is None:
-                for idx in range(cursor, len(exec_events)):
-                    if idx not in used_indices:
-                        chosen_idx = idx
-                        break
-
-            if chosen_idx is None:
+            # Weak threshold to still support truncated strace strings.
+            if best_idx is None or best_score < 12:
                 continue
 
-            used_indices.add(chosen_idx)
-            cursor = min(chosen_idx + 1, len(exec_events))
-            assigned_starts[tool_call_id] = int(exec_events[chosen_idx].get("line_no", 0))
+            used_exec_indices.add(best_idx)
+            matched[str(tool_call_id)] = exec_events[best_idx]
+
+        return matched
+
+    def _is_descendant_or_same_pid(self, trace: TraceState, pid: int, ancestor: int) -> bool:
+        current = int(pid)
+        seen: set[int] = set()
+        while current and current not in seen:
+            if current == ancestor:
+                return True
+            seen.add(current)
+            current = int(trace.process_parent.get(current, 0))
+        return False
+
+    def _split_tool_command_events(
+        self,
+        trace: TraceState,
+        tool_payload: dict[str, Any],
+        command_events: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if not command_events:
+            return [], []
+
+        tool_cmd = self._extract_tool_command_text(tool_payload)
+        non_wrapper_exists = any(not self._is_shell_wrapper_command(cmd) for cmd in command_events)
+
+        relevant: list[dict[str, Any]] = []
+        internal: list[dict[str, Any]] = []
+
+        for cmd in command_events:
+            score = self._command_match_score(tool_cmd, cmd)
+            is_wrapper = self._is_shell_wrapper_command(cmd)
+            is_internal = self._is_agent_internal_command(cmd)
+
+            if non_wrapper_exists and is_wrapper:
+                internal.append(cmd)
+                continue
+
+            if is_internal and score < 12:
+                internal.append(cmd)
+                continue
+
+            relevant.append(cmd)
+
+        if not relevant:
+            best = max(command_events, key=lambda e: self._command_match_score(tool_cmd, e))
+            relevant = [best]
+            internal = [e for e in command_events if e is not best]
+
+        seen_ids: set[int] = set()
+        uniq_relevant: list[dict[str, Any]] = []
+        for event in sorted(relevant, key=lambda e: int(e.get("line_no", 0))):
+            line_no = int(event.get("line_no", 0))
+            if line_no in seen_ids:
+                continue
+            seen_ids.add(line_no)
+            uniq_relevant.append(event)
+
+        uniq_internal: list[dict[str, Any]] = []
+        relevant_lines = {int(e.get("line_no", 0)) for e in uniq_relevant}
+        for event in sorted(internal, key=lambda e: int(e.get("line_no", 0))):
+            if int(event.get("line_no", 0)) in relevant_lines:
+                continue
+            uniq_internal.append(event)
+
+        return uniq_relevant, uniq_internal
+
+    def _tool_line_ranges(self, trace: TraceState) -> dict[str, tuple[int, int | None]]:
+        starts = self._tool_start_events(trace)
+        matched = self._match_tool_root_commands(trace)
+        if not starts or not matched:
+            return {}
 
         ordered_ids = [
             (event.get("payload") or {}).get("tool_call_id")
             for event in starts
-            if (event.get("payload") or {}).get("tool_call_id") in assigned_starts
+            if (event.get("payload") or {}).get("tool_call_id") in matched
         ]
 
         ranges: dict[str, tuple[int, int | None]] = {}
         for i, call_id in enumerate(ordered_ids):
-            start_line = assigned_starts[call_id]
+            start_line = int((matched[call_id] or {}).get("line_no", 0))
             end_line = None
             if i + 1 < len(ordered_ids):
-                next_start = assigned_starts[ordered_ids[i + 1]]
+                next_start = int((matched[ordered_ids[i + 1]] or {}).get("line_no", 0))
                 end_line = next_start - 1
             ranges[call_id] = (start_line, end_line)
 
@@ -1531,17 +1637,34 @@ class TraceStore:
             end_ts = start_ts + 5.0
 
         related: list[dict[str, Any]] = []
-        tool_ranges = self._tool_line_ranges(trace)
-        line_range = tool_ranges.get(tool_call_id)
+        matched_roots = self._match_tool_root_commands(trace)
+        root_event = matched_roots.get(tool_call_id)
 
-        if line_range is not None:
-            start_line, end_line = line_range
-            related = [
-                e
-                for e in trace.sys_events
-                if int(e.get("line_no", 0)) >= start_line
-                and (end_line is None or int(e.get("line_no", 0)) <= end_line)
-            ]
+        if root_event is not None:
+            root_line = int(root_event.get("line_no", 0))
+            root_pid = int(root_event.get("pid", 0))
+
+            root_exit_line: int | None = None
+            for e in trace.sys_events:
+                if e.get("type") != "process_exit":
+                    continue
+                if int(e.get("pid", 0)) != root_pid:
+                    continue
+                line_no = int(e.get("line_no", 0))
+                if line_no >= root_line:
+                    root_exit_line = line_no
+                    break
+
+            related = []
+            for e in trace.sys_events:
+                line_no = int(e.get("line_no", 0))
+                if line_no < root_line:
+                    continue
+                if root_exit_line is not None and line_no > root_exit_line:
+                    continue
+                pid = int(e.get("pid", 0))
+                if pid and self._is_descendant_or_same_pid(trace, pid, root_pid):
+                    related.append(e)
 
         if not related:
             related = [e for e in trace.sys_events if start_ts <= float(e.get("ts", 0)) <= (end_ts + 0.25)]
@@ -1816,35 +1939,9 @@ class TraceStore:
             edges.append({"source": "tool", "target": "no_commands", "label": "info"})
             return {"nodes": nodes, "edges": edges, "events": []}
 
-        root_pid = int(command_events[0].get("pid", 0))
-
-        if line_range is not None and line_range[1] is None:
-            start_line = line_range[0]
-            exit_lines = [
-                int(e.get("line_no", 0))
-                for e in t.sys_events
-                if e.get("type") == "process_exit"
-                and int(e.get("pid", 0)) == root_pid
-                and int(e.get("line_no", 0)) >= start_line
-            ]
-            if exit_lines:
-                bounded_end = min(exit_lines)
-                related_sorted = [e for e in related_sorted if int(e.get("line_no", 0)) <= bounded_end]
-                command_events = [e for e in command_events if int(e.get("line_no", 0)) <= bounded_end]
-
-        def is_descendant_or_same(pid: int, ancestor: int) -> bool:
-            current = pid
-            seen = set()
-            while current and current not in seen:
-                if current == ancestor:
-                    return True
-                seen.add(current)
-                current = int(t.process_parent.get(current, 0))
-            return False
-
-        command_events = [
-            e for e in command_events if is_descendant_or_same(int(e.get("pid", 0)), root_pid)
-        ] or command_events
+        tool_payload = start_event.get("payload") or {}
+        relevant_command_events, internal_command_events = self._split_tool_command_events(t, tool_payload, command_events)
+        command_events = relevant_command_events or command_events
 
         max_commands = 80
         command_overflow = 0
@@ -1972,26 +2069,11 @@ class TraceStore:
         command_ids_with_net = {b["cmd_id"] for b in net_agg.values()}
         command_ids_with_resources = command_ids_with_files | command_ids_with_net
 
-        tool_payload = start_event.get("payload") or {}
-        tool_cmd_text = ""
-        if (tool_payload.get("tool_name") or "") == "command_exec":
-            tool_cmd_text = str((tool_payload.get("arguments") or {}).get("command") or "")
-        tool_tokens = {tok for tok in re.findall(r"[A-Za-z0-9_./-]+", tool_cmd_text.lower()) if len(tok) >= 2}
-
         def command_is_relevant(node: dict[str, Any], idx: int) -> bool:
             cmd_id = node["id"]
             if idx == 0:
                 return True
             if cmd_id in command_ids_with_resources:
-                return True
-
-            meta = node.get("metadata") or {}
-            exec_path = str(meta.get("exec_path") or "")
-            base = Path(exec_path).name.lower() if exec_path else ""
-
-            if base and base in tool_tokens:
-                return True
-            if base in {"sh", "bash"}:
                 return True
             return False
 
@@ -2022,6 +2104,25 @@ class TraceStore:
                     "metadata": {"hidden_commands": hidden_count},
                 }
             )
+
+        internal_visible = [
+            e for e in internal_command_events
+            if int(e.get("line_no", 0)) not in {int(c.get("line_no", 0)) for c in command_events}
+        ]
+        if internal_visible:
+            internal_preview = [self._short_command_label(e) for e in internal_visible[:6]]
+            nodes.append(
+                {
+                    "id": "agent_internal",
+                    "label": f"Agent internal commands ({len(internal_visible)})",
+                    "kind": "placeholder",
+                    "metadata": {
+                        "internal_count": len(internal_visible),
+                        "commands": internal_preview,
+                    },
+                }
+            )
+            edges.append({"source": "tool", "target": "agent_internal", "label": "agent runtime"})
 
         prev_cmd_id: str | None = None
         visible_command_ids = {n["id"] for n in filtered_nodes if n.get("kind") == "action"}
@@ -2242,8 +2343,39 @@ class TraceStore:
                     if start_ts - 1.0 <= float(e.get("ts", 0)) <= end_ts + 2.0
                 ]
 
+        related = sorted(related, key=lambda e: int(e.get("line_no", 0)))
+        command_events = [e for e in related if e.get("type") == "command_exec"]
+
+        relevant_pid_roots: set[int] = set()
+        relevant_line_min: int | None = None
+        relevant_line_max: int | None = None
+        if command_events:
+            payload = (start_event or {}).get("payload") or {}
+            relevant_cmds, _internal_cmds = self._split_tool_command_events(t, payload, command_events)
+            for cmd in relevant_cmds:
+                pid = int(cmd.get("pid", 0))
+                if pid:
+                    relevant_pid_roots.add(pid)
+            if relevant_cmds:
+                line_values = [int(c.get("line_no", 0)) for c in relevant_cmds]
+                relevant_line_min = min(line_values)
+                relevant_line_max = max(line_values)
+
+        def _event_relevant(event: dict[str, Any]) -> bool:
+            pid = int(event.get("pid", 0))
+            line_no = int(event.get("line_no", 0))
+            if relevant_pid_roots and pid:
+                if any(self._is_descendant_or_same_pid(t, pid, root) for root in relevant_pid_roots):
+                    return True
+            if relevant_line_min is not None and relevant_line_max is not None:
+                if relevant_line_min <= line_no <= relevant_line_max:
+                    return True
+            return not relevant_pid_roots
+
         file_agg: dict[str, dict[str, Any]] = {}
         for event in related:
+            if not _event_relevant(event):
+                continue
             event_type = str(event.get("type") or "")
             if event_type not in {"file_read", "file_write", "file_delete", "file_rename", "command_exec"}:
                 continue
@@ -2268,6 +2400,8 @@ class TraceStore:
         # Network endpoints for this tool
         net_agg: dict[tuple[str, str], dict[str, Any]] = {}
         for event in related:
+            if not _event_relevant(event):
+                continue
             event_type = str(event.get("type") or "")
             if event_type not in {"net_connect", "net_send", "net_recv"}:
                 continue
