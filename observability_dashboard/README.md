@@ -1,6 +1,6 @@
 # Agent Observability Dashboard
 
-This service monitors strace logs + agent instrumentation events + mitm captures and renders a realtime drilldown graph.
+This service monitors low-level trace logs (strace or eBPF JSONL) + agent instrumentation events + mitm captures and renders a realtime drilldown graph.
 
 ## Folder Convention
 
@@ -41,17 +41,17 @@ Then open: `http://127.0.0.1:8099`
 
 ## Run Agent + Strace with Matching Trace ID
 
-Choose a trace id, e.g. `trace_001.strace.log`.
+Choose a trace id, e.g. `trace_001.ebpf.jsonl`.
 
 ```bash
-export AGENT_TRACE_ID=trace_001.strace.log
+export AGENT_TRACE_ID=trace_001.ebpf.jsonl
 export AGENT_OBS_ROOT=~/shared/simple_agent/obs
-strace -f -e trace=process,file -o ~/shared/simple_agent/obs/traces/trace_001.strace.log python cli_agent.py
+python ebpf_capture.py --output ~/shared/simple_agent/obs/traces/trace_001.ebpf.jsonl -- python cli_agent.py
 ```
 
 This writes:
-- strace: `~/shared/simple_agent/obs/traces/trace_001.strace.log`
-- agent events: `~/shared/simple_agent/obs/events/trace_001.strace.log.events.jsonl`
+- eBPF trace: `~/shared/simple_agent/obs/traces/trace_001.ebpf.jsonl`
+- agent events: `~/shared/simple_agent/obs/events/trace_001.ebpf.jsonl.events.jsonl`
 
 ## Optional Environment Overrides
 

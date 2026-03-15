@@ -4,7 +4,7 @@ RTrace is a productionized observability stack for coding agents.
 
 It captures:
 - API-level behavior via `mitmproxy`
-- system calls via `strace`
+- system/process/file/network activity via eBPF (`bpftrace` driven collector)
 - agent flow in a dashboard (`FastAPI` + static UI)
 
 Current primary target is Codex, with an extension model for other agents.
@@ -83,7 +83,7 @@ Options:
 
 ### `rtrace codex`
 
-Run Codex with interception and optional syscall tracing.
+Run Codex with interception and optional low-level tracing.
 
 Usage:
 ```bash
@@ -99,8 +99,10 @@ rtrace codex --no-strace exec "fast run without low-level syscall capture"
 ```
 
 Notes:
-- `--strace` is default.
-- `--no-strace` disables low-level syscall capture.
+- `--strace` keeps backward-compatible flag semantics and enables low-level capture.
+- Implementation now uses eBPF capture (prototype) under the hood.
+- `--no-strace` disables low-level capture.
+- If eBPF is unavailable on the host kernel/container runtime, capture falls back to strace automatically.
 - Under the hood this calls `run_intercepted_codex.sh`.
 
 ### `run_intercepted_codex.sh` (advanced)
@@ -156,7 +158,7 @@ Important options:
 ```
 
 Generated data:
-- `obs/traces/<trace_id>.strace.log`
+- `obs/traces/<trace_id>.ebpf.jsonl`
 - `obs/mitm/<trace_id>.mitm.jsonl`
 - `obs/events/<trace_id>.events.jsonl`
 
@@ -216,7 +218,7 @@ Use the setup manifest + script pattern.
 
 ### No low-level syscall nodes in drilldown
 - Ensure you are not using `--no-strace`.
-- Confirm run output shows `Strace: true` and `Strace file: ...`.
+- Confirm run output shows `eBPF trace: true` and `eBPF file: ...`.
 
 ### Dashboard unreachable from host in Docker
 - Start monitor with `rtrace_monitor` (Docker-aware default bind is `0.0.0.0`).

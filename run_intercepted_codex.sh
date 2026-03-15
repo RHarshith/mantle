@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────
 # Run codex (or any external agent) with mitmproxy API interception
-# and optional strace syscall tracing.
+# and optional eBPF syscall tracing.
 #
 # Uses iptables transparent redirect to force ALL HTTPS traffic
 # through mitmproxy — works even for binaries that ignore proxy
@@ -17,7 +17,7 @@
 # ─────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-USE_STRACE=true
+USE_EBPF=true
 TRACE_ID=""
 MITM_PORT=8899
 MITM_REV_PORT=8898
@@ -25,10 +25,12 @@ AGENT_BIN="codex"
 TASK=""
 MITM_USER="mitmproxyuser"
 INTERCEPT_MODE="${RTRACE_INTERCEPT_MODE:-proxy}"
+AGENT_TAG="codex"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --no-strace)   USE_STRACE=false; shift ;;
+        --no-strace)   USE_EBPF=false; shift ;;
+        --strace)      USE_EBPF=true; shift ;;
         --trace-id)    TRACE_ID="$2"; shift 2 ;;
         --port)        MITM_PORT="$2"; shift 2 ;;
         --mode)        INTERCEPT_MODE="$2"; shift 2 ;;
@@ -40,13 +42,19 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OBS_ROOT="${AGENT_OBS_ROOT:-$SCRIPT_DIR/obs}"
-[ -z "$TRACE_ID" ] && TRACE_ID="${AGENT_BIN}_$(date +%Y%m%d_%H%M%S).strace.log"
+AGENT_TAG="$(basename "$AGENT_BIN")"
+[ -z "$TRACE_ID" ] && TRACE_ID="${AGENT_TAG}_$(date +%Y%m%d_%H%M%S).ebpf.jsonl"
 
 mkdir -p "$OBS_ROOT/traces" "$OBS_ROOT/events" "$OBS_ROOT/mitm"
 
-MITM_JSONL="$OBS_ROOT/mitm/${TRACE_ID%.strace.log}.mitm.jsonl"
-STRACE_FILE="$OBS_ROOT/traces/$TRACE_ID"
+TRACE_BASENAME="$TRACE_ID"
+TRACE_BASENAME="${TRACE_BASENAME%.strace.log}"
+TRACE_BASENAME="${TRACE_BASENAME%.ebpf.jsonl}"
+MITM_JSONL="$OBS_ROOT/mitm/${TRACE_BASENAME}.mitm.jsonl"
+EBPF_FILE="$OBS_ROOT/traces/$TRACE_ID"
+STRACE_FALLBACK_FILE="$OBS_ROOT/traces/${TRACE_BASENAME}.strace.log"
 MITM_CA="${HOME}/.mitmproxy/mitmproxy-ca-cert.pem"
+EBPF_CAPTURE_SCRIPT="$SCRIPT_DIR/ebpf_capture.py"
 
 # Find mitmdump
 MITMDUMP="$(command -v mitmdump 2>/dev/null || echo "$HOME/.local/bin/mitmdump")"
@@ -105,8 +113,8 @@ echo "  Trace ID:    $TRACE_ID"
 echo "  MITM mode:   $INTERCEPT_MODE"
 echo "  MITM proxy:  localhost:$MITM_PORT"
 echo "  MITM log:    $MITM_JSONL"
-echo "  Strace:      $USE_STRACE"
-$USE_STRACE && echo "  Strace file: $STRACE_FILE"
+echo "  eBPF trace:  $USE_EBPF"
+$USE_EBPF && echo "  eBPF file:   $EBPF_FILE"
 echo "═══════════════════════════════════════════════════════════"
 
 export MITM_CAPTURE_FILE="$MITM_JSONL"
@@ -240,21 +248,41 @@ cleanup() {
     wait "$MITM_PID" 2>/dev/null || true
     echo "[*] Done. Captured data:"
     [ -f "$MITM_JSONL" ] && echo "    MITM log:   $MITM_JSONL ($(wc -l < "$MITM_JSONL") lines)"
-    $USE_STRACE && [ -f "$STRACE_FILE" ] && echo "    Strace log: $STRACE_FILE ($(wc -l < "$STRACE_FILE") lines)"
+    $USE_EBPF && [ -f "$EBPF_FILE" ] && echo "    eBPF log:   $EBPF_FILE ($(wc -l < "$EBPF_FILE") lines)"
+    [ -f "$STRACE_FALLBACK_FILE" ] && echo "    Strace log: $STRACE_FALLBACK_FILE ($(wc -l < "$STRACE_FALLBACK_FILE") lines)"
 }
 trap cleanup EXIT
 
 # Build the agent command args
 AGENT_ARGS=("${TASK[@]:-}")
 
-if $USE_STRACE; then
-    echo "[*] Running $AGENT_BIN with strace..."
-    # -yy decodes socket FDs to endpoint hints, -s raises captured string size.
-    STRACE_STR_SIZE="${RTRACE_STRACE_STRING_SIZE:-512}"
-    strace -f -yy -s "$STRACE_STR_SIZE" -e trace=process,file,network -o "$STRACE_FILE" "$AGENT_BIN" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"
+if $USE_EBPF; then
+    RUN_EBPF=true
+    if ! command -v bpftrace >/dev/null 2>&1; then
+        RUN_EBPF=false
+        echo "[!] bpftrace not found, falling back to strace capture."
+    fi
+    if [ ! -f "$EBPF_CAPTURE_SCRIPT" ]; then
+        RUN_EBPF=false
+        echo "[!] $EBPF_CAPTURE_SCRIPT not found, falling back to strace capture."
+    fi
+
+    if $RUN_EBPF; then
+        echo "[*] Running $AGENT_BIN with eBPF capture..."
+        if ! python3 "$EBPF_CAPTURE_SCRIPT" --output "$EBPF_FILE" -- "$AGENT_BIN" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"; then
+            RUN_EBPF=false
+            echo "[!] eBPF capture failed at runtime, falling back to strace capture."
+        fi
+    fi
+
+    if ! $RUN_EBPF; then
+        STRACE_STR_SIZE="${RTRACE_STRACE_STRING_SIZE:-512}"
+        echo "[*] Running $AGENT_BIN with strace fallback..."
+        strace -f -yy -s "$STRACE_STR_SIZE" -e trace=process,file,network -o "$STRACE_FALLBACK_FILE" "$AGENT_BIN" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"
+    fi
 else
     echo "[*] Running $AGENT_BIN..."
-    touch "$STRACE_FILE"
+    touch "$EBPF_FILE"
     "$AGENT_BIN" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"
 fi
 

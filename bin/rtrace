@@ -27,6 +27,7 @@ Examples:
 
 Notes:
   - This command wraps run_intercepted_codex.sh.
+    - Low-level capture is eBPF-based (prototype); flags are kept for compatibility.
   - For transparent interception, root privileges may be required.
 EOF
 }

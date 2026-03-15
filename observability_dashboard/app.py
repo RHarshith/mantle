@@ -44,6 +44,7 @@ class TraceState:
     trace_id: str
     strace_path: Path
     events_path_candidates: list[Path]
+    trace_format: str = "strace"
     strace_offset: int = 0
     strace_line_no: int = 0
     events_offset: int = 0
@@ -75,19 +76,26 @@ class TraceStore:
             self.events_dir / f"{no_ext}.events.jsonl",
         ]
 
+    def _detect_trace_format(self, path: Path) -> str:
+        if path.name.endswith(".ebpf.jsonl"):
+            return "ebpf"
+        return "strace"
+
     async def poll_once(self) -> None:
         changed = False
 
         self.trace_dir.mkdir(parents=True, exist_ok=True)
         self.events_dir.mkdir(parents=True, exist_ok=True)
 
-        for file_path in sorted(self.trace_dir.glob("*.log")):
+        trace_files = sorted(self.trace_dir.glob("*.log")) + sorted(self.trace_dir.glob("*.ebpf.jsonl"))
+        for file_path in trace_files:
             trace_id = file_path.name
             if trace_id not in self.traces:
                 mitm_path = self._find_mitm_file(trace_id) if self.mitm_dir else None
                 self.traces[trace_id] = TraceState(
                     trace_id=trace_id,
                     strace_path=file_path,
+                    trace_format=self._detect_trace_format(file_path),
                     events_path_candidates=self._trace_to_event_candidates(file_path),
                     mitm_path=mitm_path,
                 )
@@ -98,7 +106,10 @@ class TraceStore:
                 state.mitm_path = self._find_mitm_file(state.trace_id)
 
             if state.strace_path.exists():
-                changed = self._tail_strace(state) or changed
+                if state.trace_format == "ebpf":
+                    changed = self._tail_ebpf_events(state) or changed
+                else:
+                    changed = self._tail_strace(state) or changed
             has_native = self._tail_events(state)
             changed = has_native or changed
             # If no native events FILE exists, continuously tail mitmproxy capture
@@ -169,6 +180,9 @@ class TraceStore:
         # Also strip .strace from e.g. trace_xxx.strace.log
         if no_ext.endswith(".strace"):
             candidates.append(self.mitm_dir / f"{no_ext[:-7]}.mitm.jsonl")
+        if trace_id.endswith(".ebpf.jsonl"):
+            base = trace_id[: -len(".ebpf.jsonl")]
+            candidates.append(self.mitm_dir / f"{base}.mitm.jsonl")
         for cand in candidates:
             if cand.exists():
                 return cand
@@ -589,6 +603,47 @@ class TraceStore:
         for line in lines:
             state.strace_line_no += 1
             changed = self._ingest_strace_line(state, line, state.strace_line_no) or changed
+
+        state.strace_offset = new_offset
+        return changed
+
+    def _tail_ebpf_events(self, state: TraceState) -> bool:
+        lines, new_offset = self._read_new_lines(state.strace_path, state.strace_offset)
+        if not lines:
+            return False
+
+        changed = False
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            state.strace_line_no += 1
+            event_type = str(event.get("type") or "")
+
+            normalized = dict(event)
+            normalized["line_no"] = int(normalized.get("line_no") or state.strace_line_no)
+            normalized["ts"] = float(normalized.get("ts") or time.time())
+            state.sys_events.append(normalized)
+            changed = True
+
+            if event_type == "command_exec" and state.root_pid is None:
+                state.root_pid = int(normalized.get("pid", 0)) or None
+
+            if event_type == "process_spawn":
+                parent_pid = int(normalized.get("pid", 0))
+                child_pid = int(normalized.get("child_pid", 0))
+                if parent_pid > 0 and child_pid > 0:
+                    state.process_parent[child_pid] = parent_pid
+
+            if event_type == "process_exit" and state.root_pid is not None:
+                pid = int(normalized.get("pid", 0))
+                if pid == state.root_pid:
+                    state.complete = True
 
         state.strace_offset = new_offset
         return changed
