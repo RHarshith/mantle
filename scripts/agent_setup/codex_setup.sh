@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ENV_DIR="/root/.config/rtrace/agent-env"
+ENV_DIR="/root/.config/mantle/agent-env"
 ENV_FILE="$ENV_DIR/codex.env"
 BASHRC="/root/.bashrc"
-MARKER_START="# >>> rtrace-agent-env >>>"
-MARKER_END="# <<< rtrace-agent-env <<<"
+MARKER_START="# >>> mantle-agent-env >>>"
+MARKER_END="# <<< mantle-agent-env <<<"
 
 mkdir -p "$ENV_DIR"
 
@@ -33,13 +33,13 @@ fi
 if [[ -f "$BASHRC" ]]; then
     if ! grep -q "$MARKER_START" "$BASHRC"; then
         cat >> "$BASHRC" <<'EOF'
-# >>> rtrace-agent-env >>>
-if [ -d /root/.config/rtrace/agent-env ]; then
-  for _envf in /root/.config/rtrace/agent-env/*.env; do
+# >>> mantle-agent-env >>>
+if [ -d /root/.config/mantle/agent-env ]; then
+    for _envf in /root/.config/mantle/agent-env/*.env; do
     [ -f "$_envf" ] && . "$_envf"
   done
 fi
-# <<< rtrace-agent-env <<<
+# <<< mantle-agent-env <<<
 EOF
     fi
 fi

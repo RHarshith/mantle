@@ -93,11 +93,11 @@ append_once "$HOME/.zshrc" "export AGENT_OBS_ROOT=\"$REPO_ROOT/obs\""
 
 cd "$REPO_ROOT"
 echo "[bootstrap] installing python runtime + repo commands"
-bash "$REPO_ROOT/scripts/install_rtrace.sh"
+bash "$REPO_ROOT/scripts/install_mantle.sh"
 
 echo "[bootstrap] done"
 echo ""
 echo "Next steps:"
 echo "  1) reload your shell: source ~/.bashrc  (or source ~/.zshrc)"
 echo "  2) set key for current shell: export OPENAI_API_KEY=YOUR_KEY"
-echo "  3) verify commands: rtrace_monitor --help && rtrace codex --help && rtrace_test --list"
+echo "  3) verify commands: mantle --help && mantle serve --help && mantle watch --help"

@@ -4,23 +4,23 @@ This service monitors low-level eBPF JSONL trace logs + agent instrumentation ev
 
 ## Folder Convention
 
-- eBPF logs directory (watched): `~/shared/simple_agent/obs/traces`
-- Agent event logs directory: `~/shared/simple_agent/obs/events`
+- eBPF logs directory (watched): `~/shared/mantle/obs/traces`
+- Agent event logs directory: `~/shared/mantle/obs/events`
 
 ## Run the Dashboard
 
 Recommended (from repo root):
 
 ```bash
-rtrace_monitor --host 0.0.0.0 --port 8099
+mantle serve --host 0.0.0.0 --port 8099
 ```
 
 Direct uvicorn alternative:
 
 ```bash
-cd observability_dashboard
-/Users/harshithreddy/ubuntu_shared/simple_agent/.venv/bin/python -m pip install -r requirements.txt
-/Users/harshithreddy/ubuntu_shared/simple_agent/.venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8099 --reload
+cd mantle/dashboard
+/Users/harshithreddy/ubuntu_shared/mantle/.venv/bin/python -m pip install -r requirements.txt
+/Users/harshithreddy/ubuntu_shared/mantle/.venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8099 --reload
 ```
 
 Open: `http://127.0.0.1:8099`
@@ -45,13 +45,13 @@ Choose a trace id, e.g. `trace_001.ebpf.jsonl`.
 
 ```bash
 export AGENT_TRACE_ID=trace_001.ebpf.jsonl
-export AGENT_OBS_ROOT=~/shared/simple_agent/obs
-python ebpf_capture.py --output ~/shared/simple_agent/obs/traces/trace_001.ebpf.jsonl -- python cli_agent.py
+export AGENT_OBS_ROOT=~/shared/mantle/obs
+mantle watch --trace-id trace_001.ebpf.jsonl codex exec "inspect this repository and summarize"
 ```
 
 This writes:
-- eBPF trace: `~/shared/simple_agent/obs/traces/trace_001.ebpf.jsonl`
-- agent events: `~/shared/simple_agent/obs/events/trace_001.ebpf.jsonl.events.jsonl`
+- eBPF trace: `~/shared/mantle/obs/traces/trace_001.ebpf.jsonl`
+- agent events: `~/shared/mantle/obs/events/trace_001.ebpf.jsonl.events.jsonl`
 
 ## Optional Environment Overrides
 
@@ -59,4 +59,4 @@ This writes:
 - `OBS_EVENTS_DIR` (dashboard watched events dir)
 - `AGENT_OBS_ENABLED` (`1`/`0`)
 - `AGENT_TRACE_ID` (must match trace log file name for best correlation)
-- `AGENT_OBS_ROOT` (defaults to `~/shared/simple_agent/obs`)
+- `AGENT_OBS_ROOT` (defaults to `~/shared/mantle/obs`)

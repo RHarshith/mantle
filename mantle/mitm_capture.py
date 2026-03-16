@@ -2,7 +2,7 @@
 mitmproxy addon: capture OpenAI API chat-completion requests & responses.
 
 Usage:
-    mitmdump -s mitm_capture.py --set capture_file=/path/to/output.mitm.jsonl
+    mitmdump -s mantle/mitm_capture.py --set capture_file=/path/to/output.mitm.jsonl
 
 Each intercepted chat completion is written as a single JSONL line containing:
     - ts:                 UNIX timestamp

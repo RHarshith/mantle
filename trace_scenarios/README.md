@@ -12,5 +12,5 @@ Each suite lives in its own subfolder and should include:
 Run a suite using:
 
 ```bash
-rtrace_test <suite_name>
+./bin/rtrace_test <suite_name>
 ```

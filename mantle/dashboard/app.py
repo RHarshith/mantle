@@ -644,7 +644,7 @@ class TraceStore:
             return True
         if any(part in path for part in NOISY_SUFFIXES):
             return True
-        if "site-packages" in path and "simple_agent" not in path:
+        if "site-packages" in path and "mantle" not in path:
             return True
         return False
 
@@ -671,7 +671,7 @@ class TraceStore:
         if not path.startswith("/"):
             return "/" in path or "." in path
 
-        if "/workspace/" in path or "/simple_agent/" in path:
+        if "/workspace/" in path or "/mantle/" in path:
             return True
 
         # Catch-all for tmp and other workspace-like paths
@@ -2622,12 +2622,12 @@ def _resolve_paths() -> tuple[Path, Path]:
 
     candidate_pairs = [
         (
-            Path("~/shared/simple_agent/obs/traces").expanduser(),
-            Path("~/shared/simple_agent/obs/events").expanduser(),
+            Path("~/shared/mantle/obs/traces").expanduser(),
+            Path("~/shared/mantle/obs/events").expanduser(),
         ),
         (
-            Path("~/ubuntu_shared/simple_agent/obs/traces").expanduser(),
-            Path("~/ubuntu_shared/simple_agent/obs/events").expanduser(),
+            Path("~/ubuntu_shared/mantle/obs/traces").expanduser(),
+            Path("~/ubuntu_shared/mantle/obs/events").expanduser(),
         ),
         (repo_root / "obs" / "traces", repo_root / "obs" / "events"),
     ]

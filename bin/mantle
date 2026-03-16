@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -h "$SOURCE" ]]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    TARGET="$(readlink "$SOURCE")"
+    if [[ "$TARGET" != /* ]]; then
+        SOURCE="$DIR/$TARGET"
+    else
+        SOURCE="$TARGET"
+    fi
+done
+
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+REPO_ROOT="${MANTLE_REPO_ROOT:-${RTRACE_REPO_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}}"
+VENV_PATH="${MANTLE_VENV:-${RTRACE_VENV:-$REPO_ROOT/.venv}}"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  mantle serve [--host <host>] [--port <port>] [--obs-root <path>]
+  mantle watch [--mode <proxy|transparent>] [--trace-id <id>] [--port <mitm_port>] <executable> [exec] [prompt...]
+
+Commands:
+    serve    Start the observability dashboard.
+    watch    Run an executable under MITM + eBPF capture.
+
+Examples:
+  mantle serve --host 0.0.0.0 --port 8099
+  mantle watch codex
+  mantle watch codex exec "inspect this repo and summarize"
+  mantle watch --mode transparent codex exec "trace network behavior"
+  mantle watch aider "fix failing tests"
+EOF
+}
+
+serve_cmd() {
+    local host port obs_root python_bin
+
+    if [[ -f "/.dockerenv" ]]; then
+        host="0.0.0.0"
+    else
+        host="127.0.0.1"
+    fi
+    port="8099"
+    obs_root="${AGENT_OBS_ROOT:-$REPO_ROOT/obs}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --host)
+                host="$2"
+                shift 2
+                ;;
+            --port)
+                port="$2"
+                shift 2
+                ;;
+            --obs-root)
+                obs_root="$2"
+                shift 2
+                ;;
+            -h|--help|help)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "Unknown argument for 'serve': $1" >&2
+                usage
+                exit 1
+                ;;
+        esac
+    done
+
+    python_bin="$VENV_PATH/bin/python"
+    if [[ ! -x "$python_bin" ]]; then
+        echo "Error: $python_bin not found. Run scripts/install_mantle.sh first." >&2
+        exit 1
+    fi
+
+    export AGENT_OBS_ROOT="$obs_root"
+    export OBS_TRACE_DIR="$obs_root/traces"
+    export OBS_EVENTS_DIR="$obs_root/events"
+
+    mkdir -p "$obs_root/traces" "$obs_root/events" "$obs_root/mitm"
+
+    exec "$python_bin" -m uvicorn mantle.dashboard.app:app --host "$host" --port "$port"
+}
+
+watch_cmd() {
+    local runner executable preserve_env
+    local -a runner_args passthrough task_args
+
+    runner="$REPO_ROOT/run_intercepted_codex.sh"
+    if [[ ! -x "$runner" ]]; then
+        echo "Error: $runner not found or not executable." >&2
+        exit 1
+    fi
+
+    passthrough=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --mode|--trace-id|--port)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: $1 requires a value." >&2
+                    exit 1
+                fi
+                passthrough+=("$1" "$2")
+                shift 2
+                ;;
+            -h|--help|help)
+                usage
+                exit 0
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -*)
+                echo "Unknown argument for 'watch': $1" >&2
+                usage
+                exit 1
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    if [[ $# -lt 1 ]]; then
+        echo "Error: 'watch' requires an executable (for example: codex)." >&2
+        usage
+        exit 1
+    fi
+
+    executable="$1"
+    shift
+
+    task_args=()
+    if [[ $# -eq 0 ]]; then
+        :
+    elif [[ "$1" == "exec" ]]; then
+        shift
+        if [[ $# -eq 0 ]]; then
+            echo "Error: 'exec' requires a prompt." >&2
+            exit 1
+        fi
+        task_args+=("exec" "$*")
+    else
+        task_args+=("$*")
+    fi
+
+    runner_args=("${passthrough[@]}" --agent "$executable" "${task_args[@]}")
+
+    if [[ "${EUID}" -ne 0 ]]; then
+        preserve_env="OPENAI_API_KEY,AGENT_OBS_ROOT,RTRACE_VENV,RTRACE_INTERCEPT_MODE,RTRACE_FORCE_OPENAI_BASE,MANTLE_VENV,MANTLE_INTERCEPT_MODE,MANTLE_FORCE_OPENAI_BASE"
+        exec sudo --preserve-env="$preserve_env" "$runner" "${runner_args[@]}"
+    fi
+
+    exec "$runner" "${runner_args[@]}"
+}
+
+if [[ $# -lt 1 ]]; then
+    usage
+    exit 1
+fi
+
+case "$1" in
+    serve)
+        shift
+        serve_cmd "$@"
+        ;;
+    watch)
+        shift
+        watch_cmd "$@"
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        echo "Unknown command: $1" >&2
+        usage
+        exit 1
+        ;;
+esac

@@ -22,7 +22,7 @@ MITM_REV_PORT=8898
 AGENT_BIN="codex"
 TASK=""
 MITM_USER="mitmproxyuser"
-INTERCEPT_MODE="${RTRACE_INTERCEPT_MODE:-proxy}"
+INTERCEPT_MODE="${MANTLE_INTERCEPT_MODE:-${RTRACE_INTERCEPT_MODE:-proxy}}"
 AGENT_TAG="codex"
 
 while [[ $# -gt 0 ]]; do
@@ -42,7 +42,7 @@ AGENT_TAG="$(basename "$AGENT_BIN")"
 [ -z "$TRACE_ID" ] && TRACE_ID="${AGENT_TAG}_$(date +%Y%m%d_%H%M%S).ebpf.jsonl"
 
 # Resolve runtime venv path (allows consistent tool discovery under sudo).
-RUNTIME_VENV="${RTRACE_VENV:-$SCRIPT_DIR/.venv}"
+RUNTIME_VENV="${MANTLE_VENV:-${RTRACE_VENV:-$SCRIPT_DIR/.venv}}"
 
 mkdir -p "$OBS_ROOT/traces" "$OBS_ROOT/events" "$OBS_ROOT/mitm"
 
@@ -51,7 +51,7 @@ TRACE_BASENAME="${TRACE_BASENAME%.ebpf.jsonl}"
 MITM_JSONL="$OBS_ROOT/mitm/${TRACE_BASENAME}.mitm.jsonl"
 EBPF_FILE="$OBS_ROOT/traces/$TRACE_ID"
 MITM_CA="${HOME}/.mitmproxy/mitmproxy-ca-cert.pem"
-EBPF_CAPTURE_SCRIPT="$SCRIPT_DIR/ebpf_capture.py"
+EBPF_CAPTURE_SCRIPT="$SCRIPT_DIR/mantle/ebpf_capture.py"
 
 # Find mitmdump
 MITMDUMP=""
@@ -66,7 +66,7 @@ elif [ -x "$HOME/.local/bin/mitmdump" ]; then
 fi
 
 [ -n "$MITMDUMP" ] || {
-    echo "Error: mitmdump not found. Run scripts/install_rtrace.sh or install with: pipx install mitmproxy" >&2
+    echo "Error: mitmdump not found. Run scripts/install_mantle.sh or install with: pipx install mitmproxy" >&2
     exit 1
 }
 
@@ -153,7 +153,7 @@ if [[ "$INTERCEPT_MODE" == "transparent" ]]; then
             --mode reverse:https://api.openai.com@"$MITM_REV_PORT" \
             --ssl-insecure \
             --set connection_strategy=lazy \
-            -s "$SCRIPT_DIR/mitm_capture.py" \
+            -s "$SCRIPT_DIR/mantle/mitm_capture.py" \
             --set capture_file="$MITM_JSONL" \
             -q &
     MITM_PID=$!
@@ -165,7 +165,7 @@ else
     "$MITMDUMP" \
         -p "$MITM_PORT" \
         --ssl-insecure \
-        -s "$SCRIPT_DIR/mitm_capture.py" \
+        -s "$SCRIPT_DIR/mantle/mitm_capture.py" \
         --set capture_file="$MITM_JSONL" \
         -q &
     MITM_PID=$!
@@ -231,7 +231,7 @@ export NODE_TLS_REJECT_UNAUTHORIZED=0
 # Newer Codex versions may drop auth headers for plaintext http base URLs.
 # Transparent iptables interception is sufficient, so do NOT override base URL
 # by default. Allow opt-in for debugging compatibility.
-if [[ "${RTRACE_FORCE_OPENAI_BASE:-0}" == "1" ]]; then
+if [[ "${MANTLE_FORCE_OPENAI_BASE:-${RTRACE_FORCE_OPENAI_BASE:-0}}" == "1" ]]; then
     export OPENAI_API_BASE="http://127.0.0.1:$MITM_REV_PORT/v1"
     export OPENAI_BASE_URL="http://127.0.0.1:$MITM_REV_PORT/v1"
     echo "[*] Forced OPENAI_BASE_URL/OPENAI_API_BASE to local reverse endpoint"

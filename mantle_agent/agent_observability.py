@@ -76,7 +76,7 @@ def build_event_sink() -> EventSink:
 
     session_id = str(uuid.uuid4())
 
-    root = os.getenv("AGENT_OBS_ROOT", "~/shared/simple_agent/obs").strip()
+    root = os.getenv("AGENT_OBS_ROOT", "~/shared/mantle/obs").strip()
     root_path = Path(root).expanduser()
 
     output_path = root_path / "events" / f"{trace_id}.events.jsonl"
