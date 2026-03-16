@@ -126,6 +126,37 @@
     .timeline-connector::before { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; background: var(--slate-200); transform: translateX(-50%); }
     .connector-arrow { width: 8px; height: 8px; border-right: 2px solid var(--slate-300); border-bottom: 2px solid var(--slate-300); transform: rotate(45deg); background: var(--bg); position: relative; z-index: 1; }
 
+    /* === Git-Style Tree === */
+    .git-tree { max-width: 1040px; margin: 0 auto; }
+    .git-row { display: grid; grid-template-columns: auto 1fr; align-items: stretch; gap: 8px; margin-bottom: 4px; }
+    .git-graph { position: relative; min-height: 48px; }
+    .git-svg { position: absolute; inset: 0; overflow: visible; pointer-events: none; }
+    .git-lane { position: absolute; top: 0; bottom: 0; width: 2px; transform: translateX(-50%); background: transparent; }
+    .git-lane.active { background: var(--slate-300); }
+    .git-marker { position: absolute; top: 50%; width: 11px; height: 11px; border-radius: 50%; transform: translate(-50%, -50%); background: var(--slate-500); border: 2px solid var(--surface); box-shadow: 0 0 0 1px var(--slate-300); z-index: 3; }
+    .git-marker.kind-process_start { background: var(--emerald-600); }
+    .git-marker.kind-process_spawn { background: var(--blue-600); }
+    .git-marker.kind-process_exec { background: var(--orange-600); }
+    .git-marker.kind-process_exit { background: var(--red-600); }
+    .git-marker.kind-tool_step { background: var(--amber-600); }
+    .git-marker.kind-tool_output { background: var(--amber-500); }
+    .git-marker.kind-api_call { background: var(--emerald-500); }
+    .git-marker.kind-assistant_response { background: var(--cyan-600); }
+    .git-curve { fill: none; stroke-width: 2.2; }
+    .git-curve.branch { stroke: var(--blue-500); }
+    .git-curve.merge { stroke: var(--emerald-600); stroke-dasharray: 5 4; }
+
+    .git-card { background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--slate-300); border-radius: var(--radius-sm); padding: 6px 9px; box-shadow: var(--shadow-sm); cursor: pointer; transition: all .14s; max-height: 44px; overflow: hidden; }
+    .git-card:hover { box-shadow: var(--shadow-md); border-color: var(--slate-300); }
+    .git-card.selected { box-shadow: 0 0 0 2px var(--blue-500), var(--shadow-md); }
+    .git-card:hover { max-height: 140px; }
+    .git-card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 3px; }
+    .git-kind { font-size: 10px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-muted); }
+    .git-line { font-size: 10px; font-variant-numeric: tabular-nums; color: var(--text-muted); }
+    .git-title { font-size: 12px; font-weight: 600; color: var(--text-primary); word-break: break-word; line-height: 1.25; display: -webkit-box; -webkit-line-clamp: 1; line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; }
+    .git-card:hover .git-title { -webkit-line-clamp: 5; line-clamp: 5; }
+    .git-meta { margin-top: 1px; font-size: 10px; color: var(--text-muted); }
+
     /* === DAG view (tool drilldown) === */
     .dag-container { position: relative; margin: 0 auto; }
     .dag-edges { position: absolute; top: 0; left: 0; pointer-events: none; overflow: visible; }

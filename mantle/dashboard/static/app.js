@@ -6,8 +6,11 @@
 
 // ─── State ────────────────────────────────────────────────────────
 let selectedTraceId = null;
-let currentMode = "high"; // "high" | "tool"
+let currentMode = "high"; // "high" | "tool" | "process" | "internal"
 let currentToolCallId = null;
+let currentProcessPid = null;
+let processTrail = [];
+let currentInternalRange = null;
 let cachedTraces = [];
 let latestVersion = -1;
 let zoomLevel = 1;
@@ -89,6 +92,29 @@ async function openToolDrilldown(toolCallId, toolName) {
   }
 }
 
+async function openProcessDrilldown(pid) {
+  if (!selectedTraceId || !pid) return;
+  currentMode = "process";
+  currentProcessPid = Number(pid);
+  if (processTrail.length === 0 || processTrail[processTrail.length - 1] !== currentProcessPid) {
+    processTrail.push(currentProcessPid);
+  }
+  zoomLevel = 1;
+  applyZoom();
+  renderBreadcrumbs();
+  await loadProcessGraph(currentProcessPid);
+}
+
+async function openInternalDrilldown(lineStart, lineEnd) {
+  if (!selectedTraceId || lineStart == null || lineEnd == null) return;
+  currentMode = "internal";
+  currentInternalRange = { start: Number(lineStart), end: Number(lineEnd) };
+  zoomLevel = 1;
+  applyZoom();
+  renderBreadcrumbs();
+  await loadInternalGraph(currentInternalRange.start, currentInternalRange.end);
+}
+
 function renderTools(tools) {
   cachedTraceTools = Array.isArray(tools) ? tools : [];
   toolsCountBadge.textContent = `${cachedTraceTools.length}`;
@@ -143,6 +169,9 @@ async function selectTrace(traceId) {
   selectedTraceId = traceId;
   currentMode = "high";
   currentToolCallId = null;
+  currentProcessPid = null;
+  processTrail = [];
+  currentInternalRange = null;
   selectedNodeId = null;
   zoomLevel = 1;
   applyZoom();
@@ -195,11 +224,38 @@ function renderBreadcrumbs() {
     toolCrumb.textContent = `Tool: ${currentToolCallId.slice(0, 20)}`;
     breadcrumbsEl.appendChild(toolCrumb);
   }
+
+  if (currentMode === "process" && processTrail.length > 0) {
+    const sep = document.createElement("span");
+    sep.className = "sep";
+    sep.textContent = "›";
+    breadcrumbsEl.appendChild(sep);
+
+    const procCrumb = document.createElement("span");
+    procCrumb.className = "crumb current";
+    procCrumb.textContent = `Process: ${processTrail[processTrail.length - 1]}`;
+    breadcrumbsEl.appendChild(procCrumb);
+  }
+
+  if (currentMode === "internal" && currentInternalRange) {
+    const sep = document.createElement("span");
+    sep.className = "sep";
+    sep.textContent = "›";
+    breadcrumbsEl.appendChild(sep);
+
+    const internalCrumb = document.createElement("span");
+    internalCrumb.className = "crumb current";
+    internalCrumb.textContent = `Internal: L${currentInternalRange.start}-L${currentInternalRange.end}`;
+    breadcrumbsEl.appendChild(internalCrumb);
+  }
 }
 
 async function goBackToHighLevel() {
   currentMode = "high";
   currentToolCallId = null;
+  currentProcessPid = null;
+  processTrail = [];
+  currentInternalRange = null;
   selectedNodeId = null;
   zoomLevel = 1;
   applyZoom();
@@ -242,182 +298,44 @@ if (toolsToggle) {
   toolsToggle.addEventListener("click", () => setToolsExpanded(!toolsExpanded));
 }
 
-// ─── File Tree Building ────────────────────────────────────────────
-function buildFileTree(files) {
-  const root = { name: "", children: {}, files: [] };
+// ─── Linear File Compression ───────────────────────────────────────
+function renderLinearFiles(files) {
+  const sorted = [...files].sort((a, b) => String(a.path || "").localeCompare(String(b.path || "")));
+  const maxShownPerDir = 4;
+  const byDir = new Map();
 
-  for (const f of files) {
-    const path = f.path.replace(/^\/+/, "");
-    const parts = path.split("/");
-    let node = root;
-
-    for (let i = 0; i < parts.length - 1; i++) {
-      const part = parts[i];
-      if (!node.children[part]) {
-        node.children[part] = { name: part, children: {}, files: [] };
-      }
-      node = node.children[part];
-    }
-
-    node.files.push({ ...f, fileName: parts[parts.length - 1] });
+  for (const f of sorted) {
+    const path = String(f.path || "");
+    const idx = path.lastIndexOf("/");
+    const dir = idx >= 0 ? path.slice(0, idx) : ".";
+    if (!byDir.has(dir)) byDir.set(dir, []);
+    byDir.get(dir).push(f);
   }
 
-  compressSingleChildChains(root);
-  return root;
-}
+  for (const [dir, entries] of byDir.entries()) {
+    const hdr = document.createElement("div");
+    hdr.className = "file-row tree-root-prefix";
+    hdr.innerHTML = `<div class="file-path" style="color:var(--text-muted);font-size:11px;">${escapeHtml(dir || ".")}</div>`;
+    filesListEl.appendChild(hdr);
 
-function compressSingleChildChains(node) {
-  for (const key of Object.keys(node.children)) {
-    compressSingleChildChains(node.children[key]);
-  }
-  const childKeys = Object.keys(node.children);
-  if (childKeys.length === 1 && node.files.length === 0) {
-    const key = childKeys[0];
-    const child = node.children[key];
-    node.name = node.name ? node.name + "/" + child.name : child.name;
-    node.children = child.children;
-    node.files = child.files;
-  }
-}
-
-function countFilesInTree(node) {
-  let count = node.files.length;
-  for (const key of Object.keys(node.children)) {
-    count += countFilesInTree(node.children[key]);
-  }
-  return count;
-}
-
-function renderFileTreeNode(node, container, depth) {
-  const childKeys = Object.keys(node.children).sort();
-
-  // Render child folders first
-  for (const key of childKeys) {
-    const child = node.children[key];
-    const totalFiles = countFilesInTree(child);
-
-    const wrapper = document.createElement("div");
-    wrapper.className = "folder-wrapper";
-
-    const row = document.createElement("div");
-    row.className = "file-row folder-row";
-    row.style.paddingLeft = 12 + depth * 16 + "px";
-    row.innerHTML = `
-      <div class="file-path folder-path">
-        <span class="folder-toggle">▶</span>
-        <span class="folder-icon">📁</span>
-        <span>${escapeHtml(child.name)}/</span>
-        <span class="file-count">${totalFiles} file${totalFiles !== 1 ? "s" : ""}</span>
-      </div>`;
-
-    const childContainer = document.createElement("div");
-    childContainer.className = "folder-children";
-    childContainer.style.display = "none";
-
-    let expanded = false;
-    let childrenRendered = false;
-
-    row.addEventListener("click", (e) => {
-      e.stopPropagation();
-      expanded = !expanded;
-      if (!childrenRendered) {
-        renderFileTreeNode(child, childContainer, depth + 1);
-        childrenRendered = true;
-      }
-      childContainer.style.display = expanded ? "block" : "none";
-      row.querySelector(".folder-toggle").textContent = expanded ? "▼" : "▶";
-    });
-
-    wrapper.appendChild(row);
-    wrapper.appendChild(childContainer);
-    container.appendChild(wrapper);
-  }
-
-  // Render direct files (with grouping if > 3)
-  const fileList = node.files;
-  if (fileList.length > 0 && fileList.length <= 3) {
-    for (const f of fileList) {
+    const visible = entries.slice(0, maxShownPerDir);
+    for (const f of visible) {
       const row = document.createElement("div");
       row.className = "file-row";
-      row.style.paddingLeft = 12 + depth * 16 + "px";
-      const opsHtml = (f.ops || [])
-        .map((op) => `<span class="op-badge op-${op}">${op}</span>`)
-        .join("");
+      const base = String(f.path || "").split("/").pop() || String(f.path || "");
+      const opsHtml = (f.ops || []).map((op) => `<span class="op-badge op-${op}">${op}</span>`).join("");
       row.innerHTML = `
-        <div class="file-path">${escapeHtml(f.fileName)}</div>
-        <div class="file-ops">
-          ${opsHtml}
-          <span class="file-count">×${f.count || 0}</span>
-        </div>`;
-      container.appendChild(row);
+        <div class="file-path">${escapeHtml(base)}</div>
+        <div class="file-ops">${opsHtml}<span class="file-count">×${f.count || 0}</span></div>`;
+      filesListEl.appendChild(row);
     }
-  } else if (fileList.length > 3) {
-    // Show first file
-    const first = fileList[0];
-    const firstRow = document.createElement("div");
-    firstRow.className = "file-row";
-    firstRow.style.paddingLeft = 12 + depth * 16 + "px";
-    const firstOpsHtml = (first.ops || [])
-      .map((op) => `<span class="op-badge op-${op}">${op}</span>`)
-      .join("");
-    firstRow.innerHTML = `
-      <div class="file-path">${escapeHtml(first.fileName)}</div>
-      <div class="file-ops">
-        ${firstOpsHtml}
-        <span class="file-count">×${first.count || 0}</span>
-      </div>`;
-    container.appendChild(firstRow);
 
-    // Collapsed "+ N other files" group
-    const remaining = fileList.length - 1;
-    const groupWrapper = document.createElement("div");
-    groupWrapper.className = "folder-wrapper";
-
-    const groupRow = document.createElement("div");
-    groupRow.className = "file-row folder-row grouped-files-row";
-    groupRow.style.paddingLeft = 12 + depth * 16 + "px";
-    groupRow.innerHTML = `
-      <div class="file-path grouped-path">
-        <span class="folder-toggle">▶</span>
-        ${escapeHtml(first.fileName)} + ${remaining} other file${remaining !== 1 ? "s" : ""}
-      </div>`;
-
-    const restContainer = document.createElement("div");
-    restContainer.className = "folder-children";
-    restContainer.style.display = "none";
-
-    let groupExpanded = false;
-    let groupRendered = false;
-
-    groupRow.addEventListener("click", (e) => {
-      e.stopPropagation();
-      groupExpanded = !groupExpanded;
-      if (!groupRendered) {
-        for (let i = 1; i < fileList.length; i++) {
-          const f = fileList[i];
-          const row = document.createElement("div");
-          row.className = "file-row";
-          row.style.paddingLeft = 12 + (depth + 1) * 16 + "px";
-          const opsHtml = (f.ops || [])
-            .map((op) => `<span class="op-badge op-${op}">${op}</span>`)
-            .join("");
-          row.innerHTML = `
-            <div class="file-path">${escapeHtml(f.fileName)}</div>
-            <div class="file-ops">
-              ${opsHtml}
-              <span class="file-count">×${f.count || 0}</span>
-            </div>`;
-          restContainer.appendChild(row);
-        }
-        groupRendered = true;
-      }
-      restContainer.style.display = groupExpanded ? "block" : "none";
-      groupRow.querySelector(".folder-toggle").textContent = groupExpanded ? "▼" : "▶";
-    });
-
-    groupWrapper.appendChild(groupRow);
-    groupWrapper.appendChild(restContainer);
-    container.appendChild(groupWrapper);
+    if (entries.length > maxShownPerDir) {
+      const more = document.createElement("div");
+      more.className = "file-row grouped-files-row";
+      more.innerHTML = `<div class="file-path grouped-path">+ ${entries.length - maxShownPerDir} more files</div>`;
+      filesListEl.appendChild(more);
+    }
   }
 }
 
@@ -504,17 +422,7 @@ function renderFiles(files, scopeLabel, totalCount, network) {
     }
 
     if (filtered.length > 0) {
-      const tree = buildFileTree(filtered);
-
-      // Show common prefix if present
-      if (tree.name) {
-        const prefixRow = document.createElement("div");
-        prefixRow.className = "file-row tree-root-prefix";
-        prefixRow.innerHTML = `<div class="file-path" style="color:var(--text-muted);font-size:11px;">📂 ${escapeHtml(tree.name)}/</div>`;
-        filesListEl.appendChild(prefixRow);
-      }
-
-      renderFileTreeNode(tree, filesListEl, tree.name ? 1 : 0);
+      renderLinearFiles(filtered);
     }
   }
 }
@@ -538,6 +446,193 @@ function renderDetails(nodeData) {
   detailsEl.innerHTML = `
     <div class="detail-title">${escapeHtml(nodeData.label || nodeData.id)}</div>
     <pre>${escapeHtml(metaStr)}</pre>`;
+}
+
+// ─── Git-Style Tree Renderer ──────────────────────────────────────
+function renderGitTreeGraph(payload) {
+  graphCanvas.innerHTML = "";
+  emptyState.style.display = "none";
+
+  const nodes = Array.isArray(payload.nodes) ? [...payload.nodes] : [];
+  if (nodes.length === 0) {
+    graphCanvas.innerHTML = '<div class="empty-state"><h3>No trace events</h3><p>Waiting for process and agent activity...</p></div>';
+    return;
+  }
+
+  nodes.sort((a, b) => {
+    const la = Number(a.line_no || 0);
+    const lb = Number(b.line_no || 0);
+    if (la !== lb) return la - lb;
+    return Number(a.lane || 0) - Number(b.lane || 0);
+  });
+
+  const maxLane = Number(payload.max_lane || 0);
+  const laneSpacing = 24;
+  const graphWidth = (maxLane + 1) * laneSpacing + 16;
+
+  const rangeByLane = new Map();
+  for (const branch of payload.branch_ranges || []) {
+    const lane = Number(branch.lane || 0);
+    rangeByLane.set(lane, {
+      start: Number(branch.start_line || 0),
+      end: branch.end_line == null ? null : Number(branch.end_line),
+      pid: branch.pid,
+      parentPid: branch.parent_pid,
+    });
+  }
+
+  const root = document.createElement("div");
+  root.className = "git-tree";
+
+  const kindLabel = {
+    process_start: "Process Start",
+    process_spawn: "Spawn",
+    process_exec: "Exec",
+    process_exit: "Exit",
+    internal: "Internal",
+    prompt: "Prompt",
+    prompt_batch: "Prompts",
+    assistant_response: "Response",
+    file_read: "File Read",
+    file_write: "File Write",
+    file_delete: "Delete",
+    file_rename: "Rename",
+    net_connect: "Connect",
+    net_send: "Net Send",
+    net_recv: "Net Recv",
+  };
+
+  let selectedEl = null;
+
+  const isLaneActiveAt = (lane, lineNo) => {
+    const r = rangeByLane.get(lane);
+    if (!r) return false;
+    if (lineNo < r.start) return false;
+    if (r.end == null) return true;
+    return lineNo <= r.end;
+  };
+
+  for (const node of nodes) {
+    const lineNo = Number(node.line_no || 0);
+    const lane = Number(node.lane || 0);
+
+    const row = document.createElement("div");
+    row.className = "git-row";
+
+    const graph = document.createElement("div");
+    graph.className = "git-graph";
+    graph.style.width = `${graphWidth}px`;
+
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("class", "git-svg");
+    svg.setAttribute("width", graphWidth);
+    svg.setAttribute("height", 54);
+    graph.appendChild(svg);
+
+    for (let i = 0; i <= maxLane; i++) {
+      const laneEl = document.createElement("div");
+      laneEl.className = "git-lane";
+      laneEl.style.left = `${8 + i * laneSpacing}px`;
+      if (isLaneActiveAt(i, lineNo)) {
+        laneEl.classList.add("active");
+      }
+      graph.appendChild(laneEl);
+    }
+
+    const marker = document.createElement("div");
+    const kind = String(node.kind || "event");
+    marker.className = `git-marker kind-${kind}`;
+    marker.style.left = `${8 + lane * laneSpacing}px`;
+    marker.addEventListener("dblclick", async (e) => {
+      e.stopPropagation();
+      const meta = node.metadata || {};
+      if (kind === "internal" && meta.line_start != null && meta.line_end != null) {
+        await openInternalDrilldown(Number(meta.line_start), Number(meta.line_end));
+        return;
+      }
+      if ((kind === "process_spawn" || kind === "process_exit" || kind === "process_exec") && node.pid) {
+        const targetPid = Number(node.pid);
+        if (targetPid > 0 && targetPid !== Number(payload.root_pid || 0)) {
+          await openProcessDrilldown(targetPid);
+        }
+      }
+    });
+    graph.appendChild(marker);
+
+    const branchFrom = node.branch_from_lane;
+    if (branchFrom != null && Number(branchFrom) !== lane) {
+      const x1 = 8 + Number(branchFrom) * laneSpacing;
+      const x2 = 8 + lane * laneSpacing;
+      const mid = (x1 + x2) / 2;
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      path.setAttribute("class", "git-curve branch");
+      path.setAttribute("d", `M ${x1} 27 C ${mid} 8, ${mid} 46, ${x2} 27`);
+      svg.appendChild(path);
+    }
+
+    const mergeTo = node.merge_to_lane;
+    if (mergeTo != null && Number(mergeTo) !== lane) {
+      const x1 = 8 + lane * laneSpacing;
+      const x2 = 8 + Number(mergeTo) * laneSpacing;
+      const mid = (x1 + x2) / 2;
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      path.setAttribute("class", "git-curve merge");
+      path.setAttribute("d", `M ${x1} 27 C ${mid} 46, ${mid} 8, ${x2} 27`);
+      svg.appendChild(path);
+    }
+
+    const card = document.createElement("div");
+    card.className = "git-card";
+    card.dataset.nodeId = String(node.id || "");
+
+    const shortLabel = String(node.label || kind);
+    const tag = kindLabel[kind] || kind;
+    const pid = node.pid != null ? `pid ${node.pid}` : "";
+    const lineLabel = Number.isInteger(lineNo) ? `${lineNo}` : lineNo.toFixed(3);
+
+    card.innerHTML = `
+      <div class="git-card-head">
+        <span class="git-kind">${escapeHtml(tag)}</span>
+        <span class="git-line">L${lineLabel}</span>
+      </div>
+      <div class="git-title">${escapeHtml(shortLabel)}</div>
+      <div class="git-meta">${escapeHtml([pid, node.source].filter(Boolean).join(" • "))}</div>
+    `;
+    card.title = shortLabel;
+
+    card.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (selectedEl) selectedEl.classList.remove("selected");
+      selectedEl = card;
+      card.classList.add("selected");
+      renderDetails(node);
+    });
+
+    card.addEventListener("dblclick", async (e) => {
+      e.stopPropagation();
+      const meta = node.metadata || {};
+      if ((kind === "tool_step" || kind === "tool_call") && meta.tool_call_id) {
+        await openToolDrilldown(meta.tool_call_id, meta.tool_name || meta.tool_call_id);
+        return;
+      }
+      if (kind === "internal" && meta.line_start != null && meta.line_end != null) {
+        await openInternalDrilldown(Number(meta.line_start), Number(meta.line_end));
+        return;
+      }
+      if ((kind === "process_spawn" || kind === "process_exit" || kind === "process_exec") && node.pid) {
+        const targetPid = Number(node.pid);
+        if (targetPid > 0 && targetPid !== Number(payload.root_pid || 0)) {
+          await openProcessDrilldown(targetPid);
+        }
+      }
+    });
+
+    row.appendChild(graph);
+    row.appendChild(card);
+    root.appendChild(row);
+  }
+
+  graphCanvas.appendChild(root);
 }
 
 // ─── High-Level Timeline Renderer ─────────────────────────────────
@@ -1069,7 +1164,11 @@ async function loadHighLevelGraph() {
   renderBreadcrumbs();
   const payload = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/high-level-graph`);
 
-  if (payload.mode === "syscall_only") {
+  if (payload.mode === "git_tree") {
+    currentSyscallMode = false;
+    updateSummaryCards(payload.summary || {});
+    renderGitTreeGraph(payload);
+  } else if (payload.mode === "syscall_only") {
     currentSyscallMode = true;
     updateSummaryCards(payload.summary || {});
     renderSyscallTimeline(payload);
@@ -1080,10 +1179,32 @@ async function loadHighLevelGraph() {
   }
 }
 
+async function loadProcessGraph(pid) {
+  if (!selectedTraceId || !pid) return;
+  renderBreadcrumbs();
+  const payload = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/process-graph/${encodeURIComponent(pid)}`);
+  currentSyscallMode = false;
+  updateSummaryCards(payload.summary || {});
+  renderGitTreeGraph(payload);
+}
+
+async function loadInternalGraph(lineStart, lineEnd) {
+  if (!selectedTraceId) return;
+  renderBreadcrumbs();
+  const payload = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/internal-graph/${encodeURIComponent(lineStart)}/${encodeURIComponent(lineEnd)}`);
+  currentSyscallMode = false;
+  updateSummaryCards(payload.summary || {});
+  renderGitTreeGraph(payload);
+}
+
 async function loadToolGraph(toolCallId) {
   if (!selectedTraceId) return;
   renderBreadcrumbs();
   const payload = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/tool-graph/${encodeURIComponent(toolCallId)}`);
+  if (payload.mode === "git_tree") {
+    renderGitTreeGraph(payload);
+    return;
+  }
   renderDAGGraph(payload);
 }
 
@@ -1124,6 +1245,10 @@ async function refreshTraces(keepView = true, force = false) {
     await loadHighLevelGraph();
   } else if (currentToolCallId) {
     await loadToolGraph(currentToolCallId);
+  } else if (currentMode === "internal" && currentInternalRange) {
+    await loadInternalGraph(currentInternalRange.start, currentInternalRange.end);
+  } else if (currentMode === "process" && currentProcessPid) {
+    await loadProcessGraph(currentProcessPid);
   }
   await loadTraceSummary();
 }

@@ -9,6 +9,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
@@ -55,6 +56,7 @@ class TraceState:
     pending_syscalls: dict[tuple[int, str], str] = field(default_factory=dict)
     process_parent: dict[int, int] = field(default_factory=dict)
     pid_fds: dict[tuple[int, int], dict[str, Any]] = field(default_factory=dict)  # (pid, fd) -> socket info
+    mitm_endpoints: set[str] = field(default_factory=set)
     sys_events: list[dict[str, Any]] = field(default_factory=list)
     agent_events: list[dict[str, Any]] = field(default_factory=list)
 
@@ -421,6 +423,52 @@ class TraceStore:
 
             return parsed
 
+        def _parse_chat_completion_response(resp: dict[str, Any]) -> dict[str, Any]:
+            parsed: dict[str, Any] = {"assistant_messages": [], "tool_calls": []}
+            choices = resp.get("choices")
+            if not isinstance(choices, list):
+                return parsed
+
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    continue
+                message = choice.get("message") or {}
+                if not isinstance(message, dict):
+                    continue
+
+                content = _get_string_content(message.get("content"))
+                if content.strip():
+                    parsed["assistant_messages"].append(
+                        {
+                            "role": message.get("role") or "assistant",
+                            "phase": "final",
+                            "content": content.strip(),
+                        }
+                    )
+
+                tool_calls = message.get("tool_calls")
+                if not isinstance(tool_calls, list):
+                    continue
+                for tool in tool_calls:
+                    if not isinstance(tool, dict):
+                        continue
+                    fn = tool.get("function") or {}
+                    raw_args = fn.get("arguments") if isinstance(fn, dict) else ""
+                    args_obj: Any = {}
+                    if isinstance(raw_args, str) and raw_args:
+                        try:
+                            args_obj = json.loads(raw_args)
+                        except json.JSONDecodeError:
+                            args_obj = {"_raw": raw_args}
+                    parsed["tool_calls"].append(
+                        {
+                            "tool_call_id": tool.get("id") or tool.get("call_id") or "",
+                            "tool_name": fn.get("name") if isinstance(fn, dict) else "unknown",
+                            "arguments": args_obj,
+                        }
+                    )
+            return parsed
+
         for line in lines:
             line = line.strip()
             if not line:
@@ -443,6 +491,16 @@ class TraceStore:
             endpoint = record.get("url") or ""
             status_code = record.get("status_code")
 
+            if endpoint:
+                try:
+                    parsed_url = urlparse(str(endpoint))
+                    host = parsed_url.hostname or ""
+                    if host:
+                        port = parsed_url.port or (443 if parsed_url.scheme == "https" else 80)
+                        state.mitm_endpoints.add(f"{host}:{port}")
+                except Exception:
+                    pass
+
             messages = req_body.get("messages", [])
             if not messages and "input" in req_body:
                 messages = req_body.get("input") or []
@@ -450,6 +508,11 @@ class TraceStore:
                 messages = []
 
             sse_parsed = _parse_responses_sse(str(resp_body.get("_raw") or ""))
+            chat_fallback = _parse_chat_completion_response(resp_body)
+            if not sse_parsed.get("assistant_messages") and chat_fallback.get("assistant_messages"):
+                sse_parsed["assistant_messages"] = chat_fallback["assistant_messages"]
+            if not sse_parsed.get("tool_calls") and chat_fallback.get("tool_calls"):
+                sse_parsed["tool_calls"] = chat_fallback["tool_calls"]
             available_tools = _extract_available_tools(req_body)
 
             seq += 1
@@ -511,6 +574,27 @@ class TraceStore:
                         "event_type": "reasoning_summary",
                         "payload": {
                             "content": sse_parsed.get("reasoning_summary", ""),
+                        },
+                        "_source": "mitm",
+                    }
+                )
+
+            if not sse_parsed.get("assistant_messages") and sse_parsed.get("tool_calls"):
+                calls = sse_parsed.get("tool_calls") or []
+                names = [str(c.get("tool_name") or "tool") for c in calls if c.get("tool_name")]
+                preview = ", ".join(names[:3]) if names else "tool"
+                if len(names) > 3:
+                    preview = f"{preview}, +{len(names) - 3} more"
+                seq += 1
+                state.agent_events.append(
+                    {
+                        "ts": ts,
+                        "seq": seq,
+                        "event_type": "assistant_response",
+                        "payload": {
+                            "content": f"Calling tool: {preview}",
+                            "phase": "tool_call",
+                            "model": model,
                         },
                         "_source": "mitm",
                     }
@@ -774,6 +858,11 @@ class TraceStore:
         family = str(event.get("family") or "").strip()
 
         if dest.startswith("fd="):
+            inferred = str(event.get("inferred_dest") or "").strip()
+            if inferred:
+                if transport and transport != "other":
+                    return f"{transport} {inferred} (inferred)"
+                return f"{inferred} (inferred)"
             if transport:
                 return f"{transport} unresolved ({dest})"
             if family:
@@ -786,6 +875,13 @@ class TraceStore:
             return f"{family} {dest}"
         return dest
 
+    def _with_inferred_net_dest(self, trace: TraceState, event: dict[str, Any]) -> dict[str, Any]:
+        enriched = dict(event)
+        dest = str(enriched.get("dest") or "")
+        if dest.startswith("fd=") and trace.mitm_endpoints and not enriched.get("inferred_dest"):
+            enriched["inferred_dest"] = sorted(trace.mitm_endpoints)[0]
+        return enriched
+
     def _handle_syscall(self, state: TraceState, pid: int, syscall: str, args: str, ret: str) -> bool:
         if state.root_pid is None and syscall == "execve":
             state.root_pid = pid
@@ -795,6 +891,11 @@ class TraceStore:
             if child and int(child.group(1)) > 0:
                 child_pid = int(child.group(1))
                 state.process_parent[child_pid] = pid
+                # Child inherits open fds from parent; keep socket destinations.
+                for (ppid, fd), info in list(state.pid_fds.items()):
+                    if ppid != pid:
+                        continue
+                    state.pid_fds[(child_pid, fd)] = dict(info)
                 self._push_sys_event(
                     state,
                     {
@@ -1063,188 +1164,593 @@ class TraceStore:
             raise KeyError(trace_id)
         return trace
 
-    def high_level_graph(self, trace_id: str) -> dict[str, Any]:
-        t = self._get_trace(trace_id)
+    def _nearest_line_for_ts(self, sys_events: list[dict[str, Any]], ts: float) -> int:
+        if not sys_events:
+            return 0
+        best_line = int(sys_events[0].get("line_no", 0))
+        best_dist = abs(float(sys_events[0].get("ts", 0.0)) - ts)
+        for event in sys_events[1:]:
+            dist = abs(float(event.get("ts", 0.0)) - ts)
+            if dist < best_dist:
+                best_dist = dist
+                best_line = int(event.get("line_no", 0))
+        return best_line
 
-        # ── Fallback: if no agent trajectory, build from syscall events ────────
-        if not t.agent_events and t.sys_events:
-            return self._syscall_only_graph(t)
+    def _is_relevant_trunk_sys_event(self, event: dict[str, Any]) -> bool:
+        et = str(event.get("type") or "")
+        if et == "command_exec":
+            return True
+        if et in {"net_connect", "net_send", "net_recv"}:
+            return True
+        if et in {"file_write", "file_delete", "file_rename"}:
+            return True
+        if et == "file_read":
+            return True
+        return False
 
-        nodes = []
-        edges = []
-        timeline = []
-        prev_id = None
+    def _agent_event_to_git_node(self, event: dict[str, Any], line_no: int, idx: int) -> dict[str, Any] | None:
+        event_type = str(event.get("event_type") or "")
+        payload = event.get("payload") or {}
 
-        tool_finish_by_id: dict[str, tuple[int, dict[str, Any]]] = {}
-        for i, event in enumerate(t.agent_events):
-            if event.get("event_type") not in {"tool_call_finished", "tool_call_denied", "tool_call_invalid_args", "tool_call_unknown"}:
+        kind = ""
+        label = ""
+        metadata: dict[str, Any] = dict(payload)
+
+        if event_type == "user_prompt":
+            kind = "prompt"
+            label = "User Prompt"
+        elif event_type == "user_prompt_batch":
+            kind = "prompt_batch"
+            count = int(payload.get("count") or 0)
+            label = f"User Prompts ({count})"
+        elif event_type == "assistant_response":
+            kind = "assistant_response"
+            label = "Assistant Response"
+        elif event_type == "tool_call_started":
+            kind = "assistant_response"
+            tool_name = str(payload.get("tool_name") or "tool")
+            label = f"Assistant Tool Call ({tool_name})"
+            if not metadata.get("content"):
+                metadata["content"] = f"Calling tool: {tool_name}"
+        else:
+            return None
+
+        return {
+            "id": f"agent_{idx}",
+            "line_no": line_no,
+            "lane": 0,
+            "pid": None,
+            "kind": kind,
+            "label": label,
+            "metadata": metadata,
+            "branch_from_lane": None,
+            "merge_to_lane": None,
+            "source": "agent",
+        }
+
+    def _map_agent_event_lines(self, trace: TraceState, sys_events: list[dict[str, Any]]) -> list[float]:
+        n = len(trace.agent_events)
+        if n == 0:
+            return []
+
+        if not sys_events:
+            return [float(i + 1) for i in range(n)]
+
+        root_start_line = float(int(sys_events[0].get("line_no", 0)))
+        root_end_line = float(int(sys_events[-1].get("line_no", 0)))
+
+        sys_ts_vals = [float(e.get("ts", 0.0)) for e in sys_events if e.get("ts") is not None]
+        agent_ts_vals: list[float] = []
+        for event in trace.agent_events:
+            try:
+                agent_ts_vals.append(float(event.get("ts")))
+            except (TypeError, ValueError):
                 continue
+
+        # eBPF and MITM can be in different timestamp domains (monotonic vs epoch).
+        # Only do nearest-ts matching when both streams are clearly compatible.
+        ts_compatible = False
+        if sys_ts_vals and agent_ts_vals:
+            sys_min = min(sys_ts_vals)
+            agent_min = min(agent_ts_vals)
+            sys_epoch_like = sys_min > 100_000_000.0
+            agent_epoch_like = agent_min > 100_000_000.0
+            ts_compatible = (sys_epoch_like == agent_epoch_like)
+
+        anchors: dict[int, float] = {}
+
+        if ts_compatible:
+            for idx, event in enumerate(trace.agent_events):
+                ts_val = event.get("ts")
+                if ts_val is None:
+                    continue
+                try:
+                    ts = float(ts_val)
+                except (TypeError, ValueError):
+                    continue
+                nearest = self._nearest_line_for_ts(sys_events, ts)
+                anchors[idx] = float(nearest)
+
+        # Use tool-call line ranges as hard anchors independent of timestamp domain.
+        tool_ranges = self._tool_line_ranges(trace)
+        for idx, event in enumerate(trace.agent_events):
+            et = str(event.get("event_type") or "")
             payload = event.get("payload") or {}
-            tool_call_id = payload.get("tool_call_id")
-            if tool_call_id and tool_call_id not in tool_finish_by_id:
-                tool_finish_by_id[tool_call_id] = (i, event)
+            call_id = payload.get("tool_call_id")
+            if not isinstance(call_id, str) or call_id not in tool_ranges:
+                continue
+            start_line, end_line = tool_ranges[call_id]
+            if et == "tool_call_started":
+                anchors[idx] = float(start_line) - 0.2
+            elif et in {"tool_call_finished", "tool_call_denied", "tool_call_invalid_args", "tool_call_unknown"}:
+                end_anchor = end_line if end_line is not None else start_line + 1
+                anchors[idx] = float(end_anchor) + 0.2
 
-        # ── Add Setup Phase Node ───────────────────────────────────────
-        if t.sys_events and t.agent_events:
-            first_event_ts = t.agent_events[0].get("ts", max(e.get("ts", 0) for e in t.sys_events))
-            setup_events = [e for e in t.sys_events if e.get("ts", 0) < first_event_ts - 0.1]
-            if setup_events:
-                setup_node = {
-                    "id": "setup_phase",
-                    "label": "Agent Setup",
-                    "kind": "tool_step",
-                    "metadata": {
-                        "tool_name": "Environment Setup",
-                        "arguments": {"sys_call_count": len(setup_events)},
-                        "status": "ok",
-                        "tool_call_id": "setup_phase"
-                    },
-                    "ts": setup_events[0].get("ts", 0),
-                }
-                nodes.append(setup_node)
-                timeline.append(setup_node)
-                prev_id = "setup_phase"
+        # If timestamps are not compatible, anchor API calls by sequence across
+        # the syscall line window so prompts/responses remain sequential.
+        if not ts_compatible:
+            api_indices = [
+                i for i, event in enumerate(trace.agent_events)
+                if str(event.get("event_type") or "") == "api_call"
+            ]
+            m = len(api_indices)
+            if m > 0:
+                span = max(root_end_line - root_start_line, 1.0)
+                for rank, idx in enumerate(api_indices):
+                    anchors[idx] = root_start_line + ((rank + 1) * span / (m + 1))
 
-        consumed_finish_indices: set[int] = set()
+        # Soft boundary anchors so non-tool events are still properly ordered.
+        anchors[-1] = root_start_line + 0.05
+        anchors[n] = max(root_end_line - 0.05, root_start_line + 0.1)
 
-        for i, event in enumerate(t.agent_events):
-            if i in consumed_finish_indices:
+        lines: list[float] = [0.0] * n
+        anchor_indices = sorted(anchors.keys())
+
+        for i in range(n):
+            if i in anchors:
+                lines[i] = float(anchors[i])
                 continue
 
-            event_type = event.get("event_type", "unknown")
-            payload = event.get("payload") or {}
+            prev_idx = -1
+            next_idx = n
+            for ai in anchor_indices:
+                if ai < i:
+                    prev_idx = ai
+                elif ai > i:
+                    next_idx = ai
+                    break
 
-            if event_type == "user_prompt":
-                label = "Prompt"
-                kind = "prompt"
-                metadata = {"content": payload.get("content", "")}
-            elif event_type == "user_prompt_batch":
-                prompts = payload.get("prompts") or []
-                label = f"User Prompts ({len(prompts)})"
-                kind = "prompt_batch"
-                metadata = {
-                    "prompts": prompts,
-                    "count": len(prompts),
-                }
-            elif event_type == "system_instruction":
-                label = "System Instructions"
-                kind = "system_instruction"
-                metadata = {"content": payload.get("content", "")}
-            elif event_type == "reasoning_summary":
-                label = "Reasoning"
-                kind = "reasoning"
-                metadata = {"content": payload.get("content", "")}
-            elif event_type == "api_call":
-                endpoint = str(payload.get("endpoint") or "")
-                model = str(payload.get("model") or "")
-                label = "API Call"
-                kind = "api_call"
-                metadata = {
-                    "endpoint": endpoint,
-                    "method": payload.get("method", "POST"),
-                    "model": model,
-                    "reasoning": payload.get("reasoning"),
-                    "duration_ms": payload.get("duration_ms"),
-                    "status_code": payload.get("status_code"),
-                }
-            elif event_type == "tool_call_started":
-                tool_call_id = payload.get("tool_call_id")
-                finish_tuple = tool_finish_by_id.get(str(tool_call_id)) if tool_call_id else None
-                finish_event = finish_tuple[1] if finish_tuple else None
-                if finish_tuple:
-                    consumed_finish_indices.add(finish_tuple[0])
+            prev_line = float(anchors.get(prev_idx, root_start_line + 0.05))
+            next_line = float(anchors.get(next_idx, root_end_line - 0.05))
 
-                finish_payload = (finish_event or {}).get("payload") or {}
-                status = "ok"
-                result = finish_payload.get("result")
-                if isinstance(result, dict) and result.get("ok") is False:
-                    status = "error"
-                elif finish_event and finish_event.get("event_type") != "tool_call_finished":
-                    status = "error"
-
-                label = f"Tool: {payload.get('tool_name', 'unknown')} ({status})"
-                kind = "tool_step"
-                metadata = {
-                    "tool_call_id": tool_call_id,
-                    "tool_name": payload.get("tool_name"),
-                    "arguments": payload.get("arguments", {}),
-                    "status": status,
-                    "result": result,
-                    "duration_ms": finish_payload.get("duration_ms"),
-                }
-
-                node_id = f"hl_{len(nodes)}"
-                node = {
-                    "id": node_id,
-                    "label": label,
-                    "kind": kind,
-                    "metadata": metadata,
-                    "ts": event.get("ts"),
-                }
-                nodes.append(node)
-                timeline.append(node)
-
-                if prev_id is not None:
-                    edges.append({"source": prev_id, "target": node_id, "label": "next"})
-                prev_id = node_id
-
-                if finish_event is not None:
-                    output_node_id = f"hl_{len(nodes)}"
-                    output_result = finish_payload.get("result")
-                    output_status = "ok"
-                    if isinstance(output_result, dict) and output_result.get("ok") is False:
-                        output_status = "error"
-                    elif finish_event.get("event_type") != "tool_call_finished":
-                        output_status = "error"
-
-                    output_node = {
-                        "id": output_node_id,
-                        "label": "Tool Output",
-                        "kind": "tool_output",
-                        "metadata": {
-                            "tool_call_id": tool_call_id,
-                            "tool_name": payload.get("tool_name"),
-                            "status": output_status,
-                            "result": output_result,
-                            "duration_ms": finish_payload.get("duration_ms"),
-                        },
-                        "ts": finish_event.get("ts") or event.get("ts"),
-                    }
-                    nodes.append(output_node)
-                    timeline.append(output_node)
-                    edges.append({"source": node_id, "target": output_node_id, "label": "output"})
-                    prev_id = output_node_id
-                continue
-            elif event_type == "assistant_response":
-                label = "Agent Response"
-                kind = "assistant_response"
-                metadata = {"content": payload.get("content", "")}
+            if next_idx > prev_idx:
+                ratio = (i - prev_idx) / (next_idx - prev_idx)
             else:
+                ratio = 0.5
+            lines[i] = prev_line + (next_line - prev_line) * ratio
+
+        # Guarantee strict monotonicity for stable sort/renderer behavior.
+        for i in range(1, n):
+            if lines[i] <= lines[i - 1]:
+                lines[i] = lines[i - 1] + 0.001
+
+        return lines
+
+    def _setup_phase_window(self, trace: TraceState, sys_events: list[dict[str, Any]]) -> tuple[int, int] | None:
+        if not sys_events:
+            return None
+
+        mapped = self._map_agent_event_lines(trace, sys_events)
+        first_api_line: float | None = None
+        for i, event in enumerate(trace.agent_events):
+            if event.get("event_type") == "api_call":
+                first_api_line = mapped[i] if i < len(mapped) else None
+                break
+
+        if first_api_line is None and mapped:
+            first_api_line = float(mapped[0])
+        if first_api_line is None:
+            return None
+
+        mapped_by_idx = {i: float(mapped[i]) for i in range(min(len(mapped), len(trace.agent_events)))}
+
+        # Cut the internal window at the first next top-level boundary so it does
+        # not overlap tool-call branches or later prompt/API sections.
+        stop_line = float("inf")
+        boundary_types = {"assistant_response", "tool_call_started", "api_call", "user_prompt", "user_prompt_batch"}
+        for i, event in enumerate(trace.agent_events):
+            line = mapped_by_idx.get(i)
+            if line is None or line <= first_api_line:
+                continue
+            if str(event.get("event_type") or "") in boundary_types:
+                stop_line = min(stop_line, line)
+
+        candidates = [
+            e for e in sys_events
+            if first_api_line <= float(e.get("line_no", 0)) < stop_line
+            and str(e.get("type") or "") in {"file_read", "file_write", "file_delete", "file_rename", "net_connect", "net_send", "net_recv", "command_exec"}
+        ]
+
+        if not candidates:
+            candidates = [
+                e for e in sys_events
+                if float(e.get("line_no", 0)) < first_api_line
+                and str(e.get("type") or "") in {"file_read", "file_write", "file_delete", "file_rename", "net_connect", "net_send", "net_recv", "command_exec"}
+            ]
+        if not candidates:
+            return None
+
+        start_line = int(min(float(e.get("line_no", 0)) for e in candidates))
+        end_line = int(max(float(e.get("line_no", 0)) for e in candidates))
+        return (start_line, end_line)
+
+    def _git_tree_graph(
+        self,
+        t: TraceState,
+        focus_pid: int | None = None,
+        detailed: bool = False,
+        scoped_sys_events: list[dict[str, Any]] | None = None,
+        include_agent_events: bool = True,
+    ) -> dict[str, Any]:
+        sys_events = sorted(scoped_sys_events if scoped_sys_events is not None else t.sys_events, key=lambda e: int(e.get("line_no", 0)))
+        if not sys_events:
+            return {
+                "mode": "git_tree",
+                "nodes": [],
+                "summary": {
+                    "prompts": 0,
+                    "tool_steps": 0,
+                    "responses": 0,
+                    "trace_status": "completed" if t.complete else "active",
+                },
+            }
+
+        command_execs = [e for e in sys_events if str(e.get("type") or "") == "command_exec"]
+        if focus_pid is not None and focus_pid > 0:
+            root_pid = int(focus_pid)
+            focus_exec = [e for e in command_execs if int(e.get("pid", 0)) == root_pid]
+            root_start_line = int((focus_exec[0] if focus_exec else sys_events[0]).get("line_no", 0))
+        elif command_execs:
+            root_pid = int(command_execs[0].get("pid", 0))
+            root_start_line = int(command_execs[0].get("line_no", 0))
+        else:
+            root_pid = int(t.root_pid or 0)
+            root_start_line = int(sys_events[0].get("line_no", 0))
+
+        parent_map: dict[int, int] = {int(k): int(v) for k, v in t.process_parent.items()}
+        spawn_event_by_pid: dict[int, dict[str, Any]] = {}
+        exit_event_by_pid: dict[int, dict[str, Any]] = {}
+        first_exec_by_pid: dict[int, dict[str, Any]] = {}
+
+        for event in sys_events:
+            et = str(event.get("type") or "")
+            if et == "process_spawn":
+                child = int(event.get("child_pid", 0))
+                if child > 0 and child not in spawn_event_by_pid:
+                    spawn_event_by_pid[child] = event
+            elif et == "process_exit":
+                pid = int(event.get("pid", 0))
+                if pid > 0 and pid not in exit_event_by_pid:
+                    exit_event_by_pid[pid] = event
+            elif et == "command_exec":
+                pid = int(event.get("pid", 0))
+                if pid > 0 and pid not in first_exec_by_pid:
+                    first_exec_by_pid[pid] = event
+
+        children_by_pid: dict[int, list[int]] = defaultdict(list)
+        for child, parent in parent_map.items():
+            if parent > 0:
+                children_by_pid[parent].append(child)
+
+        for parent in list(children_by_pid.keys()):
+            children_by_pid[parent].sort(key=lambda p: int((spawn_event_by_pid.get(p) or {}).get("line_no", 10**9)))
+
+        lane_for_pid: dict[int, int] = {}
+        next_lane = 1
+
+        def assign_lanes(pid: int) -> None:
+            nonlocal next_lane
+            for child in children_by_pid.get(pid, []):
+                if child in lane_for_pid:
+                    continue
+                lane_for_pid[child] = next_lane
+                next_lane += 1
+                assign_lanes(child)
+
+        lane_for_pid[root_pid] = 0
+        assign_lanes(root_pid)
+
+        subtree_pids = set(lane_for_pid.keys())
+        sys_events = [e for e in sys_events if int(e.get("pid", 0)) in subtree_pids or int(e.get("child_pid", 0)) in subtree_pids]
+
+        max_lane = max(lane_for_pid.values()) if lane_for_pid else 0
+
+        nodes: list[dict[str, Any]] = []
+
+        for pid, spawn_event in spawn_event_by_pid.items():
+            if pid not in lane_for_pid:
+                continue
+            parent = int(spawn_event.get("pid", 0))
+            parent_lane = lane_for_pid.get(parent)
+            nodes.append(
+                {
+                    "id": f"proc_spawn_{pid}_{int(spawn_event.get('line_no', 0))}",
+                    "line_no": int(spawn_event.get("line_no", 0)),
+                    "lane": lane_for_pid[pid],
+                    "pid": pid,
+                    "kind": "process_spawn",
+                    "label": f"Spawn pid={pid}",
+                    "metadata": {"pid": pid, "parent_pid": parent},
+                    "branch_from_lane": parent_lane,
+                    "merge_to_lane": None,
+                    "source": "sys",
+                }
+            )
+
+        for pid, exec_event in first_exec_by_pid.items():
+            if pid not in lane_for_pid:
+                continue
+            if not detailed and pid != root_pid:
+                continue
+            nodes.append(
+                {
+                    "id": f"proc_exec_{pid}_{int(exec_event.get('line_no', 0))}",
+                    "line_no": int(exec_event.get("line_no", 0)),
+                    "lane": lane_for_pid[pid],
+                    "pid": pid,
+                    "kind": "process_exec",
+                    "label": self._short_command_label(exec_event),
+                    "metadata": {
+                        "pid": pid,
+                        "exec_path": exec_event.get("exec_path"),
+                        "command": exec_event.get("command"),
+                        "argv": exec_event.get("argv", []),
+                    },
+                    "branch_from_lane": None,
+                    "merge_to_lane": None,
+                    "source": "sys",
+                }
+            )
+
+        if detailed:
+            for event in sys_events:
+                et = str(event.get("type") or "")
+                if et in {"process_spawn", "process_exit", "command_exec"}:
+                    continue
+                if not self._is_relevant_trunk_sys_event(event):
+                    continue
+                pid = int(event.get("pid", 0))
+                if pid <= 0 or pid not in lane_for_pid:
+                    continue
+                meta_event = self._with_inferred_net_dest(t, event) if et in {"net_connect", "net_send", "net_recv"} else dict(event)
+                label = str(meta_event.get("label") or et)
+                if et in {"net_connect", "net_send", "net_recv"}:
+                    display = self._network_display_label(meta_event)
+                    if et == "net_connect":
+                        label = f"connect {display}"
+                    elif et == "net_send":
+                        label = f"send {int(meta_event.get('bytes', 0))}B -> {display}"
+                    else:
+                        label = f"recv {int(meta_event.get('bytes', 0))}B <- {display}"
+                nodes.append(
+                    {
+                        "id": f"sys_{et}_{pid}_{int(event.get('line_no', 0))}",
+                        "line_no": int(event.get("line_no", 0)),
+                        "lane": lane_for_pid.get(pid, 0),
+                        "pid": pid,
+                        "kind": et,
+                        "label": label,
+                        "metadata": meta_event,
+                        "branch_from_lane": None,
+                        "merge_to_lane": None,
+                        "source": "sys",
+                    }
+                )
+        else:
+            root_relevant_events = [
+                e for e in sys_events
+                if int(e.get("pid", 0)) == root_pid
+                and self._is_relevant_trunk_sys_event(e)
+                and str(e.get("type") or "") not in {"process_spawn", "process_exit"}
+            ]
+            root_relevant_events.sort(key=lambda e: int(e.get("line_no", 0)))
+            root_relevant_events = root_relevant_events[:120]
+
+            # Compress root lane syscalls into linear internal segments split by
+            # agent anchors and process spawn boundaries.
+            split_lines: set[int] = set()
+            for event in sys_events:
+                if str(event.get("type") or "") == "process_spawn" and int(event.get("pid", 0)) == root_pid:
+                    split_lines.add(int(event.get("line_no", 0)))
+
+            if include_agent_events and focus_pid is None:
+                mapped_agent_lines = self._map_agent_event_lines(t, sys_events)
+                for ln in mapped_agent_lines:
+                    split_lines.add(int(float(ln)))
+
+            segments: list[list[dict[str, Any]]] = []
+            current: list[dict[str, Any]] = []
+            for event in root_relevant_events:
+                line_no = int(event.get("line_no", 0))
+                if line_no in split_lines and current:
+                    segments.append(current)
+                    current = []
+                current.append(event)
+            if current:
+                segments.append(current)
+
+            for idx, segment in enumerate(segments):
+                if not segment:
+                    continue
+                start_line = int(segment[0].get("line_no", 0))
+                end_line = int(segment[-1].get("line_no", 0))
+                nodes.append(
+                    {
+                        "id": f"internal_{idx}_{start_line}",
+                        "line_no": float(start_line) + 0.01,
+                        "lane": 0,
+                        "pid": root_pid,
+                        "kind": "internal",
+                        "label": f"Internal ({len(segment)} events)",
+                        "metadata": {
+                            "tool_call_id": "internal_phase" if focus_pid is None else None,
+                            "line_start": start_line,
+                            "line_end": end_line,
+                            "event_count": len(segment),
+                            "events": [dict(e) for e in segment],
+                        },
+                        "branch_from_lane": None,
+                        "merge_to_lane": None,
+                        "source": "sys",
+                    }
+                )
+
+        if include_agent_events:
+            mapped_agent_lines = self._map_agent_event_lines(t, sys_events)
+            for idx, event in enumerate(t.agent_events):
+                if focus_pid is not None and focus_pid > 0:
+                    continue
+                line_no = mapped_agent_lines[idx] if idx < len(mapped_agent_lines) else float(root_start_line)
+                node = self._agent_event_to_git_node(event, line_no, idx)
+                if node is not None:
+                    nodes.append(node)
+
+        # Merge rule: merge child branch to parent only if child exited and parent
+        # continues with at least one later event before parent exit.
+        parent_activity_lines: dict[int, list[int]] = defaultdict(list)
+        for event in sys_events:
+            pid = int(event.get("pid", 0))
+            if pid > 0:
+                parent_activity_lines[pid].append(int(event.get("line_no", 0)))
+
+        for node in nodes:
+            if node.get("kind") != "process_spawn":
+                continue
+            pid = int(node.get("pid", 0))
+            parent_pid = int((node.get("metadata") or {}).get("parent_pid") or 0)
+            if pid <= 0 or parent_pid <= 0:
                 continue
 
-            node_id = f"hl_{len(nodes)}"
-            node = {
-                "id": node_id,
-                "label": label,
-                "kind": kind,
-                "metadata": metadata,
-                "ts": event.get("ts"),
-            }
-            nodes.append(node)
-            timeline.append(node)
+            child_exit_event = exit_event_by_pid.get(pid)
+            if child_exit_event is None:
+                continue
+            child_exit_line = int(child_exit_event.get("line_no", 0))
+            parent_exit_line = int((exit_event_by_pid.get(parent_pid) or {}).get("line_no", 0))
 
-            if prev_id is not None:
-                edges.append({"source": prev_id, "target": node_id, "label": "next"})
-            prev_id = node_id
+            act_lines = parent_activity_lines.get(parent_pid, [])
+            merge_line = None
+            for line in act_lines:
+                if line <= child_exit_line:
+                    continue
+                if parent_exit_line and line >= parent_exit_line:
+                    continue
+                merge_line = line
+                break
+
+            if merge_line is None:
+                continue
+
+            nodes.append(
+                {
+                    "id": f"proc_exit_{pid}_{child_exit_line}",
+                    "line_no": child_exit_line,
+                    "lane": lane_for_pid.get(pid, 0),
+                    "pid": pid,
+                    "kind": "process_exit",
+                    "label": f"Exit pid={pid}",
+                    "metadata": {"pid": pid, "parent_pid": parent_pid},
+                    "branch_from_lane": None,
+                    "merge_to_lane": lane_for_pid.get(parent_pid),
+                    "merge_line": merge_line,
+                    "source": "sys",
+                }
+            )
+
+        # Add non-merged child exits so long-running/dangling branches are explicit.
+        existing_exit_ids = {
+            str(node.get("id"))
+            for node in nodes
+            if str(node.get("kind")) == "process_exit"
+        }
+        for pid, exit_event in exit_event_by_pid.items():
+            if pid not in lane_for_pid:
+                continue
+            node_id = f"proc_exit_{pid}_{int(exit_event.get('line_no', 0))}"
+            if node_id in existing_exit_ids:
+                continue
+            nodes.append(
+                {
+                    "id": node_id,
+                    "line_no": int(exit_event.get("line_no", 0)),
+                    "lane": lane_for_pid.get(pid, 0),
+                    "pid": pid,
+                    "kind": "process_exit",
+                    "label": f"Exit pid={pid}",
+                    "metadata": {"pid": pid, "parent_pid": parent_map.get(pid)},
+                    "branch_from_lane": None,
+                    "merge_to_lane": None,
+                    "source": "sys",
+                }
+            )
+
+        nodes.sort(key=lambda n: (float(n.get("line_no", 0)), int(n.get("lane", 0)), str(n.get("id"))))
+
+        branch_ranges: list[dict[str, Any]] = []
+        for pid, lane in lane_for_pid.items():
+            start_line = root_start_line if pid == root_pid else int((spawn_event_by_pid.get(pid) or {}).get("line_no", root_start_line))
+            end_event = exit_event_by_pid.get(pid)
+            end_line = int(end_event.get("line_no", 0)) if end_event is not None else None
+            branch_ranges.append(
+                {
+                    "pid": pid,
+                    "lane": lane,
+                    "parent_pid": parent_map.get(pid),
+                    "start_line": start_line,
+                    "end_line": end_line,
+                }
+            )
 
         summary = {
-            "prompts": sum(1 for n in nodes if n["kind"] == "prompt") + sum(int(n.get("metadata", {}).get("count", 0)) for n in nodes if n["kind"] == "prompt_batch"),
-            "tool_steps": sum(1 for n in nodes if n["kind"] == "tool_step"),
-            "responses": sum(1 for n in nodes if n["kind"] == "assistant_response"),
+            "prompts": sum(1 for n in nodes if n.get("kind") in {"prompt", "prompt_batch"}),
+            "tool_steps": sum(1 for n in nodes if n.get("kind") == "tool_step"),
+            "responses": sum(1 for n in nodes if n.get("kind") == "assistant_response"),
             "trace_status": "completed" if t.complete else "active",
         }
 
-        return {"nodes": nodes, "edges": edges, "timeline": timeline, "summary": summary}
+        return {
+            "mode": "git_tree",
+            "root_pid": root_pid,
+            "max_lane": max_lane,
+            "nodes": nodes,
+            "branch_ranges": sorted(branch_ranges, key=lambda b: int(b.get("lane", 0))),
+            "summary": summary,
+        }
+
+    def high_level_graph(self, trace_id: str) -> dict[str, Any]:
+        t = self._get_trace(trace_id)
+        return self._git_tree_graph(t)
+
+    def process_graph(self, trace_id: str, pid: int) -> dict[str, Any]:
+        t = self._get_trace(trace_id)
+        return self._git_tree_graph(t, focus_pid=pid, detailed=True, include_agent_events=False)
+
+    def internal_graph(self, trace_id: str, line_start: int, line_end: int) -> dict[str, Any]:
+        t = self._get_trace(trace_id)
+        if line_end < line_start:
+            line_start, line_end = line_end, line_start
+
+        scoped = [
+            e for e in t.sys_events
+            if line_start <= int(e.get("line_no", 0)) <= line_end
+            and str(e.get("type") or "") != "process_exit"
+        ]
+
+        return self._git_tree_graph(
+            t,
+            detailed=True,
+            scoped_sys_events=scoped,
+            include_agent_events=False,
+        )
 
     def _syscall_only_graph(self, t: TraceState) -> dict[str, Any]:
         """Build a high-level graph from sys_events when no agent trajectory is available."""
@@ -2009,12 +2515,19 @@ class TraceStore:
     def tool_graph(self, trace_id: str, tool_call_id: str) -> dict[str, Any]:
         t = self._get_trace(trace_id)
 
-        if tool_call_id == "setup_phase":
-            first_event_ts = t.agent_events[0].get("ts", max(e.get("ts", 0) for e in t.sys_events)) if t.agent_events else max((e.get("ts", 0) for e in t.sys_events), default=0)
-            setup_events = [e for e in t.sys_events if e.get("ts", 0) < first_event_ts - 0.1]
+        if tool_call_id == "internal_phase":
+            setup_range = self._setup_phase_window(t, sorted(t.sys_events, key=lambda e: int(e.get("line_no", 0))))
+            if setup_range is None:
+                setup_events = []
+            else:
+                s_start, s_end = setup_range
+                setup_events = [
+                    e for e in t.sys_events
+                    if s_start <= int(e.get("line_no", 0)) <= s_end
+                ]
             start_event = {
                 "ts": setup_events[0].get("ts", 0) if setup_events else 0,
-                "payload": {"tool_name": "Environment Setup", "tool_call_id": "setup_phase"}
+                "payload": {"tool_name": "Internal", "tool_call_id": "internal_phase"}
             }
             end_event = {
                 "ts": setup_events[-1].get("ts", 0) if setup_events else 0,
@@ -2029,343 +2542,25 @@ class TraceStore:
             line_range = tool_ranges.get(tool_call_id)
             related = self._related_sys_events_for_tool(t, tool_call_id, start_event, end_event)
 
-        nodes = [
-            {
-                "id": "tool",
-                "label": f"{(start_event.get('payload') or {}).get('tool_name', 'tool')}\n{tool_call_id}",
-                "kind": "tool_call",
-                "metadata": start_event.get("payload") or {},
-            }
-        ]
-        edges = []
-
-        if not related:
-            nodes.append(
-                {
-                    "id": "no_data",
-                    "label": "No low-level events correlated yet",
-                    "kind": "placeholder",
-                    "metadata": {},
-                }
-            )
-            edges.append({"source": "tool", "target": "no_data", "label": "info"})
-            return {"nodes": nodes, "edges": edges, "events": []}
-
-        related_sorted = related
-        command_events = [e for e in related_sorted if e.get("type") == "command_exec"]
-
-        if not command_events:
-            nodes.append(
-                {
-                    "id": "no_commands",
-                    "label": "No command-level events found",
-                    "kind": "placeholder",
-                    "metadata": {},
-                }
-            )
-            edges.append({"source": "tool", "target": "no_commands", "label": "info"})
-            return {"nodes": nodes, "edges": edges, "events": []}
-
-        tool_payload = start_event.get("payload") or {}
-        relevant_command_events, internal_command_events = self._split_tool_command_events(t, tool_payload, command_events)
-        command_events = relevant_command_events or command_events
-
-        max_commands = 80
-        command_overflow = 0
-        if len(command_events) > max_commands:
-            command_overflow = len(command_events) - max_commands
-            command_events = command_events[:max_commands]
-
-        command_nodes: list[dict[str, Any]] = []
-        command_ids_by_pid: dict[int, list[tuple[int, str]]] = defaultdict(list)
-        command_event_by_id: dict[str, dict[str, Any]] = {}
-
-        for i, cmd in enumerate(command_events):
-            cmd_id = f"cmd_{i}"
-            pid = int(cmd.get("pid", 0))
-            command_ids_by_pid[pid].append((int(cmd.get("line_no", 0)), cmd_id))
-            cmd_label = self._short_command_label(cmd)
-
-            node = {
-                "id": cmd_id,
-                "label": cmd_label,
-                "kind": "action",
-                "metadata": {
-                    "pid": pid,
-                    "line_no": cmd.get("line_no"),
-                    "exec_path": cmd.get("exec_path"),
-                    "argv": cmd.get("argv", []),
-                    "command": cmd.get("command"),
-                    "tool_match_score": int(cmd.get("_tool_match_score", 0)),
-                },
-            }
-            command_nodes.append(node)
-            command_event_by_id[cmd_id] = cmd
-
-        file_events = [
-            e
-            for e in related_sorted
-            if e.get("type") in {"file_read", "file_write", "file_delete", "file_rename"}
-            and isinstance(e.get("path"), str)
-            and self._is_user_visible_path(str(e.get("path")))
-        ]
-
-        # Collect network events
-        net_events = [
-            e
-            for e in related_sorted
-            if e.get("type") in {"net_connect", "net_send", "net_recv"}
-        ]
-
-        resource_nodes: dict[str, str] = {}
-        resource_index = 0
-
-        command_lookup = sorted(
-            [(int(n["metadata"]["line_no"] or 0), n["metadata"]["pid"], n["id"]) for n in command_nodes],
-            key=lambda x: x[0],
-        )
-
-        def match_command_for_event(event: dict[str, Any]) -> str | None:
-            line = int(event.get("line_no", 0))
-            pid = int(event.get("pid", 0))
-
-            candidates = command_ids_by_pid.get(pid, [])
-            best_id = None
-            best_line = -1
-            for cmd_line, cmd_id in candidates:
-                if cmd_line <= line and cmd_line >= best_line:
-                    best_line = cmd_line
-                    best_id = cmd_id
-
-            if best_id is not None:
-                return best_id
-
-            for cmd_line, _cmd_pid, cmd_id in command_lookup:
-                if cmd_line <= line:
-                    best_id = cmd_id
-                else:
+        if related:
+            root_pid = int(related[0].get("pid", 0))
+            for ev in related:
+                if str(ev.get("type") or "") == "command_exec":
+                    root_pid = int(ev.get("pid", root_pid))
                     break
-            return best_id
+        else:
+            root_pid = int(t.root_pid or 0)
 
-        file_agg: dict[tuple[str, str], dict[str, Any]] = {}
-        for fe in file_events:
-            cmd_id = match_command_for_event(fe)
-            if cmd_id is None:
-                continue
-            path = str(fe.get("path"))
-            key = (cmd_id, path)
-            bucket = file_agg.setdefault(
-                key,
-                {
-                    "cmd_id": cmd_id,
-                    "path": path,
-                    "types": set(),
-                    "count": 0,
-                    "line_min": int(fe.get("line_no", 0)),
-                    "line_max": int(fe.get("line_no", 0)),
-                },
-            )
-            bucket["types"].add(str(fe.get("type")))
-            bucket["count"] += 1
-            bucket["line_min"] = min(bucket["line_min"], int(fe.get("line_no", 0)))
-            bucket["line_max"] = max(bucket["line_max"], int(fe.get("line_no", 0)))
+        if root_pid <= 0:
+            raise KeyError(tool_call_id)
 
-        command_ids_with_files = {b["cmd_id"] for b in file_agg.values()}
-
-        # Aggregate network events per command
-        net_agg: dict[tuple[str, str], dict[str, Any]] = {}
-        for ne in net_events:
-            cmd_id = match_command_for_event(ne)
-            if cmd_id is None:
-                continue
-            display = self._network_display_label(ne)
-            key = (cmd_id, display)
-            bucket = net_agg.setdefault(
-                key,
-                {
-                    "cmd_id": cmd_id,
-                    "dest": display,
-                    "types": set(),
-                    "bytes_total": 0,
-                    "count": 0,
-                },
-            )
-            bucket["types"].add(str(ne.get("type")))
-            bucket["bytes_total"] += int(ne.get("bytes", 0))
-            bucket["count"] += 1
-
-        command_ids_with_net = {b["cmd_id"] for b in net_agg.values()}
-        command_ids_with_resources = command_ids_with_files | command_ids_with_net
-
-        def command_is_relevant(node: dict[str, Any], idx: int) -> bool:
-            cmd_id = node["id"]
-            match_score = int((node.get("metadata") or {}).get("tool_match_score", 0))
-            if idx == 0:
-                return True
-            if cmd_id in command_ids_with_resources:
-                return True
-            # Keep command-chain steps that strongly match the tool command text
-            # even if they do not have direct file/network events.
-            if match_score >= 8:
-                return True
-            return False
-
-        filtered_nodes: list[dict[str, Any]] = []
-        hidden_count = 0
-        for idx, node in enumerate(command_nodes):
-            if command_is_relevant(node, idx):
-                if hidden_count > 0:
-                    filtered_nodes.append(
-                        {
-                            "id": f"hidden_{idx}",
-                            "label": f"runtime/setup commands hidden ({hidden_count})",
-                            "kind": "placeholder",
-                            "metadata": {"hidden_commands": hidden_count},
-                        }
-                    )
-                    hidden_count = 0
-                filtered_nodes.append(node)
-            else:
-                hidden_count += 1
-
-        if hidden_count > 0:
-            filtered_nodes.append(
-                {
-                    "id": "hidden_tail",
-                    "label": f"runtime/setup commands hidden ({hidden_count})",
-                    "kind": "placeholder",
-                    "metadata": {"hidden_commands": hidden_count},
-                }
-            )
-
-        shell_steps = self._extract_shell_steps(tool_payload)
-        synthetic_shell_nodes: list[dict[str, Any]] = []
-        if shell_steps:
-            for idx, step in enumerate(shell_steps):
-                if not self._shell_step_needs_synthetic_node(step, command_events):
-                    continue
-                synthetic_shell_nodes.append(
-                    {
-                        "id": f"shell_step_{idx}",
-                        "label": step[:140],
-                        "kind": "action",
-                        "metadata": {
-                            "synthetic": True,
-                            "source": "tool_command",
-                            "command": step,
-                            "line_no": None,
-                            "pid": None,
-                            "exec_path": "shell-builtin",
-                            "argv": [],
-                            "tool_match_score": 100,
-                        },
-                    }
-                )
-
-        if synthetic_shell_nodes:
-            filtered_nodes = synthetic_shell_nodes + filtered_nodes
-
-        internal_visible = [
-            e for e in internal_command_events
-            if int(e.get("line_no", 0)) not in {int(c.get("line_no", 0)) for c in command_events}
-        ]
-        if internal_visible:
-            internal_preview = [self._short_command_label(e) for e in internal_visible[:6]]
-            nodes.append(
-                {
-                    "id": "agent_internal",
-                    "label": f"Agent internal commands ({len(internal_visible)})",
-                    "kind": "placeholder",
-                    "metadata": {
-                        "internal_count": len(internal_visible),
-                        "commands": internal_preview,
-                    },
-                }
-            )
-            edges.append({"source": "tool", "target": "agent_internal", "label": "agent runtime"})
-
-        prev_cmd_id: str | None = None
-        visible_command_ids = {n["id"] for n in filtered_nodes if n.get("kind") == "action"}
-        for node in filtered_nodes:
-            nodes.append(node)
-            nid = node["id"]
-            if prev_cmd_id is None:
-                edges.append({"source": "tool", "target": nid, "label": "start"})
-            else:
-                edges.append({"source": prev_cmd_id, "target": nid, "label": "next"})
-            prev_cmd_id = nid
-
-        # ── Collapse file nodes into folder hierarchy ─────────────────
-        # Gather all file buckets across all visible commands,
-        # then collapse them in one pass like an OS folder tree.
-        all_file_items: list[dict[str, Any]] = []
-        file_source_ids: dict[str, set[str]] = defaultdict(set)  # path → set of cmd_ids
-        for bucket in sorted(file_agg.values(), key=lambda b: (b["line_min"], b["path"])):
-            if bucket["cmd_id"] not in visible_command_ids:
-                continue
-            all_file_items.append(bucket)
-            file_source_ids[bucket["path"]].add(bucket["cmd_id"])
-
-        collapsed = self._collapse_files_into_folders(
-            all_file_items, file_source_ids, resource_index, max_nodes=8,
+        return self._git_tree_graph(
+            t,
+            focus_pid=root_pid,
+            detailed=True,
+            scoped_sys_events=related,
+            include_agent_events=False,
         )
-        nodes.extend(collapsed["nodes"])
-        edges.extend(collapsed["edges"])
-        resource_index = collapsed["next_index"]
-
-        # ── Network resource nodes ─────────────────────────────────────
-        net_node_ids: dict[str, str] = {}
-        net_index = 0
-        for bucket in sorted(net_agg.values(), key=lambda b: b["dest"]):
-            if bucket["cmd_id"] not in visible_command_ids:
-                continue
-            dest = bucket["dest"]
-            if dest not in net_node_ids:
-                nid = f"net_{net_index}"
-                net_index += 1
-                net_node_ids[dest] = nid
-                nodes.append({
-                    "id": nid,
-                    "label": dest,
-                    "kind": "network",
-                    "metadata": {"dest": dest},
-                })
-            types = sorted(bucket["types"])
-            label = "/".join(t.replace("net_", "") for t in types)
-            if bucket["bytes_total"] > 0:
-                if bucket["bytes_total"] > 1024 * 1024:
-                    label += f" {bucket['bytes_total'] / (1024*1024):.1f}MB"
-                elif bucket["bytes_total"] > 1024:
-                    label += f" {bucket['bytes_total'] / 1024:.1f}KB"
-                else:
-                    label += f" {bucket['bytes_total']}B"
-            if bucket["count"] > 1:
-                label += f" x{bucket['count']}"
-            edges.append({"source": bucket["cmd_id"], "target": net_node_ids[dest], "label": label})
-
-        if command_overflow > 0 and prev_cmd_id is not None:
-            nodes.append(
-                {
-                    "id": "overflow",
-                    "label": f"{command_overflow} additional command nodes hidden",
-                    "kind": "placeholder",
-                    "metadata": {"overflow": command_overflow},
-                }
-            )
-            edges.append({"source": prev_cmd_id, "target": "overflow", "label": "next"})
-
-        events_out = [
-            {
-                "type": "command_exec",
-                "line_no": n["metadata"].get("line_no"),
-                "pid": n["metadata"].get("pid"),
-                "command": n["metadata"].get("command"),
-                "exec_path": n["metadata"].get("exec_path"),
-            }
-            for n in command_nodes
-        ]
-
-        return {"nodes": nodes, "edges": edges, "events": events_out}
 
     def trace_summary(self, trace_id: str) -> dict[str, Any]:
         t = self._get_trace(trace_id)
@@ -2401,13 +2596,9 @@ class TraceStore:
 
             if event_type == "command_exec":
                 path = str(event.get("exec_path") or "")
-                if not self._is_user_visible_path(path):
-                    continue
                 op = "execute"
             else:
                 path = str(event.get("path") or "")
-                if not self._is_user_visible_path(path):
-                    continue
                 op = event_type.replace("file_", "")
 
             if not path:
@@ -2426,8 +2617,9 @@ class TraceStore:
             event_type = str(event.get("type") or "")
             if event_type not in {"net_connect", "net_send", "net_recv"}:
                 continue
-            display = self._network_display_label(event)
-            transport = str(event.get("transport") or "other")
+            net_event = self._with_inferred_net_dest(t, event)
+            display = self._network_display_label(net_event)
+            transport = str(net_event.get("transport") or "other")
             key = (display, transport)
             bucket = net_agg.setdefault(
                 key,
@@ -2437,17 +2629,17 @@ class TraceStore:
                     "bytes": 0,
                     "count": 0,
                     "transport": transport,
-                    "family": str(event.get("family") or "other"),
+                    "family": str(net_event.get("family") or "other"),
                     "failed": 0,
                     "errors": set(),
                 },
             )
             bucket["ops"].add(event_type.replace("net_", ""))
-            bucket["bytes"] += int(event.get("bytes", 0))
+            bucket["bytes"] += int(net_event.get("bytes", 0))
             bucket["count"] += 1
-            if event.get("ok") is False:
+            if net_event.get("ok") is False:
                 bucket["failed"] += 1
-                err = str(event.get("error") or "")
+                err = str(net_event.get("error") or "")
                 if err:
                     bucket["errors"].add(err)
         net_endpoints = [
@@ -2482,10 +2674,18 @@ class TraceStore:
 
     def tool_summary(self, trace_id: str, tool_call_id: str) -> dict[str, Any]:
         t = self._get_trace(trace_id)
+        start_event: dict[str, Any] | None = None
         
-        if tool_call_id == "setup_phase":
-            first_event_ts = t.agent_events[0].get("ts", max(e.get("ts", 0) for e in t.sys_events)) if t.agent_events else max((e.get("ts", 0) for e in t.sys_events), default=0)
-            related = [e for e in t.sys_events if e.get("ts", 0) < first_event_ts - 0.1]
+        if tool_call_id == "internal_phase":
+            setup_range = self._setup_phase_window(t, sorted(t.sys_events, key=lambda e: int(e.get("line_no", 0))))
+            if setup_range is None:
+                related = []
+            else:
+                s_start, s_end = setup_range
+                related = [
+                    e for e in t.sys_events
+                    if s_start <= int(e.get("line_no", 0)) <= s_end
+                ]
         else:
             start_event, end_event = self._find_tool_events(t, tool_call_id)
             if start_event is None:
@@ -2547,7 +2747,7 @@ class TraceStore:
                 path = str(event.get("path") or "")
                 op = event_type.replace("file_", "")
 
-            if not self._is_user_visible_path(path):
+            if not path:
                 continue
 
             bucket = file_agg.setdefault(path, {"path": path, "ops": set(), "count": 0})
@@ -2565,8 +2765,9 @@ class TraceStore:
             event_type = str(event.get("type") or "")
             if event_type not in {"net_connect", "net_send", "net_recv"}:
                 continue
-            display = self._network_display_label(event)
-            transport = str(event.get("transport") or "other")
+            net_event = self._with_inferred_net_dest(t, event)
+            display = self._network_display_label(net_event)
+            transport = str(net_event.get("transport") or "other")
             key = (display, transport)
             bucket = net_agg.setdefault(
                 key,
@@ -2576,17 +2777,17 @@ class TraceStore:
                     "bytes": 0,
                     "count": 0,
                     "transport": transport,
-                    "family": str(event.get("family") or "other"),
+                    "family": str(net_event.get("family") or "other"),
                     "failed": 0,
                     "errors": set(),
                 },
             )
             bucket["ops"].add(event_type.replace("net_", ""))
-            bucket["bytes"] += int(event.get("bytes", 0))
+            bucket["bytes"] += int(net_event.get("bytes", 0))
             bucket["count"] += 1
-            if event.get("ok") is False:
+            if net_event.get("ok") is False:
                 bucket["failed"] += 1
-                err = str(event.get("error") or "")
+                err = str(net_event.get("error") or "")
                 if err:
                     bucket["errors"].add(err)
         net_endpoints = [
@@ -2716,6 +2917,22 @@ def high_level_graph(trace_id: str) -> dict[str, Any]:
         return store.high_level_graph(trace_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Trace not found")
+
+
+@app.get("/api/traces/{trace_id}/process-graph/{pid}")
+def process_graph(trace_id: str, pid: int) -> dict[str, Any]:
+    try:
+        return store.process_graph(trace_id, pid)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="trace not found")
+
+
+@app.get("/api/traces/{trace_id}/internal-graph/{line_start}/{line_end}")
+def internal_graph(trace_id: str, line_start: int, line_end: int) -> dict[str, Any]:
+    try:
+        return store.internal_graph(trace_id, line_start, line_end)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="trace not found")
 
 
 @app.get("/api/traces/{trace_id}/tool-graph/{tool_call_id}")
