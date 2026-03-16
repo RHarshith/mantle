@@ -88,7 +88,7 @@ serve_cmd() {
 }
 
 watch_cmd() {
-    local runner executable preserve_env
+    local runner executable resolved_executable preserve_env
     local -a runner_args passthrough task_args
 
     runner="$REPO_ROOT/run_intercepted_codex.sh"
@@ -136,6 +136,17 @@ watch_cmd() {
     executable="$1"
     shift
 
+    # Resolve executables without requiring shell PATH/venv activation.
+    if [[ "$executable" == */* ]]; then
+        resolved_executable="$executable"
+    elif [[ -x "$VENV_PATH/bin/$executable" ]]; then
+        resolved_executable="$VENV_PATH/bin/$executable"
+    elif command -v "$executable" >/dev/null 2>&1; then
+        resolved_executable="$(command -v "$executable")"
+    else
+        resolved_executable="$executable"
+    fi
+
     task_args=()
     if [[ $# -eq 0 ]]; then
         :
@@ -147,13 +158,16 @@ watch_cmd() {
         fi
         task_args+=("exec" "$*")
     else
-        task_args+=("$*")
+        task_args=("$@")
     fi
 
-    runner_args=("${passthrough[@]}" --agent "$executable" "${task_args[@]}")
+    runner_args=("${passthrough[@]}" --agent "$resolved_executable")
+    if [[ ${#task_args[@]} -gt 0 ]]; then
+        runner_args+=(-- "${task_args[@]}")
+    fi
 
     if [[ "${EUID}" -ne 0 ]]; then
-        preserve_env="OPENAI_API_KEY,AGENT_OBS_ROOT,RTRACE_VENV,RTRACE_INTERCEPT_MODE,RTRACE_FORCE_OPENAI_BASE,MANTLE_VENV,MANTLE_INTERCEPT_MODE,MANTLE_FORCE_OPENAI_BASE"
+        preserve_env="PATH,OPENAI_API_KEY,OAK1,OPENAI_BASE_URL,OPENAI_MODEL,AGENT_TRACE_ID,AGENT_OBS_ENABLED,AGENT_OBS_ROOT,RTRACE_VENV,RTRACE_INTERCEPT_MODE,RTRACE_FORCE_OPENAI_BASE,MANTLE_VENV,MANTLE_INTERCEPT_MODE,MANTLE_FORCE_OPENAI_BASE"
         exec sudo --preserve-env="$preserve_env" "$runner" "${runner_args[@]}"
     fi
 

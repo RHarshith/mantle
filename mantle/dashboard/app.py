@@ -69,12 +69,27 @@ class TraceStore:
         self._lock = asyncio.Lock()
 
     def _trace_to_event_candidates(self, trace_file: Path) -> list[Path]:
-        stem = trace_file.name
+        name = trace_file.name
         no_ext = trace_file.stem
-        return [
-            self.events_dir / f"{stem}.events.jsonl",
+        candidates = [
+            self.events_dir / f"{name}.events.jsonl",
             self.events_dir / f"{no_ext}.events.jsonl",
         ]
+
+        # Preferred naming for traces generated as <id>.ebpf.jsonl is <id>.events.jsonl.
+        if name.endswith(".ebpf.jsonl"):
+            base = name[: -len(".ebpf.jsonl")]
+            candidates.append(self.events_dir / f"{base}.events.jsonl")
+
+        # De-duplicate while preserving order.
+        seen: set[Path] = set()
+        unique: list[Path] = []
+        for cand in candidates:
+            if cand in seen:
+                continue
+            seen.add(cand)
+            unique.append(cand)
+        return unique
 
     async def poll_once(self) -> None:
         changed = False

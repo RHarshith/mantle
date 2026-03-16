@@ -5,6 +5,8 @@ import argparse
 import json
 import os
 import shlex
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -106,6 +108,125 @@ def _safe_int(value: str, default: int = 0) -> int:
         return default
 
 
+def _decode_ipv4(hex_addr: str) -> str:
+    try:
+        packed = struct.pack("<I", int(hex_addr, 16))
+        return socket.inet_ntop(socket.AF_INET, packed)
+    except Exception:
+        return "unknown"
+
+
+def _decode_ipv6(hex_addr: str) -> str:
+    try:
+        raw = bytes.fromhex(hex_addr)
+        # /proc/net/tcp6 stores each 32-bit word in little-endian order.
+        w0, w1, w2, w3 = struct.unpack("<IIII", raw)
+        packed = struct.pack(">IIII", w0, w1, w2, w3)
+        return socket.inet_ntop(socket.AF_INET6, packed)
+    except Exception:
+        return "unknown"
+
+
+def _socket_inode_for_fd(pid: int, fd: int) -> int | None:
+    try:
+        link = os.readlink(f"/proc/{pid}/fd/{fd}")
+    except OSError:
+        return None
+    if not link.startswith("socket:[") or not link.endswith("]"):
+        return None
+    try:
+        return int(link[len("socket:[") : -1])
+    except ValueError:
+        return None
+
+
+def _read_proc_net(protocol: str) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    path = Path(f"/proc/net/{protocol}")
+    if not path.exists():
+        return entries
+
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return entries
+
+    for line in lines[1:]:
+        cols = line.split()
+        if len(cols) < 10:
+            continue
+
+        local = cols[1]
+        remote = cols[2]
+        state = cols[3]
+        inode_str = cols[9]
+
+        try:
+            inode = int(inode_str)
+        except ValueError:
+            continue
+
+        try:
+            local_addr_hex, local_port_hex = local.split(":", 1)
+            remote_addr_hex, remote_port_hex = remote.split(":", 1)
+            local_port = int(local_port_hex, 16)
+            remote_port = int(remote_port_hex, 16)
+        except Exception:
+            continue
+
+        if protocol.endswith("6"):
+            family = "AF_INET6"
+            local_host = _decode_ipv6(local_addr_hex)
+            remote_host = _decode_ipv6(remote_addr_hex)
+        else:
+            family = "AF_INET"
+            local_host = _decode_ipv4(local_addr_hex)
+            remote_host = _decode_ipv4(remote_addr_hex)
+
+        transport = "tcp" if protocol.startswith("tcp") else "udp"
+        entries.append(
+            {
+                "inode": inode,
+                "transport": transport,
+                "family": family,
+                "local_host": local_host,
+                "local_port": local_port,
+                "remote_host": remote_host,
+                "remote_port": remote_port,
+                "state": state,
+            }
+        )
+
+    return entries
+
+
+def _resolve_socket_endpoint(pid: int, fd: int) -> dict[str, Any] | None:
+    inode = _socket_inode_for_fd(pid, fd)
+    if inode is None:
+        return None
+
+    for proto in ("tcp", "tcp6", "udp", "udp6"):
+        for entry in _read_proc_net(proto):
+            if entry["inode"] != inode:
+                continue
+
+            remote_host = entry.get("remote_host", "unknown")
+            remote_port = int(entry.get("remote_port") or 0)
+            dest = (
+                f"{remote_host}:{remote_port}"
+                if remote_port > 0 and remote_host != "unknown"
+                else f"fd={fd}"
+            )
+
+            return {
+                "dest": dest,
+                "transport": entry.get("transport", "other"),
+                "family": entry.get("family", "other"),
+            }
+
+    return None
+
+
 def _command_for_bpftrace(command: list[str]) -> list[str]:
     """Normalize command argv for bpftrace -c.
 
@@ -150,7 +271,12 @@ def _command_for_bpftrace(command: list[str]) -> list[str]:
     return interpreter_argv + [str(exe)] + command[1:]
 
 
-def _event_from_line(raw: str, seq: int, cmdline_cache: dict[int, str]) -> dict[str, Any] | None:
+def _event_from_line(
+    raw: str,
+    seq: int,
+    cmdline_cache: dict[int, str],
+    socket_cache: dict[tuple[int, int], dict[str, Any]],
+) -> dict[str, Any] | None:
     line = raw.strip()
     if not line.startswith("EVT|"):
         return None
@@ -268,17 +394,21 @@ def _event_from_line(raw: str, seq: int, cmdline_cache: dict[int, str]) -> dict[
             return None
         pid = _safe_int(parts[3])
         fd = _safe_int(parts[4], -1)
+        resolved = _resolve_socket_endpoint(pid, fd)
+        if resolved is not None:
+            socket_cache[(pid, fd)] = resolved
+        cached = socket_cache.get((pid, fd), {})
         return {
             "ts": ts,
             "line_no": seq,
             "type": "net_connect",
             "pid": pid,
             "fd": fd,
-            "dest": f"fd={fd}",
-            "transport": "other",
-            "family": "other",
+            "dest": cached.get("dest", f"fd={fd}"),
+            "transport": cached.get("transport", "other"),
+            "family": cached.get("family", "other"),
             "ok": True,
-            "label": f"connect fd={fd}",
+            "label": f"connect {cached.get('dest', f'fd={fd}')}",
         }
 
     if kind == "sendto":
@@ -287,18 +417,24 @@ def _event_from_line(raw: str, seq: int, cmdline_cache: dict[int, str]) -> dict[
         pid = _safe_int(parts[3])
         fd = _safe_int(parts[4], -1)
         size = _safe_int(parts[5], 0)
+        cached = socket_cache.get((pid, fd))
+        if cached is None:
+            resolved = _resolve_socket_endpoint(pid, fd)
+            if resolved is not None:
+                socket_cache[(pid, fd)] = resolved
+            cached = socket_cache.get((pid, fd), {})
         return {
             "ts": ts,
             "line_no": seq,
             "type": "net_send",
             "pid": pid,
             "fd": fd,
-            "dest": f"fd={fd}",
+            "dest": cached.get("dest", f"fd={fd}"),
             "bytes": size,
-            "transport": "other",
-            "family": "other",
+            "transport": cached.get("transport", "other"),
+            "family": cached.get("family", "other"),
             "ok": True,
-            "label": f"send {size}B -> fd={fd}",
+            "label": f"send {size}B -> {cached.get('dest', f'fd={fd}')}",
         }
 
     if kind == "recvfrom":
@@ -307,18 +443,24 @@ def _event_from_line(raw: str, seq: int, cmdline_cache: dict[int, str]) -> dict[
         pid = _safe_int(parts[3])
         fd = _safe_int(parts[4], -1)
         size = _safe_int(parts[5], 0)
+        cached = socket_cache.get((pid, fd))
+        if cached is None:
+            resolved = _resolve_socket_endpoint(pid, fd)
+            if resolved is not None:
+                socket_cache[(pid, fd)] = resolved
+            cached = socket_cache.get((pid, fd), {})
         return {
             "ts": ts,
             "line_no": seq,
             "type": "net_recv",
             "pid": pid,
             "fd": fd,
-            "dest": f"fd={fd}",
+            "dest": cached.get("dest", f"fd={fd}"),
             "bytes": size,
-            "transport": "other",
-            "family": "other",
+            "transport": cached.get("transport", "other"),
+            "family": cached.get("family", "other"),
             "ok": True,
-            "label": f"recv {size}B <- fd={fd}",
+            "label": f"recv {size}B <- {cached.get('dest', f'fd={fd}')}",
         }
 
     return None
@@ -332,19 +474,16 @@ def run_capture(output_file: Path, command: list[str]) -> int:
         script_path = Path(script_file.name)
 
     launch_argv = _command_for_bpftrace(command)
-    with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as runner_file:
-        runner_file.write("#!/usr/bin/env bash\n")
-        runner_file.write("set -euo pipefail\n")
-        runner_file.write(f"exec {shlex.join(launch_argv)}\n")
-        runner_path = Path(runner_file.name)
-    runner_path.chmod(0o700)
+    launch_cmd = shlex.join(launch_argv)
 
     cmdline_cache: dict[int, str] = {}
+    socket_cache: dict[tuple[int, int], dict[str, Any]] = {}
     seq = 0
+    expected_exec_basename = Path(launch_argv[0]).name
+    capture_started = False
 
-    shell_cmd = f"/bin/bash {runner_path}"
     proc = subprocess.Popen(
-        ["bpftrace", "-q", "-c", shell_cmd, str(script_path)],
+        ["bpftrace", "-q", "-c", launch_cmd, str(script_path)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -356,13 +495,29 @@ def run_capture(output_file: Path, command: list[str]) -> int:
             assert proc.stdout is not None
             for line in proc.stdout:
                 seq += 1
-                event = _event_from_line(line, seq, cmdline_cache)
+                event = _event_from_line(line, seq, cmdline_cache, socket_cache)
                 if event is None:
+                    if line.lstrip().startswith("EVT|"):
+                        continue
+                    # Preserve target command stdout/stderr-like logs (for example,
+                    # agent --verbose output) that are multiplexed on bpftrace stdout.
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
                     continue
+
+                if not capture_started:
+                    # Drop bootstrap noise from command launch wrappers until
+                    # the first exec of the target runtime is observed.
+                    if event.get("type") == "command_exec":
+                        exec_path = str(event.get("exec_path") or "")
+                        if Path(exec_path).name == expected_exec_basename:
+                            capture_started = True
+                    if not capture_started:
+                        continue
+
                 out_fh.write(json.dumps(event, ensure_ascii=False) + "\n")
     finally:
         script_path.unlink(missing_ok=True)
-        runner_path.unlink(missing_ok=True)
 
     stderr = ""
     if proc.stderr is not None:

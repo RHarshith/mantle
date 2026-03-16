@@ -31,6 +31,7 @@ while [[ $# -gt 0 ]]; do
         --port)        MITM_PORT="$2"; shift 2 ;;
         --mode)        INTERCEPT_MODE="$2"; shift 2 ;;
         --agent)       AGENT_BIN="$2"; shift 2 ;;
+        --)            shift; TASK=("$@"); break ;;
         -*)            echo "Unknown flag: $1" >&2; exit 1 ;;
         *)             TASK=("$@"); break ;;
     esac
@@ -52,6 +53,9 @@ MITM_JSONL="$OBS_ROOT/mitm/${TRACE_BASENAME}.mitm.jsonl"
 EBPF_FILE="$OBS_ROOT/traces/$TRACE_ID"
 MITM_CA="${HOME}/.mitmproxy/mitmproxy-ca-cert.pem"
 EBPF_CAPTURE_SCRIPT="$SCRIPT_DIR/mantle/ebpf_capture.py"
+
+# Correlate native agent events with the same trace identifier used by eBPF/mitm.
+export AGENT_TRACE_ID="$TRACE_BASENAME"
 
 # Find mitmdump
 MITMDUMP=""
@@ -89,7 +93,7 @@ command -v "$AGENT_BIN" >/dev/null 2>&1 || { echo "Error: '$AGENT_BIN' not found
 AGENT_BIN_PATH="$(command -v "$AGENT_BIN")"
 
 # Ensure Codex auth is initialized from current environment key for this run.
-if [[ "$AGENT_BIN" == "codex" ]]; then
+if [[ "$(basename "$AGENT_BIN_PATH")" == "codex" ]]; then
     if [[ -z "${OPENAI_API_KEY:-}" ]]; then
         echo "Error: OPENAI_API_KEY is not set in container environment." >&2
         echo "Export OPENAI_API_KEY on host and recreate container, then retry." >&2
