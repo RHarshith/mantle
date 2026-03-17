@@ -507,6 +507,29 @@ class TraceStore:
             if not isinstance(messages, list):
                 messages = []
 
+            tool_results_for_turn: list[dict[str, Any]] = []
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                is_tool_chat = msg.get("role") == "tool"
+                is_tool_resp = msg.get("type") == "function_call_output"
+                if not (is_tool_chat or is_tool_resp):
+                    continue
+                tid = msg.get("tool_call_id") or msg.get("call_id", "")
+                raw_content = msg.get("content", msg.get("output", ""))
+                text = _get_string_content(raw_content)
+                parsed_result: Any
+                try:
+                    parsed_result = json.loads(text)
+                except (json.JSONDecodeError, TypeError):
+                    parsed_result = {"output": text}
+                tool_results_for_turn.append(
+                    {
+                        "tool_call_id": tid,
+                        "result": parsed_result,
+                    }
+                )
+
             sse_parsed = _parse_responses_sse(str(resp_body.get("_raw") or ""))
             chat_fallback = _parse_chat_completion_response(resp_body)
             if not sse_parsed.get("assistant_messages") and chat_fallback.get("assistant_messages"):
@@ -579,6 +602,9 @@ class TraceStore:
                     }
                 )
 
+            # Some turns return tool_calls with empty assistant content.
+            # Emit one assistant_response node so the first tool-calling response
+            # is visible in the high-level graph without duplicating nodes.
             if not sse_parsed.get("assistant_messages") and sse_parsed.get("tool_calls"):
                 calls = sse_parsed.get("tool_calls") or []
                 names = [str(c.get("tool_name") or "tool") for c in calls if c.get("tool_name")]
@@ -595,6 +621,8 @@ class TraceStore:
                             "content": f"Calling tool: {preview}",
                             "phase": "tool_call",
                             "model": model,
+                            "tool_calls": calls,
+                            "tool_results": [],
                         },
                         "_source": "mitm",
                     }
@@ -611,22 +639,6 @@ class TraceStore:
                             "tool_call_id": tool_start.get("tool_call_id") or f"mitm_tc_{seq}",
                             "tool_name": tool_start.get("tool_name") or "unknown",
                             "arguments": tool_start.get("arguments") or {},
-                        },
-                        "_source": "mitm",
-                    }
-                )
-
-            for assistant_msg in sse_parsed.get("assistant_messages", []):
-                seq += 1
-                state.agent_events.append(
-                    {
-                        "ts": ts,
-                        "seq": seq,
-                        "event_type": "assistant_response",
-                        "payload": {
-                            "content": assistant_msg.get("content", ""),
-                            "phase": assistant_msg.get("phase"),
-                            "model": model,
                         },
                         "_source": "mitm",
                     }
@@ -677,6 +689,24 @@ class TraceStore:
                     },
                     "_source": "mitm",
                 })
+
+            for assistant_msg in sse_parsed.get("assistant_messages", []):
+                seq += 1
+                state.agent_events.append(
+                    {
+                        "ts": ts,
+                        "seq": seq,
+                        "event_type": "assistant_response",
+                        "payload": {
+                            "content": assistant_msg.get("content", ""),
+                            "phase": assistant_msg.get("phase"),
+                            "model": model,
+                            "tool_calls": sse_parsed.get("tool_calls") or [],
+                            "tool_results": tool_results_for_turn,
+                        },
+                        "_source": "mitm",
+                    }
+                )
 
         state.mitm_offset = new_offset
         return True
@@ -1206,12 +1236,17 @@ class TraceStore:
         elif event_type == "assistant_response":
             kind = "assistant_response"
             label = "Assistant Response"
+        elif event_type == "api_call":
+            kind = "api_call"
+            label = "LLM API Request"
         elif event_type == "tool_call_started":
-            kind = "assistant_response"
-            tool_name = str(payload.get("tool_name") or "tool")
-            label = f"Assistant Tool Call ({tool_name})"
-            if not metadata.get("content"):
-                metadata["content"] = f"Calling tool: {tool_name}"
+            kind = "tool_call_started"
+            tool_name = payload.get("tool_name") or "unknown"
+            label = f"Tool: {tool_name}"
+        elif event_type == "tool_call_finished":
+            kind = "tool_call_finished"
+            tool_name = payload.get("tool_name") or "unknown"
+            label = f"Tool Result: {tool_name}"
         else:
             return None
 
@@ -1236,100 +1271,32 @@ class TraceStore:
         if not sys_events:
             return [float(i + 1) for i in range(n)]
 
-        root_start_line = float(int(sys_events[0].get("line_no", 0)))
-        root_end_line = float(int(sys_events[-1].get("line_no", 0)))
+        sys_sorted_by_ts = sorted(sys_events, key=lambda e: float(e.get("ts", 0.0)))
 
-        sys_ts_vals = [float(e.get("ts", 0.0)) for e in sys_events if e.get("ts") is not None]
-        agent_ts_vals: list[float] = []
-        for event in trace.agent_events:
-            try:
-                agent_ts_vals.append(float(event.get("ts")))
-            except (TypeError, ValueError):
-                continue
-
-        # eBPF and MITM can be in different timestamp domains (monotonic vs epoch).
-        # Only do nearest-ts matching when both streams are clearly compatible.
-        ts_compatible = False
-        if sys_ts_vals and agent_ts_vals:
-            sys_min = min(sys_ts_vals)
-            agent_min = min(agent_ts_vals)
-            sys_epoch_like = sys_min > 100_000_000.0
-            agent_epoch_like = agent_min > 100_000_000.0
-            ts_compatible = (sys_epoch_like == agent_epoch_like)
-
-        anchors: dict[int, float] = {}
-
-        if ts_compatible:
-            for idx, event in enumerate(trace.agent_events):
-                ts_val = event.get("ts")
-                if ts_val is None:
-                    continue
-                try:
-                    ts = float(ts_val)
-                except (TypeError, ValueError):
-                    continue
-                nearest = self._nearest_line_for_ts(sys_events, ts)
-                anchors[idx] = float(nearest)
-
-        # Use tool-call line ranges as hard anchors independent of timestamp domain.
-        tool_ranges = self._tool_line_ranges(trace)
-        for idx, event in enumerate(trace.agent_events):
-            et = str(event.get("event_type") or "")
-            payload = event.get("payload") or {}
-            call_id = payload.get("tool_call_id")
-            if not isinstance(call_id, str) or call_id not in tool_ranges:
-                continue
-            start_line, end_line = tool_ranges[call_id]
-            if et == "tool_call_started":
-                anchors[idx] = float(start_line) - 0.2
-            elif et in {"tool_call_finished", "tool_call_denied", "tool_call_invalid_args", "tool_call_unknown"}:
-                end_anchor = end_line if end_line is not None else start_line + 1
-                anchors[idx] = float(end_anchor) + 0.2
-
-        # If timestamps are not compatible, anchor API calls by sequence across
-        # the syscall line window so prompts/responses remain sequential.
-        if not ts_compatible:
-            api_indices = [
-                i for i, event in enumerate(trace.agent_events)
-                if str(event.get("event_type") or "") == "api_call"
-            ]
-            m = len(api_indices)
-            if m > 0:
-                span = max(root_end_line - root_start_line, 1.0)
-                for rank, idx in enumerate(api_indices):
-                    anchors[idx] = root_start_line + ((rank + 1) * span / (m + 1))
-
-        # Soft boundary anchors so non-tool events are still properly ordered.
-        anchors[-1] = root_start_line + 0.05
-        anchors[n] = max(root_end_line - 0.05, root_start_line + 0.1)
+        root_start_line = float(sys_sorted_by_ts[0].get("line_no", 0))
 
         lines: list[float] = [0.0] * n
-        anchor_indices = sorted(anchors.keys())
 
-        for i in range(n):
-            if i in anchors:
-                lines[i] = float(anchors[i])
-                continue
+        for i, agent_event in enumerate(trace.agent_events):
+            try:
+                agent_ts = float(agent_event.get("ts", 0.0))
+            except (TypeError, ValueError):
+                agent_ts = 0.0
 
-            prev_idx = -1
-            next_idx = n
-            for ai in anchor_indices:
-                if ai < i:
-                    prev_idx = ai
-                elif ai > i:
-                    next_idx = ai
+            assigned_line = root_start_line - 0.1
+            for s in sys_sorted_by_ts:
+                try:
+                    s_ts = float(s.get("ts", 0.0))
+                except (TypeError, ValueError):
+                    s_ts = 0.0
+
+                if s_ts > agent_ts:
                     break
+                assigned_line = float(s.get("line_no", 0))
 
-            prev_line = float(anchors.get(prev_idx, root_start_line + 0.05))
-            next_line = float(anchors.get(next_idx, root_end_line - 0.05))
+            lines[i] = assigned_line + 0.05
 
-            if next_idx > prev_idx:
-                ratio = (i - prev_idx) / (next_idx - prev_idx)
-            else:
-                ratio = 0.5
-            lines[i] = prev_line + (next_line - prev_line) * ratio
-
-        # Guarantee strict monotonicity for stable sort/renderer behavior.
+        # Guarantee strictly monotonic lines for frontend stability
         for i in range(1, n):
             if lines[i] <= lines[i - 1]:
                 lines[i] = lines[i - 1] + 0.001

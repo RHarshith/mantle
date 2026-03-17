@@ -10,6 +10,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -276,6 +277,7 @@ def _event_from_line(
     seq: int,
     cmdline_cache: dict[int, str],
     socket_cache: dict[tuple[int, int], dict[str, Any]],
+    time_offset: float,
 ) -> dict[str, Any] | None:
     line = raw.strip()
     if not line.startswith("EVT|"):
@@ -287,7 +289,7 @@ def _event_from_line(
 
     ns = _safe_int(parts[1])
     kind = parts[2]
-    ts = ns / 1_000_000_000 if ns else 0.0
+    ts = (ns / 1_000_000_000) + time_offset if ns else 0.0
 
     if kind == "fork":
         if len(parts) < 5:
@@ -474,7 +476,18 @@ def run_capture(output_file: Path, command: list[str]) -> int:
         script_path = Path(script_file.name)
 
     launch_argv = _command_for_bpftrace(command)
-    launch_cmd = shlex.join(launch_argv)
+    # Run the target command through a tiny wrapper script so argv is preserved
+    # exactly, including arguments that contain spaces (for example --task text).
+    with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as launch_file:
+        launch_file.write("#!/usr/bin/env bash\n")
+        launch_file.write("set -euo pipefail\n")
+        launch_file.write(f"exec {shlex.join(launch_argv)}\n")
+        launch_script = Path(launch_file.name)
+    launch_script.chmod(0o700)
+    launch_cmd = f"/bin/bash {shlex.quote(str(launch_script))}"
+
+    # Calculate offset between bpf_ktime_get_ns() (CLOCK_MONOTONIC) and Epoch (time.time())
+    time_offset = time.time() - time.clock_gettime(time.CLOCK_MONOTONIC)
 
     cmdline_cache: dict[int, str] = {}
     socket_cache: dict[tuple[int, int], dict[str, Any]] = {}
@@ -495,7 +508,7 @@ def run_capture(output_file: Path, command: list[str]) -> int:
             assert proc.stdout is not None
             for line in proc.stdout:
                 seq += 1
-                event = _event_from_line(line, seq, cmdline_cache, socket_cache)
+                event = _event_from_line(line, seq, cmdline_cache, socket_cache, time_offset)
                 if event is None:
                     if line.lstrip().startswith("EVT|"):
                         continue
@@ -518,6 +531,7 @@ def run_capture(output_file: Path, command: list[str]) -> int:
                 out_fh.write(json.dumps(event, ensure_ascii=False) + "\n")
     finally:
         script_path.unlink(missing_ok=True)
+        launch_script.unlink(missing_ok=True)
 
     stderr = ""
     if proc.stderr is not None:
