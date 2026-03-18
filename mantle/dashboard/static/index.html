@@ -142,6 +142,7 @@
     .git-marker.kind-tool_output { background: var(--amber-500); }
     .git-marker.kind-api_call { background: var(--emerald-500); }
     .git-marker.kind-assistant_response { background: var(--cyan-600); }
+    .git-marker.kind-folder_group { background: var(--blue-600); }
     .git-curve { fill: none; stroke-width: 2.2; }
     .git-curve.branch { stroke: var(--blue-500); }
     .git-curve.merge { stroke: var(--emerald-600); stroke-dasharray: 5 4; }
@@ -234,6 +235,14 @@
     .details-body .detail-title { font-size: 14px; font-weight: 600; margin-bottom: 8px; word-break: break-word; }
     .details-body pre { white-space: pre-wrap; word-break: break-word; background: var(--slate-50); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px; font-size: 11px; font-family: "SF Mono", "Fira Code", "Consolas", monospace; max-height: 40vh; overflow-y: auto; line-height: 1.5; }
     .details-empty { color: var(--text-muted); font-size: 12px; padding: 16px; text-align: center; }
+    .details-tree-wrap { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 10px; background: var(--bg); margin-bottom: 10px; max-height: 35vh; overflow: auto; }
+    .details-tree-folder { margin: 2px 0; }
+    .details-tree-folder > summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: var(--text-primary); }
+    .details-tree-folder > summary::-webkit-details-marker { display: none; }
+    .details-tree-folder > summary::before { content: "▶"; font-size: 9px; color: var(--text-muted); }
+    .details-tree-folder[open] > summary::before { content: "▼"; }
+    .details-tree-children { margin-left: 16px; border-left: 1px solid var(--border-light); padding-left: 8px; }
+    .details-tree-file { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); padding: 2px 0; }
 
     /* Tools list */
     .tools-toggle { cursor: pointer; user-select: none; }
@@ -331,6 +340,6 @@
       </div>
     </aside>
   </div>
-  <script src="/static/app.js?v=20260310a"></script>
+  <script src="/static/app.js?v=20260317b"></script>
 </body>
 </html>

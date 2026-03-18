@@ -442,10 +442,37 @@ function renderDetails(nodeData) {
     return;
   }
   const meta = nodeData.metadata || {};
+  const folderTree = meta.folder_tree;
+  const metaForView = { ...meta };
+  delete metaForView.folder_tree;
   const metaStr = JSON.stringify(meta, null, 2);
+
+  const renderFolderTree = (node, level = 0) => {
+    if (!node || typeof node !== "object") return "";
+    const kind = String(node.kind || "");
+    const name = String(node.name || "");
+    if (kind === "file") {
+      const ops = Array.isArray(node.ops) ? node.ops : [];
+      const opsHtml = ops.map((op) => `<span class="op-badge op-${escapeHtml(op)}">${escapeHtml(op)}</span>`).join("");
+      const count = Number(node.count || 0);
+      return `<div class="details-tree-file" style="margin-left:${level * 14}px;"><span class="folder-icon">📄</span><span>${escapeHtml(name)}</span>${opsHtml}${count > 1 ? `<span class="file-count">x${count}</span>` : ""}</div>`;
+    }
+    const children = Array.isArray(node.children) ? node.children : [];
+    const openAttr = level < 2 ? " open" : "";
+    const childrenHtml = children.map((child) => renderFolderTree(child, level + 1)).join("");
+    return `
+      <details class="details-tree-folder"${openAttr}>
+        <summary><span class="folder-icon">📁</span>${escapeHtml(name || "/")}</summary>
+        <div class="details-tree-children">${childrenHtml}</div>
+      </details>`;
+  };
+
+  const treeHtml = folderTree ? `<div class="details-tree-wrap">${renderFolderTree(folderTree)}</div>` : "";
+  const metaViewStr = JSON.stringify(metaForView, null, 2);
   detailsEl.innerHTML = `
     <div class="detail-title">${escapeHtml(nodeData.label || nodeData.id)}</div>
-    <pre>${escapeHtml(metaStr)}</pre>`;
+    ${treeHtml}
+    <pre>${escapeHtml(treeHtml ? metaViewStr : metaStr)}</pre>`;
 }
 
 // ─── Git-Style Tree Renderer ──────────────────────────────────────
@@ -466,7 +493,7 @@ function renderGitTreeGraph(payload) {
     return Number(a.lane || 0) - Number(b.lane || 0);
   });
 
-  const maxLane = Number(payload.max_lane || 0);
+  const maxLane = nodes.reduce((m, n) => Math.max(m, Number(n.lane || 0)), 0);
   const laneSpacing = 24;
   const graphWidth = (maxLane + 1) * laneSpacing + 16;
 
@@ -500,6 +527,7 @@ function renderGitTreeGraph(payload) {
     net_connect: "Connect",
     net_send: "Net Send",
     net_recv: "Net Recv",
+    folder_group: "Folder View",
   };
 
   let selectedEl = null;

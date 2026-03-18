@@ -1480,15 +1480,69 @@ class TraceStore:
             )
 
         if detailed:
+            file_run: list[dict[str, Any]] = []
+
+            def flush_file_run() -> None:
+                nonlocal file_run
+                if not file_run:
+                    return
+
+                run_pid = int(file_run[0].get("pid", 0))
+                if run_pid <= 0 or run_pid not in lane_for_pid:
+                    file_run = []
+                    return
+
+                start_line = int(file_run[0].get("line_no", 0))
+                end_line = int(file_run[-1].get("line_no", 0))
+                unique_files = {
+                    str(e.get("path") or "")
+                    for e in file_run
+                    if str(e.get("path") or "")
+                }
+
+                nodes.append(
+                    {
+                        "id": f"folder_group_{run_pid}_{start_line}_{end_line}",
+                        "line_no": float(start_line),
+                        "lane": lane_for_pid.get(run_pid, 0),
+                        "pid": run_pid,
+                        "kind": "folder_group",
+                        "label": f"/ ({len(unique_files)} files, {len(file_run)} ops)",
+                        "metadata": {
+                            "path": "/",
+                            "line_start": start_line,
+                            "line_end": end_line,
+                            "event_count": len(file_run),
+                            "file_count": len(unique_files),
+                            "folder_tree": self._build_folder_tree(file_run),
+                        },
+                        "branch_from_lane": None,
+                        "merge_to_lane": None,
+                        "source": "sys",
+                    }
+                )
+                file_run = []
+
             for event in sys_events:
                 et = str(event.get("type") or "")
                 if et in {"process_spawn", "process_exit", "command_exec"}:
+                    flush_file_run()
                     continue
                 if not self._is_relevant_trunk_sys_event(event):
+                    flush_file_run()
                     continue
                 pid = int(event.get("pid", 0))
                 if pid <= 0 or pid not in lane_for_pid:
+                    flush_file_run()
                     continue
+
+                if et in {"file_read", "file_write"}:
+                    if file_run and int(file_run[0].get("pid", 0)) != pid:
+                        flush_file_run()
+                    file_run.append(event)
+                    continue
+
+                flush_file_run()
                 meta_event = self._with_inferred_net_dest(t, event) if et in {"net_connect", "net_send", "net_recv"} else dict(event)
                 label = str(meta_event.get("label") or et)
                 if et in {"net_connect", "net_send", "net_recv"}:
@@ -1513,6 +1567,8 @@ class TraceStore:
                         "source": "sys",
                     }
                 )
+
+            flush_file_run()
         else:
             root_relevant_events = [
                 e for e in sys_events
@@ -1662,15 +1718,73 @@ class TraceStore:
 
         nodes.sort(key=lambda n: (float(n.get("line_no", 0)), int(n.get("lane", 0)), str(n.get("id"))))
 
+        # Compress all nodes before the first LLM API call into one internal
+        # setup node so heavy agent bootstrap activity does not flood the top view.
+        if include_agent_events and focus_pid is None and not detailed:
+            first_api_line: float | None = None
+            for node in nodes:
+                if str(node.get("kind") or "") == "api_call" and str(node.get("source") or "") == "agent":
+                    first_api_line = float(node.get("line_no", 0))
+                    break
+
+            if first_api_line is not None:
+                pre_api = [n for n in nodes if float(n.get("line_no", 0)) < first_api_line]
+                post_api = [n for n in nodes if float(n.get("line_no", 0)) >= first_api_line]
+
+                if len(pre_api) > 1:
+                    start_line = int(min(float(n.get("line_no", 0)) for n in pre_api))
+                    end_line = int(max(float(n.get("line_no", 0)) for n in pre_api))
+                    compressed = {
+                        "id": f"internal_pre_api_{start_line}_{end_line}",
+                        "line_no": float(start_line) - 0.01,
+                        "lane": 0,
+                        "pid": root_pid,
+                        "kind": "internal",
+                        "label": f"Internal setup ({len(pre_api)} nodes)",
+                        "metadata": {
+                            "line_start": start_line,
+                            "line_end": end_line,
+                            "event_count": len(pre_api),
+                            "tool_call_id": "internal_phase",
+                        },
+                        "branch_from_lane": None,
+                        "merge_to_lane": None,
+                        "source": "sys",
+                    }
+                    nodes = [compressed] + post_api
+                    nodes.sort(key=lambda n: (float(n.get("line_no", 0)), int(n.get("lane", 0)), str(n.get("id"))))
+
+        visible_lanes = sorted({int(n.get("lane", 0)) for n in nodes if n.get("lane") is not None})
+        lane_remap = {old_lane: idx for idx, old_lane in enumerate(visible_lanes)}
+
+        # Normalize sparse lane ids (for example 0, 17, 42) into dense lanes
+        # so the frontend width is proportional to visible branches only.
+        for node in nodes:
+            lane_val = node.get("lane")
+            if lane_val is not None:
+                node["lane"] = lane_remap.get(int(lane_val), 0)
+
+            branch_from = node.get("branch_from_lane")
+            if branch_from is not None:
+                node["branch_from_lane"] = lane_remap.get(int(branch_from))
+
+            merge_to = node.get("merge_to_lane")
+            if merge_to is not None:
+                node["merge_to_lane"] = lane_remap.get(int(merge_to))
+
+        max_lane = (len(visible_lanes) - 1) if visible_lanes else 0
+
         branch_ranges: list[dict[str, Any]] = []
         for pid, lane in lane_for_pid.items():
+            if lane not in lane_remap:
+                continue
             start_line = root_start_line if pid == root_pid else int((spawn_event_by_pid.get(pid) or {}).get("line_no", root_start_line))
             end_event = exit_event_by_pid.get(pid)
             end_line = int(end_event.get("line_no", 0)) if end_event is not None else None
             branch_ranges.append(
                 {
                     "pid": pid,
-                    "lane": lane,
+                    "lane": lane_remap[lane],
                     "parent_pid": parent_map.get(pid),
                     "start_line": start_line,
                     "end_line": end_line,
@@ -2160,6 +2274,64 @@ class TraceStore:
             item.pop("_key", None)
 
         return compressed
+
+    def _build_folder_tree(self, file_events: list[dict[str, Any]]) -> dict[str, Any]:
+        """Build an OS-like folder tree rooted at '/'."""
+        root: dict[str, Any] = {"name": "/", "kind": "folder", "children": {}}
+
+        for event in file_events:
+            path = str(event.get("path") or "").strip()
+            if not path:
+                continue
+
+            parts = [p for p in path.split("/") if p]
+            if not parts:
+                continue
+
+            op = "write" if str(event.get("type") or "") == "file_write" else "read"
+            node = root
+            for seg in parts[:-1]:
+                children = node.setdefault("children", {})
+                if seg not in children:
+                    children[seg] = {"name": seg, "kind": "folder", "children": {}}
+                node = children[seg]
+
+            file_name = parts[-1]
+            children = node.setdefault("children", {})
+            if file_name not in children:
+                full_path = "/" + "/".join(parts)
+                children[file_name] = {
+                    "name": file_name,
+                    "kind": "file",
+                    "path": full_path,
+                    "ops": set(),
+                    "count": 0,
+                }
+
+            leaf = children[file_name]
+            leaf["ops"].add(op)
+            leaf["count"] = int(leaf.get("count", 0)) + 1
+
+        def _to_plain(node: dict[str, Any]) -> dict[str, Any]:
+            if node.get("kind") == "file":
+                return {
+                    "name": str(node.get("name") or ""),
+                    "kind": "file",
+                    "path": str(node.get("path") or ""),
+                    "ops": sorted(node.get("ops") or []),
+                    "count": int(node.get("count") or 0),
+                }
+
+            children_dict = node.get("children") or {}
+            children = [_to_plain(child) for child in children_dict.values()]
+            children.sort(key=lambda c: (0 if c.get("kind") == "folder" else 1, str(c.get("name") or "").lower()))
+            return {
+                "name": str(node.get("name") or ""),
+                "kind": "folder",
+                "children": children,
+            }
+
+        return _to_plain(root)
 
     def _short_command_label(self, event: dict[str, Any]) -> str:
         argv = event.get("argv") or []
