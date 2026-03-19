@@ -1,0 +1,36 @@
+services:
+  vulnerable-app:
+    build:
+      context: ./services
+    container_name: taint-test-vuln-app
+    command: ["python3", "vulnerable_app.py"]
+    ports:
+      - "19090:19090"
+    environment:
+      - PORT=19090
+      - RUNTIME_DIR=/data
+    volumes:
+      - runtime-data:/data
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:19090/health')"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+
+  mock-mcp:
+    build:
+      context: ./services
+    container_name: taint-test-mock-mcp
+    command: ["python3", "mock_mcp_server.py"]
+    ports:
+      - "19091:19091"
+    environment:
+      - PORT=19091
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:19091/health')"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+
+volumes:
+  runtime-data:

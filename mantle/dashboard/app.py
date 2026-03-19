@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import json
 import os
 import re
@@ -1412,23 +1413,46 @@ class TraceStore:
         for parent in list(children_by_pid.keys()):
             children_by_pid[parent].sort(key=lambda p: int((spawn_event_by_pid.get(p) or {}).get("line_no", 10**9)))
 
-        lane_for_pid: dict[int, int] = {}
+        # Render only one subprocess depth per graph: focused/root process + its
+        # direct children. Deeper descendants remain available via drilldown.
+        direct_children = list(children_by_pid.get(root_pid, []))
+
+        def child_start_line(pid: int) -> int:
+            spawn_line = int((spawn_event_by_pid.get(pid) or {}).get("line_no", 10**9))
+            exec_line = int((first_exec_by_pid.get(pid) or {}).get("line_no", 10**9))
+            return min(spawn_line, exec_line)
+
+        direct_children.sort(key=lambda p: (child_start_line(p), p))
+
+        # Reuse lane columns when earlier children have exited.
+        lane_for_pid: dict[int, int] = {root_pid: 0}
+        free_lanes: list[int] = []
+        active_lanes: list[tuple[int, int]] = []  # (exit_line, lane)
         next_lane = 1
 
-        def assign_lanes(pid: int) -> None:
-            nonlocal next_lane
-            for child in children_by_pid.get(pid, []):
-                if child in lane_for_pid:
-                    continue
-                lane_for_pid[child] = next_lane
+        for child_pid in direct_children:
+            spawn_line = child_start_line(child_pid)
+
+            while active_lanes and active_lanes[0][0] <= spawn_line:
+                _, released_lane = heapq.heappop(active_lanes)
+                heapq.heappush(free_lanes, released_lane)
+
+            if free_lanes:
+                lane = heapq.heappop(free_lanes)
+            else:
+                lane = next_lane
                 next_lane += 1
-                assign_lanes(child)
 
-        lane_for_pid[root_pid] = 0
-        assign_lanes(root_pid)
+            lane_for_pid[child_pid] = lane
 
-        subtree_pids = set(lane_for_pid.keys())
-        sys_events = [e for e in sys_events if int(e.get("pid", 0)) in subtree_pids or int(e.get("child_pid", 0)) in subtree_pids]
+            exit_event = exit_event_by_pid.get(child_pid)
+            if exit_event is not None:
+                exit_line = int(exit_event.get("line_no", 0))
+                if exit_line >= spawn_line:
+                    heapq.heappush(active_lanes, (exit_line, lane))
+
+        visible_pids = set(lane_for_pid.keys())
+        sys_events = [e for e in sys_events if int(e.get("pid", 0)) in visible_pids or int(e.get("child_pid", 0)) in visible_pids]
 
         max_lane = max(lane_for_pid.values()) if lane_for_pid else 0
 
@@ -2309,6 +2333,13 @@ class TraceStore:
                 }
 
             leaf = children[file_name]
+            # Some traces report both a directory path and nested file paths
+            # under it; in that case this node may already exist as a folder.
+            # Keep metadata fields defensively to avoid crashing drilldowns.
+            if "ops" not in leaf or not isinstance(leaf.get("ops"), set):
+                leaf["ops"] = set()
+            if "count" not in leaf:
+                leaf["count"] = 0
             leaf["ops"].add(op)
             leaf["count"] = int(leaf.get("count", 0)) + 1
 
@@ -3062,8 +3093,12 @@ def high_level_graph(trace_id: str) -> dict[str, Any]:
 def process_graph(trace_id: str, pid: int) -> dict[str, Any]:
     try:
         return store.process_graph(trace_id, pid)
-    except KeyError:
-        raise HTTPException(status_code=404, detail="trace not found")
+    except KeyError as exc:
+        # Only treat missing trace-id lookups as 404. Other KeyErrors are
+        # internal issues and should not be masked as "trace not found".
+        if exc.args and str(exc.args[0]) == trace_id:
+            raise HTTPException(status_code=404, detail="trace not found")
+        raise HTTPException(status_code=500, detail="process graph build failed")
 
 
 @app.get("/api/traces/{trace_id}/internal-graph/{line_start}/{line_end}")

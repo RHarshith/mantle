@@ -1,0 +1,1 @@
+Clone https://github.com/RHarshith/AdvisorMatch.git into ~/code_projects, create a venv in that and install the requirements.txt.

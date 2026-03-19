@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────
+# mantle_test — Run a mantle trace scenario end-to-end.
+#
+# Usage:
+#   mantle_test <scenario_name> [--agent <agent>] [--policy <trust|nondeterministic>]
+#
+# Example:
+#   mantle_test taint_analysis_test
+#   mantle_test taint_analysis_test --agent codex --policy nondeterministic
+# ─────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -h "$SOURCE" ]]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    TARGET="$(readlink "$SOURCE")"
+    if [[ "$TARGET" != /* ]]; then
+        SOURCE="$DIR/$TARGET"
+    else
+        SOURCE="$TARGET"
+    fi
+done
+
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+REPO_ROOT="${MANTLE_REPO_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+VENV_PATH="${MANTLE_VENV:-$REPO_ROOT/.venv}"
+SCENARIOS_DIR="$REPO_ROOT/trace_scenarios"
+
+# ── Defaults ──────────────────────────────────────────────────────────
+
+AGENT="mantle"
+POLICY="nondeterministic"
+
+# ── Parse arguments ───────────────────────────────────────────────────
+
+usage() {
+    cat <<'EOF'
+Usage:
+  mantle_test <scenario_name> [--agent <agent>] [--policy <trust|nondeterministic>]
+
+Arguments:
+  scenario_name   Name of the directory under trace_scenarios/ (e.g. taint_analysis_test)
+
+Options:
+  --agent <name>  Agent to use: mantle (default) or codex
+  --policy <p>    Trust policy for taint analysis: trust or nondeterministic (default)
+
+Examples:
+  mantle_test taint_analysis_test
+  mantle_test taint_analysis_test --agent codex --policy trust
+EOF
+    exit 1
+}
+
+if [[ $# -lt 1 ]]; then
+    usage
+fi
+
+SCENARIO_NAME="$1"
+shift
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --agent)   AGENT="$2"; shift 2 ;;
+        --policy)  POLICY="$2"; shift 2 ;;
+        *)         echo "Unknown option: $1" >&2; usage ;;
+    esac
+done
+
+SCENARIO_DIR="$SCENARIOS_DIR/$SCENARIO_NAME"
+if [[ ! -d "$SCENARIO_DIR" ]]; then
+    echo "ERROR: Scenario directory not found: $SCENARIO_DIR" >&2
+    exit 1
+fi
+
+# ── Helpers ───────────────────────────────────────────────────────────
+
+cleanup_on_exit() {
+    echo ""
+    echo "==> Running cleanup..."
+    bash "$SCENARIO_DIR/cleanup.sh" 2>/dev/null || true
+}
+
+# ── Main flow ─────────────────────────────────────────────────────────
+
+echo "╔══════════════════════════════════════════════════════╗"
+echo "║  mantle_test — $SCENARIO_NAME"
+echo "╚══════════════════════════════════════════════════════╝"
+echo ""
+
+# 1. Setup.
+echo "▶ Phase 1: Setup"
+bash "$SCENARIO_DIR/setup.sh"
+echo ""
+
+# Register cleanup on exit.
+trap cleanup_on_exit EXIT
+
+# 2. Verify prerequisites.
+echo "▶ Phase 2: Verify"
+bash "$SCENARIO_DIR/verify.sh"
+echo ""
+
+# 3. Run the agent with tracing.
+echo "▶ Phase 3: Run agent"
+PROMPT_FILE="$SCENARIO_DIR/prompt.txt"
+if [[ ! -f "$PROMPT_FILE" ]]; then
+    echo "ERROR: prompt.txt not found in $SCENARIO_DIR" >&2
+    exit 1
+fi
+
+PROMPT="$(cat "$PROMPT_FILE")"
+TRACE_ID="${SCENARIO_NAME}_$(date +%Y%m%d_%H%M%S)"
+
+if [[ "$AGENT" == "codex" ]]; then
+    echo "  Running Codex under mantle watch..."
+    "$SCRIPT_DIR/mantle" watch --trace-id "$TRACE_ID" codex exec "$PROMPT"
+else
+    echo "  Running mantle agent..."
+    AGENT_OBS_ROOT="${AGENT_OBS_ROOT:-$REPO_ROOT/obs}"
+    AGENT_OBS_ENABLED=1 \
+    AGENT_TRACE_ID="$TRACE_ID" \
+    AGENT_AUTO_APPROVE=1 \
+    "$VENV_PATH/bin/python" -m mantle_agent.cli_agent "$PROMPT"
+fi
+
+echo ""
+echo "  Trace ID: $TRACE_ID"
+echo ""
+
+# 4. Run taint analysis on the captured trace.
+echo "▶ Phase 4: Taint analysis"
+echo "  Policy: $POLICY"
+
+PYTHON_BIN="$VENV_PATH/bin/python"
+if [[ ! -f "$PYTHON_BIN" ]]; then
+    PYTHON_BIN="$(which python3)"
+fi
+
+"$PYTHON_BIN" -c "
+import json, sys, pathlib
+
+# Find the trace files.
+obs_root = pathlib.Path('${AGENT_OBS_ROOT:-$REPO_ROOT/obs}')
+trace_files = sorted(obs_root.glob('traces/*${TRACE_ID}*.ebpf.jsonl'))
+event_files = sorted(obs_root.glob('events/*${TRACE_ID}*.events.jsonl'))
+
+sys_events = []
+agent_events = []
+
+for f in trace_files:
+    for line in f.read_text().splitlines():
+        if line.strip():
+            try:
+                sys_events.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+
+for f in event_files:
+    for line in f.read_text().splitlines():
+        if line.strip():
+            try:
+                agent_events.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+
+print(f'  Loaded {len(sys_events)} BPF events, {len(agent_events)} agent events')
+
+from mantle.taint_engine import run_taint_analysis
+from mantle.taint_rules import TrustPolicy
+
+policy = TrustPolicy.TRUST_EXTERNAL_FILES if '$POLICY' == 'trust' else TrustPolicy.NONDETERMINISTIC_EXTERNAL_FILES
+report = run_taint_analysis(sys_events, agent_events, policy)
+
+print()
+print('  ' + report.summary.replace('\n', '\n  '))
+print()
+
+if report.findings:
+    for f in report.findings:
+        icon = {'critical': '🚨', 'warning': '⚠️', 'info': 'ℹ️'}.get(f.severity.value, '•')
+        print(f'  {icon} [{f.severity.value.upper()}] {f.title}')
+        print(f'    {f.description[:200]}')
+        print()
+
+# Write report JSON.
+report_path = obs_root / 'taint_reports' / '${TRACE_ID}.taint.json'
+report_path.parent.mkdir(parents=True, exist_ok=True)
+report_path.write_text(json.dumps(report.to_dict(), indent=2))
+print(f'  Report saved to: {report_path}')
+"
+
+echo ""
+echo "╔══════════════════════════════════════════════════════╗"
+echo "║  Test complete                                       ║"
+echo "╚══════════════════════════════════════════════════════╝"

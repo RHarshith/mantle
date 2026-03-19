@@ -1,13 +1,62 @@
-# Mantle Observability
+# Mantle
 
-Mantle captures coding-agent behavior at three layers:
-- API traffic via `mitmproxy`
-- process/file/network activity via eBPF (`bpftrace`)
-- timeline + drilldown in a FastAPI dashboard
+An observability and safety-analysis platform for coding agents.
 
-Mantle now uses a single executable: `mantle`.
+Mantle captures how an AI coding agent reasons, calls tools, touches files, and talks to networks, then reconstructs that execution into a live drilldown dashboard and taint analysis report.
 
-## Native Setup (Linux/macOS)
+## Why This Project Exists
+
+AI coding agents are powerful, but most teams still treat their behavior as a black box. Mantle was built to answer practical engineering and security questions:
+
+- What exactly did the agent do over time?
+- Which tools and files were involved in each step?
+- Which network endpoints were contacted?
+- Did untrusted data flow into dangerous sinks (shell/python execution, sensitive writes)?
+
+The goal is to make agent behavior inspectable, testable, and reviewable.
+
+## Core Capabilities
+
+- Multi-layer capture:
+	- API traffic via `mitmproxy`
+	- process/file/network activity via eBPF (`bpftrace`)
+	- agent-native events via JSONL instrumentation
+- Live observability dashboard (`mantle serve`):
+	- trace timeline
+	- tool and process drilldowns
+	- file/network activity panels
+	- websocket-driven updates
+- Taint analysis engine:
+	- forward propagation of trust labels
+	- source to sink findings with severity
+	- policy-aware checks for command/python execution and sensitive writes
+- Scenario-based validation:
+	- reproducible suites under `trace_scenarios/`
+	- setup, verify, and cleanup lifecycle
+
+## Architecture At A Glance
+
+```text
+Agent Runtime
+	-> mantle watch
+			-> eBPF syscall capture (process/file/network)
+			-> MITM capture (API/network payload view)
+			-> agent event sink (structured JSONL)
+
+Captured data (obs/)
+	-> traces/*.ebpf.jsonl
+	-> mitm/*.mitm.jsonl
+	-> events/*.events.jsonl
+
+mantle serve
+	-> FastAPI backend
+	-> static UI + websocket updates
+	-> timeline, drilldowns, and analysis views
+```
+
+## Quickstart
+
+### Native Setup (Linux/macOS)
 
 ```bash
 git clone <your-repo-url>
@@ -17,7 +66,7 @@ export PATH="$HOME/.local/bin:$PATH"
 export OPENAI_API_KEY="<your_key>"
 ```
 
-Verify install:
+Verify installation:
 
 ```bash
 mantle --help
@@ -25,7 +74,7 @@ mantle serve --help
 mantle watch --help
 ```
 
-## Native Run
+### Run A Live Trace
 
 Terminal 1 (dashboard):
 
@@ -33,15 +82,15 @@ Terminal 1 (dashboard):
 mantle serve --host 0.0.0.0 --port 8099
 ```
 
-Terminal 2 (observe an executable):
+Terminal 2 (run and trace an agent command):
 
 ```bash
 mantle watch codex exec "inspect this repository and summarize"
 ```
 
-Open: `http://127.0.0.1:8099`
+Open `http://127.0.0.1:8099`.
 
-## Docker Setup And Run
+## Docker Workflow
 
 ```bash
 git clone <your-repo-url>
@@ -50,27 +99,29 @@ export OPENAI_API_KEY="<your_key_in_local_shell>"
 docker compose up -d --build
 ```
 
-Terminal 1:
+Start dashboard:
 
 ```bash
 docker compose exec mantle-lab bash -lc 'mantle serve'
 ```
 
-Terminal 2:
+Run traced task:
 
 ```bash
 docker compose exec mantle-lab bash -lc 'mantle watch codex exec "count shell scripts and print result"'
 ```
 
-Open: `http://127.0.0.1:8099`
+Open `http://127.0.0.1:8099`.
 
-## Command Reference
+## CLI Reference
 
 `mantle serve`
-- Starts the dashboard server.
+
+- Starts the FastAPI dashboard server.
 - Usage: `mantle serve [--host <host>] [--port <port>] [--obs-root <path>]`
 
 `mantle watch`
+
 - Runs an executable under MITM + eBPF capture.
 - Usage: `mantle watch [--mode <proxy|transparent>] [--trace-id <id>] [--port <mitm_port>] <executable> [exec] [prompt...]`
 
@@ -83,63 +134,81 @@ mantle watch --mode transparent codex exec "trace outbound API calls"
 mantle watch aider "fix failing tests"
 ```
 
-## Folder Structure
+## Data Artifacts
 
-```text
-.
-├── agent_setup/
-│   └── setup.yml
-├── bin/
-│   ├── mantle
-│   └── rtrace_test                   # scenario runner helper (not globally installed)
-├── docker/
-│   └── entrypoint.sh
-├── mantle/
-│   ├── dashboard/
-│   │   ├── app.py
-│   │   ├── static/
-│   │   └── requirements.txt
-│   ├── ebpf_capture.py
-│   └── mitm_capture.py
-├── mantle_agent/
-│   ├── agent_observability.py
-│   └── cli_agent.py
-├── scripts/
-│   ├── bootstrap_ubuntu.sh
-│   ├── install_mantle.sh
-│   └── agent_setup/
-├── trace_scenarios/
-├── run_intercepted_codex.sh
-└── obs/
-```
+Mantle writes trace outputs to `obs/`:
 
-Generated data:
 - `obs/traces/<trace_id>.ebpf.jsonl`
 - `obs/mitm/<trace_id>.mitm.jsonl`
 - `obs/events/<trace_id>.events.jsonl`
 
-## Key Environment Variables
+These files are the source of truth for replay, debugging, and analysis.
 
-- `OPENAI_API_KEY`: OpenAI credential
+## Project Structure
+
+```text
+.
+├── bin/
+│   ├── mantle
+│   └── mantle_test
+├── mantle/
+│   ├── dashboard/
+│   │   ├── app.py
+│   │   └── static/
+│   ├── ebpf_capture.py
+│   ├── mitm_capture.py
+│   ├── taint_engine.py
+│   └── taint_rules.py
+├── mantle_agent/
+│   ├── agent_observability.py
+│   └── cli_agent.py
+├── trace_scenarios/
+├── scripts/
+├── run_intercepted_codex.sh
+└── obs/
+```
+
+## Engineering Highlights
+
+- End-to-end instrumentation design spanning agent-level and OS-level telemetry
+- Real-time UX with backend polling and websocket update flow
+- Security-focused dataflow modeling with explicit trust policy semantics
+- Reproducible scenario harness for validation and regression checks
+
+## Environment Variables
+
+- `OPENAI_API_KEY`: API credential
 - `AGENT_OBS_ROOT`: output root (default `<repo>/obs`)
 - `MANTLE_VENV`: Python venv path used by wrappers
 - `MANTLE_INTERCEPT_MODE`: default intercept mode (`proxy` or `transparent`)
-- `MANTLE_FORCE_OPENAI_BASE=1`: forces local reverse base URL behavior (debug only)
+- `MANTLE_FORCE_OPENAI_BASE=1`: debug override for base URL behavior
 
-Compatibility fallback variables (`RTRACE_*`) are still accepted.
+Compatibility fallback variables (`RTRACE_*`) are supported.
 
 ## Troubleshooting
 
 Dashboard unreachable from host in Docker:
-- Run `docker compose ps`
-- Run `docker compose port mantle-lab 8099`
+
+- `docker compose ps`
+- `docker compose port mantle-lab 8099`
 
 No low-level syscall nodes in drilldown:
+
 - Ensure `bpftrace` is installed and runnable as root.
 - Confirm run output prints `eBPF trace: true`.
 
-Codex auth errors:
+Codex authentication issues:
 
 ```bash
 docker compose exec mantle-lab bash -lc 'printenv OPENAI_API_KEY | codex login --with-api-key && codex login status'
 ```
+
+## Demo And Portfolio Notes
+
+For recruiter or hiring panel review, include:
+
+- a short architecture diagram screenshot from the dashboard
+- one end-to-end trace walkthrough (input -> tool calls -> outputs)
+- one taint finding example with remediation steps
+
+This makes both product thinking and systems engineering depth obvious in a quick review.

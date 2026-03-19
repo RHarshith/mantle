@@ -495,12 +495,18 @@ def run_capture(output_file: Path, command: list[str]) -> int:
     expected_exec_basename = Path(launch_argv[0]).name
     capture_started = False
 
+    # Increase bpftrace str() buffer size to avoid path truncation.
+    # Default is 64 bytes which truncates most real filesystem paths.
+    bpf_env = os.environ.copy()
+    bpf_env.setdefault("BPFTRACE_STR_LEN", "200")
+
     proc = subprocess.Popen(
         ["bpftrace", "-q", "-c", launch_cmd, str(script_path)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        env=bpf_env,
     )
 
     try:

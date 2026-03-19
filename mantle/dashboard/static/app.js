@@ -500,7 +500,8 @@ function renderGitTreeGraph(payload) {
   const rangeByLane = new Map();
   for (const branch of payload.branch_ranges || []) {
     const lane = Number(branch.lane || 0);
-    rangeByLane.set(lane, {
+    if (!rangeByLane.has(lane)) rangeByLane.set(lane, []);
+    rangeByLane.get(lane).push({
       start: Number(branch.start_line || 0),
       end: branch.end_line == null ? null : Number(branch.end_line),
       pid: branch.pid,
@@ -530,14 +531,25 @@ function renderGitTreeGraph(payload) {
     folder_group: "Folder View",
   };
 
+  const processDrilldownPid = (node) => {
+    const kind = String(node.kind || "");
+    if (!(kind === "process_spawn" || kind === "process_exit" || kind === "process_exec")) return null;
+    const targetPid = Number(node.pid || 0);
+    if (!(targetPid > 0)) return null;
+    if (targetPid === Number(payload.root_pid || 0)) return null;
+    return targetPid;
+  };
+
   let selectedEl = null;
 
   const isLaneActiveAt = (lane, lineNo) => {
-    const r = rangeByLane.get(lane);
-    if (!r) return false;
-    if (lineNo < r.start) return false;
-    if (r.end == null) return true;
-    return lineNo <= r.end;
+    const ranges = rangeByLane.get(lane);
+    if (!ranges || ranges.length === 0) return false;
+    for (const r of ranges) {
+      if (lineNo < r.start) continue;
+      if (r.end == null || lineNo <= r.end) return true;
+    }
+    return false;
   };
 
   for (const node of nodes) {
@@ -571,18 +583,16 @@ function renderGitTreeGraph(payload) {
     const kind = String(node.kind || "event");
     marker.className = `git-marker kind-${kind}`;
     marker.style.left = `${8 + lane * laneSpacing}px`;
-    marker.addEventListener("dblclick", async (e) => {
+    marker.addEventListener("click", async (e) => {
       e.stopPropagation();
       const meta = node.metadata || {};
-      if (kind === "internal" && meta.line_start != null && meta.line_end != null) {
-        await openInternalDrilldown(Number(meta.line_start), Number(meta.line_end));
+      const targetPid = processDrilldownPid(node);
+      if (targetPid != null) {
+        await openProcessDrilldown(targetPid);
         return;
       }
-      if ((kind === "process_spawn" || kind === "process_exit" || kind === "process_exec") && node.pid) {
-        const targetPid = Number(node.pid);
-        if (targetPid > 0 && targetPid !== Number(payload.root_pid || 0)) {
-          await openProcessDrilldown(targetPid);
-        }
+      if (kind === "internal" && meta.line_start != null && meta.line_end != null) {
+        await openInternalDrilldown(Number(meta.line_start), Number(meta.line_end));
       }
     });
     graph.appendChild(marker);
@@ -628,12 +638,17 @@ function renderGitTreeGraph(payload) {
     `;
     card.title = shortLabel;
 
-    card.addEventListener("click", (e) => {
+    card.addEventListener("click", async (e) => {
       e.stopPropagation();
       if (selectedEl) selectedEl.classList.remove("selected");
       selectedEl = card;
       card.classList.add("selected");
       renderDetails(node);
+
+      const targetPid = processDrilldownPid(node);
+      if (targetPid != null) {
+        await openProcessDrilldown(targetPid);
+      }
     });
 
     card.addEventListener("dblclick", async (e) => {
