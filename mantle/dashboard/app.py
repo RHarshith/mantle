@@ -1333,6 +1333,78 @@ class TraceStore:
             )
         return out
 
+    def _candidate_trace_paths(self, trace_id: str) -> list[Path]:
+        candidates = [self.trace_dir / trace_id]
+        if trace_id.endswith(".ebpf.jsonl"):
+            # Defensive fallback if callers ever pass the stem.
+            stem = trace_id[: -len(".ebpf.jsonl")]
+            candidates.append(self.trace_dir / f"{stem}.ebpf.jsonl")
+        return candidates
+
+    def _candidate_events_paths(self, trace_id: str) -> list[Path]:
+        trace_file = self.trace_dir / trace_id
+        candidates = self._trace_to_event_candidates(trace_file)
+        # Also support direct <trace_id>.events.jsonl naming.
+        candidates.append(self.events_dir / f"{trace_id}.events.jsonl")
+        seen: set[Path] = set()
+        uniq: list[Path] = []
+        for cand in candidates:
+            if cand in seen:
+                continue
+            seen.add(cand)
+            uniq.append(cand)
+        return uniq
+
+    def _candidate_mitm_paths(self, trace_id: str) -> list[Path]:
+        if not self.mitm_dir:
+            return []
+        candidates: list[Path] = [self.mitm_dir / f"{trace_id}.mitm.jsonl"]
+        no_ext = Path(trace_id).stem
+        candidates.append(self.mitm_dir / f"{no_ext}.mitm.jsonl")
+        if trace_id.endswith(".ebpf.jsonl"):
+            base = trace_id[: -len(".ebpf.jsonl")]
+            candidates.append(self.mitm_dir / f"{base}.mitm.jsonl")
+
+        seen: set[Path] = set()
+        uniq: list[Path] = []
+        for cand in candidates:
+            if cand in seen:
+                continue
+            seen.add(cand)
+            uniq.append(cand)
+        return uniq
+
+    async def delete_trace(self, trace_id: str) -> dict[str, Any]:
+        trace = self.traces.get(trace_id)
+
+        trace_paths = self._candidate_trace_paths(trace_id)
+        events_paths = self._candidate_events_paths(trace_id)
+        mitm_paths = self._candidate_mitm_paths(trace_id)
+
+        if trace is not None:
+            trace_paths = [trace.trace_path] + [p for p in trace_paths if p != trace.trace_path]
+            events_paths = trace.events_path_candidates + [p for p in events_paths if p not in trace.events_path_candidates]
+            if trace.mitm_path is not None:
+                mitm_paths = [trace.mitm_path] + [p for p in mitm_paths if p != trace.mitm_path]
+
+        removed_files: list[str] = []
+        for path in trace_paths + events_paths + mitm_paths:
+            if not path.exists():
+                continue
+            if not path.is_file():
+                continue
+            path.unlink()
+            removed_files.append(str(path))
+
+        if trace is None and not removed_files:
+            raise KeyError(trace_id)
+
+        self.traces.pop(trace_id, None)
+        async with self._lock:
+            self.version += 1
+
+        return {"trace_id": trace_id, "deleted_files": removed_files}
+
     def _get_trace(self, trace_id: str) -> TraceState:
         trace = self.traces.get(trace_id)
         if trace is None:
@@ -3663,6 +3735,14 @@ def index() -> FileResponse:
 @app.get("/api/traces")
 def list_traces() -> dict[str, Any]:
     return {"traces": store.list_traces(), "version": store.version}
+
+
+@app.delete("/api/traces/{trace_id}")
+async def delete_trace(trace_id: str) -> dict[str, Any]:
+    try:
+        return await store.delete_trace(trace_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Trace not found")
 
 
 @app.get("/api/config")

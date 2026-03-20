@@ -49,6 +49,23 @@
     .trace-item .trace-status { display: inline-block; padding: 1px 6px; border-radius: 10px; font-size: 10px; font-weight: 600; text-transform: uppercase; }
     .trace-status.completed { background: var(--emerald-100); color: var(--emerald-600); }
     .trace-status.active { background: var(--amber-100); color: var(--amber-600); }
+    .trace-row { display: flex; align-items: flex-start; gap: 8px; }
+    .trace-main { flex: 1; min-width: 0; }
+    .trace-delete-btn {
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text-muted);
+      border-radius: 999px;
+      width: 18px;
+      height: 18px;
+      line-height: 14px;
+      font-size: 13px;
+      text-align: center;
+      cursor: pointer;
+      padding: 0;
+      flex: 0 0 auto;
+    }
+    .trace-delete-btn:hover { color: var(--red-600); border-color: var(--red-100); background: var(--red-50); }
 
     /* === Main area === */
     .main { display: flex; flex-direction: column; overflow: hidden; }

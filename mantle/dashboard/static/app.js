@@ -188,14 +188,62 @@ function renderTraceList(traces) {
     div.className = "trace-item" + (t.trace_id === selectedTraceId ? " active" : "");
     const statusCls = t.status === "completed" ? "completed" : "active";
     div.innerHTML = `
-      <div class="trace-name">${escapeHtml(t.trace_id)}</div>
-      <div class="trace-meta">
-        <span class="trace-status ${statusCls}">${t.status}</span>
-        &nbsp;agent: ${t.agent_event_count} &nbsp;sys: ${t.sys_event_count}
+      <div class="trace-row">
+        <div class="trace-main">
+          <div class="trace-name">${escapeHtml(t.trace_id)}</div>
+          <div class="trace-meta">
+            <span class="trace-status ${statusCls}">${t.status}</span>
+            &nbsp;agent: ${t.agent_event_count} &nbsp;sys: ${t.sys_event_count}
+          </div>
+        </div>
+        <button class="trace-delete-btn" title="Delete trace">&times;</button>
       </div>`;
     div.onclick = () => selectTrace(t.trace_id);
+
+    const delBtn = div.querySelector(".trace-delete-btn");
+    if (delBtn) {
+      delBtn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        await deleteTrace(t.trace_id);
+      });
+    }
+
     traceListEl.appendChild(div);
   }
+}
+
+function clearSelectionView() {
+  graphCanvas.innerHTML = '<div class="empty-state" id="emptyState"><h3>No trace selected</h3><p>Select a trace from the sidebar, or run an agent with eBPF capture to begin.</p></div>';
+  renderBreadcrumbs();
+  renderFiles([], "Select a trace to view file activity.");
+  renderTools([]);
+  detailsEl.innerHTML = '<div class="details-empty">Click a node to inspect its metadata.</div>';
+  updateSummaryCards({ prompts: 0, tool_steps: 0, responses: 0, trace_status: "-" });
+}
+
+async function deleteTrace(traceId) {
+  if (!traceId) return;
+  try {
+    const res = await fetch(`/api/traces/${encodeURIComponent(traceId)}`, { method: "DELETE" });
+    if (!res.ok) throw new Error(`API ${res.status}`);
+  } catch (_) {
+    return;
+  }
+
+  if (selectedTraceId === traceId) {
+    selectedTraceId = null;
+    currentMode = "high";
+    currentToolCallId = null;
+    currentProcessPid = null;
+    processTrail = [];
+    currentInternalRange = null;
+    selectedNodeId = null;
+    cachedTraceFiles = [];
+    cachedTraceTools = [];
+    window._cachedTraceNetwork = [];
+  }
+
+  await refreshTraces(false, true);
 }
 
 async function selectTrace(traceId) {
@@ -1578,12 +1626,19 @@ async function refreshTraces(keepView = true, force = false) {
   latestVersion = version;
 
   const traces = payload.traces || [];
+  const selectedExists = selectedTraceId && traces.some((t) => t.trace_id === selectedTraceId);
+  if (selectedTraceId && !selectedExists) {
+    selectedTraceId = null;
+  }
   if (!selectedTraceId && traces.length > 0) {
     selectedTraceId = traces[0].trace_id;
   }
 
   renderTraceList(traces);
-  if (!selectedTraceId) return;
+  if (!selectedTraceId) {
+    clearSelectionView();
+    return;
+  }
 
   if (activeTab === "trace") {
     if (!keepView || currentMode === "high") {
