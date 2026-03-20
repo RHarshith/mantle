@@ -7,7 +7,7 @@ import json
 import os
 import re
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -3194,6 +3194,359 @@ class TraceStore:
         payload["trace_id"] = trace_id
         return payload
 
+    def _path_bucket(self, path: str) -> str:
+        p = str(path or "").strip()
+        if not p:
+            return "unknown_path"
+        lower = p.lower()
+        if lower.endswith("/etc/passwd"):
+            return "etc_passwd"
+        if lower.endswith("/etc/shadow"):
+            return "etc_shadow"
+        if lower.endswith("/etc/group"):
+            return "etc_group"
+        if lower.endswith("authorized_keys"):
+            return "authorized_keys"
+        if lower.endswith("audit.log"):
+            return "audit_log"
+        if "/etc/ssh/" in lower:
+            return "etc_ssh"
+        if "/home/" in lower:
+            return "home_tree"
+        if "/tmp/" in lower:
+            return "tmp_tree"
+        try:
+            return Path(p).name or "unknown_path"
+        except Exception:
+            return "unknown_path"
+
+    def _command_bucket(self, command: str) -> str:
+        cmd = self._normalize_command_text(command)
+        if not cmd:
+            return "unknown_command"
+        tokens = self._command_tokens(cmd)
+        first = Path(tokens[0]).name if tokens else Path(cmd.split(" ", 1)[0]).name
+        first = first.lower()
+        if first in {"useradd", "adduser"}:
+            return "create_user"
+        if first in {"getent", "grep", "awk", "cut"} and "passwd" in cmd:
+            return "check_user_availability"
+        if first in {"mkdir", "install"} and ".ssh" in cmd:
+            return "prepare_ssh_dir"
+        if first in {"tee", "cat", "printf", "echo"} and "authorized_keys" in cmd:
+            return "install_authorized_key"
+        if first in {"fail2ban-client", "iptables", "nft", "ufw"}:
+            return "apply_rate_limit"
+        if first in {"logger", "echo", "tee"} and "audit" in cmd:
+            return "write_audit_log"
+        return first or "unknown_command"
+
+    def _agent_step_signature(self, event: dict[str, Any]) -> tuple[str, str] | None:
+        event_type = str(event.get("event_type") or "")
+        payload = event.get("payload") or {}
+        if event_type in {"user_prompt", "user_prompt_batch"}:
+            return "phase:user_prompt", "User prompt intake"
+        if event_type == "assistant_response":
+            return "phase:assistant_response", "Assistant response"
+        if event_type == "api_call":
+            model = str(payload.get("model") or "llm").strip() or "llm"
+            return f"phase:api_call:{model}", f"LLM API call ({model})"
+        if event_type == "tool_call_started":
+            tool_name = str(payload.get("tool_name") or "unknown").strip() or "unknown"
+            return f"tool:{tool_name}", f"Tool call: {tool_name}"
+        if event_type == "tool_call_finished":
+            tool_name = str(payload.get("tool_name") or "unknown").strip() or "unknown"
+            return f"tool_result:{tool_name}", f"Tool result: {tool_name}"
+        return None
+
+    def _sys_step_signature(self, event: dict[str, Any]) -> tuple[str, str] | None:
+        et = str(event.get("type") or "")
+        if et == "command_exec":
+            bucket = self._command_bucket(self._event_command_text(event))
+            return f"cmd:{bucket}", f"Command: {bucket}"
+        if et in {"file_read", "file_write", "file_delete", "file_rename"}:
+            bucket = self._path_bucket(str(event.get("path") or ""))
+            op = et.replace("file_", "")
+            # Reads are less strict than writes/deletes in blast-radius checks.
+            if op == "read":
+                return f"fs_read:{bucket}", f"File read: {bucket}"
+            return f"fs:{op}:{bucket}", f"File {op}: {bucket}"
+        if et in {"net_connect", "net_send", "net_recv"}:
+            dest = self._network_display_label(event)
+            parsed = urlparse(dest if "://" in dest else f"tcp://{dest}")
+            host = parsed.hostname or dest.split(":", 1)[0]
+            host = host.lower()
+            if host in {"127.0.0.1", "localhost", "::1"}:
+                host_bucket = "localhost"
+            elif host in KNOWN_LLM_HOSTS:
+                host_bucket = "llm_provider"
+            else:
+                host_bucket = host
+            op = et.replace("net_", "")
+            return f"net:{op}:{host_bucket}", f"Network {op}: {host_bucket}"
+        return None
+
+    def _semantic_trace_steps(self, trace: TraceState) -> list[dict[str, Any]]:
+        steps: list[dict[str, Any]] = []
+
+        for idx, event in enumerate(trace.agent_events):
+            sig = self._agent_step_signature(event)
+            if not sig:
+                continue
+            key, label = sig
+            steps.append(
+                {
+                    "key": key,
+                    "label": label,
+                    "source": "agent",
+                    "line_no": int(event.get("line_no") or 0),
+                    "ts": float(event.get("ts") or 0.0),
+                    "order_hint": idx,
+                    "raw_type": str(event.get("event_type") or ""),
+                }
+            )
+
+        for idx, event in enumerate(trace.sys_events):
+            sig = self._sys_step_signature(event)
+            if not sig:
+                continue
+            key, label = sig
+            steps.append(
+                {
+                    "key": key,
+                    "label": label,
+                    "source": "sys",
+                    "line_no": int(event.get("line_no") or 0),
+                    "ts": float(event.get("ts") or 0.0),
+                    "order_hint": idx,
+                    "raw_type": str(event.get("type") or ""),
+                }
+            )
+
+        steps.sort(key=lambda s: (float(s.get("ts") or 0.0), int(s.get("line_no") or 0), s.get("source") != "agent"))
+
+        # Collapse adjacent duplicates to avoid noisy syscall-level over-fitting.
+        compressed: list[dict[str, Any]] = []
+        prev_key = ""
+        for step in steps:
+            key = str(step.get("key") or "")
+            if not key:
+                continue
+            if key == prev_key:
+                continue
+            compressed.append(step)
+            prev_key = key
+        return compressed
+
+    def blast_radius_template(self, trace_ids: list[str], min_coverage: float = 0.6) -> dict[str, Any]:
+        selected = [self._get_trace(tid) for tid in trace_ids]
+        if not selected:
+            raise ValueError("at least one trace is required")
+
+        per_trace_steps: dict[str, list[dict[str, Any]]] = {
+            t.trace_id: self._semantic_trace_steps(t) for t in selected
+        }
+
+        key_presence: Counter[str] = Counter()
+        key_positions: dict[str, list[int]] = defaultdict(list)
+        transition_counts: Counter[tuple[str, str]] = Counter()
+        from_counts: Counter[str] = Counter()
+        labels: dict[str, str] = {}
+
+        for trace_id, steps in per_trace_steps.items():
+            seen_in_trace: set[str] = set()
+            keys = [str(s.get("key") or "") for s in steps if s.get("key")]
+            for pos, key in enumerate(keys):
+                labels[key] = str(steps[pos].get("label") or key)
+                key_positions[key].append(pos)
+                if key not in seen_in_trace:
+                    key_presence[key] += 1
+                    seen_in_trace.add(key)
+            for i in range(len(keys) - 1):
+                pair = (keys[i], keys[i + 1])
+                transition_counts[pair] += 1
+                from_counts[keys[i]] += 1
+
+        total = len(selected)
+        expected_steps: list[dict[str, Any]] = []
+        for key, count in key_presence.items():
+            coverage = count / total
+            if coverage < min_coverage:
+                continue
+            positions = sorted(key_positions.get(key, []))
+            if positions:
+                lo_idx = max(0, int(0.2 * (len(positions) - 1)))
+                hi_idx = int(0.8 * (len(positions) - 1))
+                pos_low = positions[lo_idx]
+                pos_high = positions[hi_idx]
+                pos_med = positions[len(positions) // 2]
+            else:
+                pos_low = 0
+                pos_high = 0
+                pos_med = 0
+            expected_steps.append(
+                {
+                    "key": key,
+                    "label": labels.get(key, key),
+                    "coverage": round(coverage, 3),
+                    "position_low": pos_low,
+                    "position_high": pos_high,
+                    "position_median": pos_med,
+                }
+            )
+
+        expected_steps.sort(key=lambda x: (int(x["position_median"]), -float(x["coverage"]), str(x["key"])))
+
+        transitions = []
+        for (src, dst), c in transition_counts.items():
+            denom = from_counts.get(src, 1)
+            transitions.append(
+                {
+                    "from": src,
+                    "to": dst,
+                    "count": c,
+                    "probability": round(c / denom, 4),
+                }
+            )
+
+        transitions.sort(key=lambda t: (-int(t["count"]), str(t["from"]), str(t["to"])))
+
+        return {
+            "trace_ids": trace_ids,
+            "trace_count": total,
+            "min_coverage": min_coverage,
+            "expected_steps": expected_steps,
+            "transitions": transitions,
+            "trace_lengths": {k: len(v) for k, v in per_trace_steps.items()},
+        }
+
+    def blast_radius_compare(self, baseline_ids: list[str], candidate_id: str, min_coverage: float = 0.6) -> dict[str, Any]:
+        if not baseline_ids:
+            raise ValueError("baseline_ids must not be empty")
+        template = self.blast_radius_template(baseline_ids, min_coverage=min_coverage)
+        candidate = self._get_trace(candidate_id)
+        candidate_steps = self._semantic_trace_steps(candidate)
+
+        expected = template.get("expected_steps") or []
+        expected_keys = [str(s.get("key") or "") for s in expected]
+        expected_set = set(expected_keys)
+        expected_by_key = {str(s.get("key") or ""): s for s in expected}
+
+        transition_probs: dict[tuple[str, str], float] = {}
+        transition_counts: dict[tuple[str, str], int] = {}
+        for t in template.get("transitions") or []:
+            src = str(t.get("from") or "")
+            dst = str(t.get("to") or "")
+            transition_probs[(src, dst)] = float(t.get("probability") or 0.0)
+            transition_counts[(src, dst)] = int(t.get("count") or 0)
+
+        rows: list[dict[str, Any]] = []
+        deviations: list[dict[str, Any]] = []
+        max_len = max(len(expected), len(candidate_steps))
+
+        for idx in range(max_len):
+            exp = expected[idx] if idx < len(expected) else None
+            obs = candidate_steps[idx] if idx < len(candidate_steps) else None
+            exp_key = str((exp or {}).get("key") or "")
+            obs_key = str((obs or {}).get("key") or "")
+            status = "match"
+            reason = ""
+            severity = "info"
+
+            if exp and not obs:
+                status = "missing"
+                coverage = float(exp.get("coverage") or 0.0)
+                severity = "high" if coverage >= 0.8 else "medium"
+                reason = "Expected step missing from candidate trace"
+            elif obs and not exp:
+                status = "extra"
+                severity = "medium"
+                reason = "Candidate has additional step beyond trained template"
+            elif exp_key != obs_key:
+                status = "mismatch"
+                if obs_key in expected_set:
+                    severity = "medium"
+                    reason = "Known step occurred out-of-order"
+                else:
+                    severity = "high"
+                    reason = "Unexpected semantic step outside training baseline"
+
+            row = {
+                "index": idx,
+                "expected": exp,
+                "observed": obs,
+                "status": status,
+                "reason": reason,
+                "severity": severity,
+            }
+            rows.append(row)
+
+            if status != "match":
+                deviations.append(
+                    {
+                        "index": idx,
+                        "kind": status,
+                        "severity": severity,
+                        "reason": reason,
+                        "expected": exp,
+                        "observed": obs,
+                        "evidence": {
+                            "line_no": int((obs or {}).get("line_no") or 0),
+                            "source": str((obs or {}).get("source") or ""),
+                            "raw_type": str((obs or {}).get("raw_type") or ""),
+                        },
+                    }
+                )
+
+        # Transition-level anomalies capture process drift without exact syscall matching.
+        for i in range(len(candidate_steps) - 1):
+            a = str(candidate_steps[i].get("key") or "")
+            b = str(candidate_steps[i + 1].get("key") or "")
+            if not a or not b:
+                continue
+            if a not in expected_set or b not in expected_set:
+                continue
+            prob = transition_probs.get((a, b), 0.0)
+            cnt = transition_counts.get((a, b), 0)
+            if prob < 0.2 and cnt < 2:
+                deviations.append(
+                    {
+                        "index": i,
+                        "kind": "transition",
+                        "severity": "medium",
+                        "reason": "Rare transition between known stages",
+                        "expected": expected_by_key.get(a),
+                        "observed": {
+                            "from": candidate_steps[i],
+                            "to": candidate_steps[i + 1],
+                            "probability": prob,
+                        },
+                        "evidence": {
+                            "line_no": int(candidate_steps[i + 1].get("line_no") or 0),
+                            "source": str(candidate_steps[i + 1].get("source") or ""),
+                            "raw_type": str(candidate_steps[i + 1].get("raw_type") or ""),
+                        },
+                    }
+                )
+
+        deviation_score = min(100, int(round((len(deviations) / max(1, len(rows))) * 100)))
+        summary = {
+            "rows": len(rows),
+            "deviations": len(deviations),
+            "deviation_score": deviation_score,
+            "status": "deviating" if deviations else "aligned",
+        }
+
+        return {
+            "candidate_id": candidate_id,
+            "baseline_ids": baseline_ids,
+            "template": template,
+            "candidate_steps": candidate_steps,
+            "rows": rows,
+            "deviations": deviations,
+            "summary": summary,
+        }
+
 
 app = FastAPI(title="Agent System Observability Dashboard")
 
@@ -3379,6 +3732,34 @@ def taint_analysis(trace_id: str, trust_policy: str = "nondeterministic") -> dic
         return store.taint_analysis(trace_id, trust_policy=trust_policy)
     except KeyError:
         raise HTTPException(status_code=404, detail="Trace not found")
+
+
+@app.get("/api/blast-radius/template")
+def blast_radius_template(trace_ids: str, min_coverage: float = 0.6) -> dict[str, Any]:
+    ids = [t.strip() for t in trace_ids.split(",") if t.strip()]
+    if not ids:
+        raise HTTPException(status_code=400, detail="trace_ids is required")
+    try:
+        return store.blast_radius_template(ids, min_coverage=min_coverage)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Trace not found: {exc.args[0] if exc.args else 'unknown'}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/blast-radius/compare")
+def blast_radius_compare(candidate_id: str, baseline_ids: str, min_coverage: float = 0.6) -> dict[str, Any]:
+    baseline = [t.strip() for t in baseline_ids.split(",") if t.strip()]
+    if not candidate_id.strip():
+        raise HTTPException(status_code=400, detail="candidate_id is required")
+    if not baseline:
+        raise HTTPException(status_code=400, detail="baseline_ids is required")
+    try:
+        return store.blast_radius_compare(baseline, candidate_id.strip(), min_coverage=min_coverage)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Trace not found: {exc.args[0] if exc.args else 'unknown'}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.websocket("/ws")

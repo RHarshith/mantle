@@ -9,7 +9,13 @@ import sys
 import traceback
 
 from openai import OpenAI
-from agent_observability import build_event_sink
+
+try:
+    # Works when invoked as `python -m mantle_agent.cli_agent`.
+    from mantle_agent.agent_observability import build_event_sink
+except ImportError:
+    # Fallback for direct execution from inside mantle_agent/.
+    from agent_observability import build_event_sink
 # try:
 #     from langfuse.openai import OpenAI
 # except ImportError:
@@ -152,6 +158,55 @@ def run_command_exec(command: str, timeout: int = 60) -> str:
     return json.dumps(result)
 
 
+def _print_tool_execution(tool_name: str, tool_args: dict[str, object]) -> None:
+    print(f"tool> {tool_name}")
+    if tool_name == "command_exec":
+        command = str(tool_args.get("command") or "")
+        timeout = int(tool_args.get("timeout") or 60)
+        print(f"tool> command: {command}")
+        print(f"tool> timeout: {timeout}s")
+    elif tool_name == "python_exec":
+        code = str(tool_args.get("code") or "")
+        print("tool> python code:")
+        for line in code.splitlines()[:20]:
+            print(f"tool>   {line}")
+        if len(code.splitlines()) > 20:
+            print("tool>   ...")
+
+
+def _print_tool_result(tool_name: str, tool_result_raw: str) -> None:
+    try:
+        payload = json.loads(tool_result_raw)
+    except json.JSONDecodeError:
+        print(f"tool< {tool_result_raw}")
+        return
+
+    ok = bool(payload.get("ok", False))
+    status = "ok" if ok else "error"
+    print(f"tool< {tool_name} [{status}]")
+
+    stdout = str(payload.get("stdout") or "").strip()
+    stderr = str(payload.get("stderr") or "").strip()
+    error = str(payload.get("error") or "").strip()
+
+    if stdout:
+        print("tool< stdout:")
+        for line in stdout.splitlines()[:30]:
+            print(f"tool<   {line}")
+        if len(stdout.splitlines()) > 30:
+            print("tool<   ...")
+
+    if stderr:
+        print("tool< stderr:")
+        for line in stderr.splitlines()[:30]:
+            print(f"tool<   {line}")
+        if len(stderr.splitlines()) > 30:
+            print("tool<   ...")
+
+    if error and not stderr:
+        print(f"tool< error: {error}")
+
+
 def extract_assistant_payload(response) -> tuple[str, list[dict]]:
     message_obj = None
 
@@ -289,6 +344,9 @@ def run_single_turn(
         assistant_content, tool_calls = extract_assistant_payload(response)
         log_event(verbose, f"received response; tool_calls={len(tool_calls)}")
 
+        if assistant_content.strip():
+            print(f"assistant> {assistant_content.strip()}")
+
         assistant_message = {
             "role": "assistant",
             "content": assistant_content,
@@ -341,6 +399,7 @@ def run_single_turn(
                             "arguments": tool_args,
                         },
                     )
+                    _print_tool_execution(tool_name, tool_args)
 
                     # Safety: require explicit user approval before execution
                     if not prompt_user_approval(tool_name, tool_args, auto_approve=auto_approve):
@@ -406,6 +465,7 @@ def run_single_turn(
                         "content": tool_result,
                     }
                 )
+                _print_tool_result(tool_name, tool_result)
                 log_event(verbose, f"tool '{tool_name}' finished and result appended")
             continue
 
@@ -456,6 +516,10 @@ def main() -> None:
     cli_prompt = " ".join(args.prompt).strip()
     task_prompt = args.task
 
+    if task_prompt:
+        # Task mode is non-interactive automation; always bypass approval prompts.
+        auto_approve = True
+
     # ── Automated task mode ──────────────────────────────────────
     if task_prompt:
         log_event(verbose, "running automated task mode")
@@ -482,7 +546,6 @@ def main() -> None:
                 print(f"assistant> Request failed: {exc}")
                 break
             sink.emit("assistant_response", {"content": assistant_output.strip()})
-            print(f"assistant> {assistant_output.strip()}")
             # If the last response had no tool calls, agent is done
             last_msg = messages[-1] if messages else {}
             if last_msg.get("role") == "assistant" and not last_msg.get("tool_calls"):
@@ -515,8 +578,7 @@ def main() -> None:
         sink.emit("assistant_response", {"content": assistant_output.strip()})
         sink.emit("session_ended", {"reason": "oneshot_complete"})
         sink.close()
-        log_event(verbose, "printing assistant response")
-        print(f"assistant> {assistant_output.strip()}")
+        log_event(verbose, "assistant response already printed")
         return
 
     print("CLI agent started. Press Ctrl+C or Ctrl+D to stop.")
@@ -552,8 +614,7 @@ def main() -> None:
             continue
 
         sink.emit("assistant_response", {"content": assistant_output.strip()})
-        log_event(verbose, "printing assistant response")
-        print(f"assistant> {assistant_output.strip()}")
+        log_event(verbose, "assistant response already printed")
 
 
 if __name__ == "__main__":

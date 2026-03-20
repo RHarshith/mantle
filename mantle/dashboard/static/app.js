@@ -18,8 +18,9 @@ let selectedNodeId = null;
 let cachedTraceFiles = []; // trace-level files cache
 let cachedTraceTools = [];
 let currentSyscallMode = false; // true when showing syscall-only (no trajectory)
-let activeTab = "trace"; // "trace" | "taint"
+let activeTab = "trace"; // "trace" | "taint" | "blast"
 let taintReportCache = null;
+let selectedBlastBaselines = new Set();
 
 // ─── DOM refs ─────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
@@ -50,6 +51,7 @@ const fitBtn = $("fitBtn");
 const zoomDisplay = $("zoomDisplay");
 const traceTabBtn = $("traceTabBtn");
 const taintTabBtn = $("taintTabBtn");
+const blastTabBtn = $("blastTabBtn");
 
 const sumPromptsEl = $("sumPrompts");
 const sumToolsEl = $("sumTools");
@@ -147,9 +149,9 @@ function renderTools(tools) {
 
 function setActiveTab(tabName) {
   activeTab = tabName;
-  const isTrace = tabName === "trace";
-  traceTabBtn.classList.toggle("active", isTrace);
-  taintTabBtn.classList.toggle("active", !isTrace);
+  traceTabBtn.classList.toggle("active", tabName === "trace");
+  taintTabBtn.classList.toggle("active", tabName === "taint");
+  blastTabBtn.classList.toggle("active", tabName === "blast");
 }
 
 function setToolsExpanded(expanded) {
@@ -209,8 +211,10 @@ async function selectTrace(traceId) {
   renderTraceList(cachedTraces);
   if (activeTab === "trace") {
     await loadHighLevelGraph();
-  } else {
+  } else if (activeTab === "taint") {
     await loadTaintAnalysis();
+  } else {
+    await loadBlastAnalysis();
   }
   await loadTraceSummary();
 }
@@ -244,6 +248,16 @@ function updateSummaryCardsTaint(report) {
     <div class="summary-card"><div class="k">Warnings</div><div class="v">${counts.warning ?? 0}</div></div>
     <div class="summary-card"><div class="k">Info</div><div class="v">${counts.info ?? 0}</div></div>
     <div class="summary-card"><div class="k">Trust Policy</div><div class="v" style="font-size:13px;line-height:1.3;padding-top:6px;">${escapeHtml(report.trust_policy || "nondeterministic")}</div></div>`;
+}
+
+function updateSummaryCardsBlast(report) {
+  const summary = report.summary || {};
+  const strip = document.getElementById("summaryStrip");
+  strip.innerHTML = `
+    <div class="summary-card"><div class="k">Baselines</div><div class="v">${(report.baseline_ids || []).length}</div></div>
+    <div class="summary-card"><div class="k">Rows</div><div class="v">${summary.rows ?? 0}</div></div>
+    <div class="summary-card"><div class="k">Deviations</div><div class="v">${summary.deviations ?? 0}</div></div>
+    <div class="summary-card"><div class="k">Risk Score</div><div class="v">${summary.deviation_score ?? 0}</div></div>`;
 }
 
 // ─── Breadcrumbs ──────────────────────────────────────────────────
@@ -1350,6 +1364,114 @@ function renderTaintAnalysis(report) {
   graphCanvas.appendChild(wrap);
 }
 
+function ensureBlastBaselines() {
+  const traceIds = (cachedTraces || []).map((t) => t.trace_id).filter(Boolean);
+  const filtered = new Set();
+  for (const id of selectedBlastBaselines) {
+    if (traceIds.includes(id) && id !== selectedTraceId) filtered.add(id);
+  }
+  selectedBlastBaselines = filtered;
+
+  if (selectedBlastBaselines.size === 0) {
+    for (const id of traceIds) {
+      if (id !== selectedTraceId) selectedBlastBaselines.add(id);
+    }
+  }
+}
+
+function renderBlastAnalysis(report) {
+  graphCanvas.innerHTML = "";
+
+  const wrap = document.createElement("div");
+  wrap.className = "taint-wrap";
+
+  const controls = document.createElement("section");
+  controls.className = "taint-card";
+  const candidateOptions = (cachedTraces || [])
+    .map((t) => {
+      const selected = t.trace_id === selectedTraceId ? "selected" : "";
+      return `<option value="${escapeHtml(t.trace_id)}" ${selected}>${escapeHtml(t.trace_id)}</option>`;
+    })
+    .join("");
+  const options = (cachedTraces || [])
+    .filter((t) => t.trace_id !== selectedTraceId)
+    .map((t) => {
+      const checked = selectedBlastBaselines.has(t.trace_id) ? "checked" : "";
+      return `<label style="display:inline-flex;align-items:center;gap:6px;margin:4px 10px 4px 0;font-size:12px;color:var(--text-secondary);"><input type="checkbox" data-baseline-id="${escapeHtml(t.trace_id)}" ${checked}/> ${escapeHtml(t.trace_id)}</label>`;
+    })
+    .join("");
+
+  controls.innerHTML = `
+    <div class="taint-card-head">Blast Radius Controls <span class="tag">Candidate: ${escapeHtml(selectedTraceId || "-")}</span></div>
+    <div class="taint-card-body">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+        <label for="blastCandidateSelect" style="font-size:12px;color:var(--text-secondary);font-weight:600;">Candidate trace</label>
+        <select id="blastCandidateSelect" class="file-filter" style="margin:0;max-width:520px;display:block;">
+          ${candidateOptions}
+        </select>
+      </div>
+      <div style="font-size:12px;color:var(--text-secondary);margin-bottom:8px;">Choose baseline training traces used to build the semantic template.</div>
+      <div>${options || '<div class="taint-empty" style="padding:0;text-align:left;">No other traces available as baselines.</div>'}</div>
+    </div>`;
+  wrap.appendChild(controls);
+
+  const candidateSelect = controls.querySelector("#blastCandidateSelect");
+  if (candidateSelect) {
+    candidateSelect.addEventListener("change", async (ev) => {
+      const id = String(ev.target.value || "").trim();
+      if (!id || id === selectedTraceId) return;
+      await selectTrace(id);
+    });
+  }
+
+  controls.querySelectorAll("input[data-baseline-id]").forEach((el) => {
+    el.addEventListener("change", async (ev) => {
+      const id = ev.target.getAttribute("data-baseline-id");
+      if (!id) return;
+      if (ev.target.checked) selectedBlastBaselines.add(id);
+      else selectedBlastBaselines.delete(id);
+      await loadBlastAnalysis();
+    });
+  });
+
+  const deviations = report.deviations || [];
+  const rows = report.rows || [];
+
+  const card = document.createElement("section");
+  card.className = "taint-card";
+  let body = '<div class="taint-empty">No diff rows available.</div>';
+  if (rows.length > 0) {
+    body = `
+      <div class="taint-table-wrap">
+        <table class="taint-table">
+          <thead>
+            <tr><th>#</th><th>Status</th><th>Expected</th><th>Observed</th><th>Evidence</th></tr>
+          </thead>
+          <tbody>
+            ${rows.map((r) => {
+              const expected = r.expected?.label || r.expected?.key || "-";
+              const observed = r.observed?.label || r.observed?.key || "-";
+              const sev = r.severity || "info";
+              const statusCls = sev === "high" ? "sev-critical" : sev === "medium" ? "sev-warning" : "sev-info";
+              const evidence = r.observed ? `line ${Number(r.observed.line_no || 0)} · ${escapeHtml(String(r.observed.source || ""))}` : "-";
+              return `<tr>
+                <td>${Number(r.index) + 1}</td>
+                <td><span class="sev ${statusCls}">${escapeHtml(String(r.status || "match"))}</span></td>
+                <td>${escapeHtml(String(expected))}</td>
+                <td>${escapeHtml(String(observed))}<div class="muted" style="font-size:11px;margin-top:2px;">${escapeHtml(String(r.reason || ""))}</div></td>
+                <td>${evidence}</td>
+              </tr>`;
+            }).join("")}
+          </tbody>
+        </table>
+      </div>`;
+  }
+  card.innerHTML = `<div class="taint-card-head">Template Diff <span class="tag">${deviations.length} deviations</span></div><div class="taint-card-body">${body}</div>`;
+  wrap.appendChild(card);
+
+  graphCanvas.appendChild(wrap);
+}
+
 // ─── Loaders ──────────────────────────────────────────────────────
 async function loadHighLevelGraph() {
   if (!selectedTraceId) return;
@@ -1410,6 +1532,26 @@ async function loadTaintAnalysis() {
   renderTaintAnalysis(report);
 }
 
+async function loadBlastAnalysis() {
+  if (!selectedTraceId) return;
+  renderBreadcrumbs();
+  ensureBlastBaselines();
+  const baselineIds = Array.from(selectedBlastBaselines);
+  if (baselineIds.length === 0) {
+    graphCanvas.innerHTML = `<div class="empty-state"><h3>Not enough training traces</h3><p>Select at least one baseline trace to compare against <code>${escapeHtml(selectedTraceId)}</code>.</p></div>`;
+    updateSummaryCardsBlast({ baseline_ids: [], summary: { rows: 0, deviations: 0, deviation_score: 0 } });
+    return;
+  }
+  const params = new URLSearchParams({
+    candidate_id: selectedTraceId,
+    baseline_ids: baselineIds.join(","),
+  });
+  const report = await api(`/api/blast-radius/compare?${params.toString()}`);
+  currentSyscallMode = false;
+  updateSummaryCardsBlast(report);
+  renderBlastAnalysis(report);
+}
+
 async function loadTraceSummary() {
   if (!selectedTraceId) return;
   try {
@@ -1453,8 +1595,10 @@ async function refreshTraces(keepView = true, force = false) {
     } else if (currentMode === "process" && currentProcessPid) {
       await loadProcessGraph(currentProcessPid);
     }
-  } else {
+  } else if (activeTab === "taint") {
     await loadTaintAnalysis();
+  } else {
+    await loadBlastAnalysis();
   }
   await loadTraceSummary();
 }
@@ -1474,6 +1618,12 @@ async function init() {
     if (activeTab === "taint") return;
     setActiveTab("taint");
     await loadTaintAnalysis();
+    await loadTraceSummary();
+  });
+  blastTabBtn.addEventListener("click", async () => {
+    if (activeTab === "blast") return;
+    setActiveTab("blast");
+    await loadBlastAnalysis();
     await loadTraceSummary();
   });
 
