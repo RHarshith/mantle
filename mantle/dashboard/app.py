@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import bisect
 import heapq
 import json
 import os
@@ -71,6 +72,7 @@ class TraceState:
     process_parent: dict[int, int] = field(default_factory=dict)
     pid_fds: dict[tuple[int, int], dict[str, Any]] = field(default_factory=dict)  # (pid, fd) -> socket info
     mitm_endpoints: set[str] = field(default_factory=set)
+    mitm_intervals: list[tuple[float, float, str]] = field(default_factory=list)  # (start_ts, end_ts, host:port) sorted by start_ts
     sys_events: list[dict[str, Any]] = field(default_factory=list)
     agent_events: list[dict[str, Any]] = field(default_factory=list)
 
@@ -141,7 +143,11 @@ class TraceStore:
                 native_file_exists = any(
                     c.exists() for c in state.events_path_candidates
                 )
-                if not native_file_exists:
+                if native_file_exists:
+                    # Native events provide agent events; only extract
+                    # network interval data from MITM for proxy resolution.
+                    changed = self._tail_mitm_events(state, intervals_only=True) or changed
+                else:
                     changed = self._tail_mitm_events(state) or changed
 
         if changed:
@@ -207,8 +213,13 @@ class TraceStore:
                 return cand
         return None
 
-    def _tail_mitm_events(self, state: TraceState) -> bool:
-        """Parse mitmproxy capture JSONL into agent_events format."""
+    def _tail_mitm_events(self, state: TraceState, intervals_only: bool = False) -> bool:
+        """Parse mitmproxy capture JSONL into agent_events format.
+        
+        When intervals_only=True, only extract network endpoint / interval
+        data (for proxy resolution) without appending agent events (which
+        would duplicate events already provided by native event files).
+        """
         if not state.mitm_path or not state.mitm_path.exists():
             return False
 
@@ -552,175 +563,193 @@ class TraceStore:
                 sse_parsed["tool_calls"] = chat_fallback["tool_calls"]
             available_tools = _extract_available_tools(req_body)
 
-            seq += 1
-            state.agent_events.append(
-                {
-                    "ts": ts,
-                    "seq": seq,
-                    "event_type": "api_call",
-                    "payload": {
-                        "endpoint": endpoint,
-                        "method": record.get("method", "POST"),
-                        "model": model,
-                        "duration_ms": duration_ms,
-                        "status_code": status_code,
-                        "reasoning": (req_body.get("reasoning") or {}).get("effort"),
-                        "available_tools": available_tools,
-                    },
-                    "_source": "mitm",
-                }
-            )
-
-            instructions = req_body.get("instructions")
-            if isinstance(instructions, str) and instructions.strip():
+            if not intervals_only:
                 seq += 1
                 state.agent_events.append(
                     {
                         "ts": ts,
                         "seq": seq,
-                        "event_type": "system_instruction",
+                        "event_type": "api_call",
                         "payload": {
-                            "content": instructions,
-                        },
-                        "_source": "mitm",
-                    }
-                )
-
-            user_prompts = _extract_user_prompts(messages)
-            if user_prompts:
-                seq += 1
-                state.agent_events.append(
-                    {
-                        "ts": ts,
-                        "seq": seq,
-                        "event_type": "user_prompt_batch",
-                        "payload": {
-                            "prompts": user_prompts,
-                            "count": len(user_prompts),
-                        },
-                        "_source": "mitm",
-                    }
-                )
-
-            if sse_parsed.get("reasoning_summary"):
-                seq += 1
-                state.agent_events.append(
-                    {
-                        "ts": ts,
-                        "seq": seq,
-                        "event_type": "reasoning_summary",
-                        "payload": {
-                            "content": sse_parsed.get("reasoning_summary", ""),
-                        },
-                        "_source": "mitm",
-                    }
-                )
-
-            # Some turns return tool_calls with empty assistant content.
-            # Emit one assistant_response node so the first tool-calling response
-            # is visible in the high-level graph without duplicating nodes.
-            if not sse_parsed.get("assistant_messages") and sse_parsed.get("tool_calls"):
-                calls = sse_parsed.get("tool_calls") or []
-                names = [str(c.get("tool_name") or "tool") for c in calls if c.get("tool_name")]
-                preview = ", ".join(names[:3]) if names else "tool"
-                if len(names) > 3:
-                    preview = f"{preview}, +{len(names) - 3} more"
-                seq += 1
-                state.agent_events.append(
-                    {
-                        "ts": ts,
-                        "seq": seq,
-                        "event_type": "assistant_response",
-                        "payload": {
-                            "content": f"Calling tool: {preview}",
-                            "phase": "tool_call",
+                            "endpoint": endpoint,
+                            "method": record.get("method", "POST"),
                             "model": model,
-                            "tool_calls": calls,
-                            "tool_results": [],
+                            "duration_ms": duration_ms,
+                            "status_code": status_code,
+                            "reasoning": (req_body.get("reasoning") or {}).get("effort"),
+                            "available_tools": available_tools,
                         },
                         "_source": "mitm",
                     }
                 )
 
-            for tool_start in sse_parsed.get("tool_calls", []):
-                seq += 1
-                state.agent_events.append(
-                    {
-                        "ts": ts,
-                        "seq": seq,
-                        "event_type": "tool_call_started",
-                        "payload": {
-                            "tool_call_id": tool_start.get("tool_call_id") or f"mitm_tc_{seq}",
-                            "tool_name": tool_start.get("tool_name") or "unknown",
-                            "arguments": tool_start.get("arguments") or {},
-                        },
-                        "_source": "mitm",
-                    }
-                )
-
-            # Deduplicate and emit tool results from previous turns
-            # Supports both Chat Completions API (role=tool) and
-            # Responses API (type=function_call_output)
-            emitted_tool_results = {e["payload"]["tool_call_id"] for e in state.agent_events if e.get("event_type") == "tool_call_finished"}
-            for msg in messages:
-                # Chat Completions format: role=tool, tool_call_id, content
-                is_tool_chat = msg.get("role") == "tool"
-                # Responses API format: type=function_call_output, call_id, output
-                is_tool_resp = msg.get("type") == "function_call_output"
-
-                if not (is_tool_chat or is_tool_resp):
-                    continue
-
-                tid = msg.get("tool_call_id") or msg.get("call_id", "")
-                if not tid or tid in emitted_tool_results:
-                    continue
-
-                emitted_tool_results.add(tid)
-                raw_content = msg.get("content", msg.get("output", ""))
-                tool_content = _get_string_content(raw_content)
+            # Build interval mapping: BPF traffic for this MITM call occurred
+            # between [response_ts - duration, response_ts].  We store these
+            # sorted intervals so _with_inferred_net_dest can binary-search.
+            if endpoint and ts > 0:
                 try:
-                    result = json.loads(tool_content)
-                except (json.JSONDecodeError, TypeError):
-                    result = {"output": tool_content}
+                    pu = urlparse(str(endpoint))
+                    ihost = pu.hostname or ""
+                    if ihost:
+                        iport = pu.port or (443 if pu.scheme == "https" else 80)
+                        dest_label = f"{ihost}:{iport}"
+                        dur_s = (float(duration_ms) / 1000.0) if duration_ms else 5.0
+                        start_ts = ts - dur_s
+                        state.mitm_intervals.append((start_ts, ts, dest_label))
+                except Exception:
+                    pass
 
-                # Try to find the tool name from a matching function_call item
-                tool_name = "unknown"
-                for m2 in messages:
-                    if m2.get("type") == "function_call" and m2.get("call_id") == tid:
-                        tool_name = m2.get("name", "unknown")
-                        break
+            if not intervals_only:
+                instructions = req_body.get("instructions")
+                if isinstance(instructions, str) and instructions.strip():
+                    seq += 1
+                    state.agent_events.append(
+                        {
+                            "ts": ts,
+                            "seq": seq,
+                            "event_type": "system_instruction",
+                            "payload": {
+                                "content": instructions,
+                            },
+                            "_source": "mitm",
+                        }
+                    )
 
-                seq += 1
-                state.agent_events.append({
-                    "ts": ts,
-                    "seq": seq,
-                    "event_type": "tool_call_finished",
-                    "payload": {
-                        "tool_call_id": tid,
-                        "tool_name": tool_name,
-                        "duration_ms": duration_ms,
-                        "result": result,
-                    },
-                    "_source": "mitm",
-                })
+                user_prompts = _extract_user_prompts(messages)
+                if user_prompts:
+                    seq += 1
+                    state.agent_events.append(
+                        {
+                            "ts": ts,
+                            "seq": seq,
+                            "event_type": "user_prompt_batch",
+                            "payload": {
+                                "prompts": user_prompts,
+                                "count": len(user_prompts),
+                            },
+                            "_source": "mitm",
+                        }
+                    )
 
-            for assistant_msg in sse_parsed.get("assistant_messages", []):
-                seq += 1
-                state.agent_events.append(
-                    {
+                if sse_parsed.get("reasoning_summary"):
+                    seq += 1
+                    state.agent_events.append(
+                        {
+                            "ts": ts,
+                            "seq": seq,
+                            "event_type": "reasoning_summary",
+                            "payload": {
+                                "content": sse_parsed.get("reasoning_summary", ""),
+                            },
+                            "_source": "mitm",
+                        }
+                    )
+
+                # Some turns return tool_calls with empty assistant content.
+                # Emit one assistant_response node so the first tool-calling response
+                # is visible in the high-level graph without duplicating nodes.
+                if not sse_parsed.get("assistant_messages") and sse_parsed.get("tool_calls"):
+                    calls = sse_parsed.get("tool_calls") or []
+                    names = [str(c.get("tool_name") or "tool") for c in calls if c.get("tool_name")]
+                    preview = ", ".join(names[:3]) if names else "tool"
+                    if len(names) > 3:
+                        preview = f"{preview}, +{len(names) - 3} more"
+                    seq += 1
+                    state.agent_events.append(
+                        {
+                            "ts": ts,
+                            "seq": seq,
+                            "event_type": "assistant_response",
+                            "payload": {
+                                "content": f"Calling tool: {preview}",
+                                "phase": "tool_call",
+                                "model": model,
+                                "tool_calls": calls,
+                                "tool_results": [],
+                            },
+                            "_source": "mitm",
+                        }
+                    )
+
+                for tool_start in sse_parsed.get("tool_calls", []):
+                    seq += 1
+                    state.agent_events.append(
+                        {
+                            "ts": ts,
+                            "seq": seq,
+                            "event_type": "tool_call_started",
+                            "payload": {
+                                "tool_call_id": tool_start.get("tool_call_id") or f"mitm_tc_{seq}",
+                                "tool_name": tool_start.get("tool_name") or "unknown",
+                                "arguments": tool_start.get("arguments") or {},
+                            },
+                            "_source": "mitm",
+                        }
+                    )
+
+                # Deduplicate and emit tool results from previous turns
+                # Supports both Chat Completions API (role=tool) and
+                # Responses API (type=function_call_output)
+                emitted_tool_results = {e["payload"]["tool_call_id"] for e in state.agent_events if e.get("event_type") == "tool_call_finished"}
+                for msg in messages:
+                    # Chat Completions format: role=tool, tool_call_id, content
+                    is_tool_chat = msg.get("role") == "tool"
+                    # Responses API format: type=function_call_output, call_id, output
+                    is_tool_resp = msg.get("type") == "function_call_output"
+
+                    if not (is_tool_chat or is_tool_resp):
+                        continue
+
+                    tid = msg.get("tool_call_id") or msg.get("call_id", "")
+                    if not tid or tid in emitted_tool_results:
+                        continue
+
+                    emitted_tool_results.add(tid)
+                    raw_content = msg.get("content", msg.get("output", ""))
+                    tool_content = _get_string_content(raw_content)
+                    try:
+                        result = json.loads(tool_content)
+                    except (json.JSONDecodeError, TypeError):
+                        result = {"output": tool_content}
+
+                    # Try to find the tool name from a matching function_call item
+                    tool_name = "unknown"
+                    for m2 in messages:
+                        if m2.get("type") == "function_call" and m2.get("call_id") == tid:
+                            tool_name = m2.get("name", "unknown")
+                            break
+
+                    seq += 1
+                    state.agent_events.append({
                         "ts": ts,
                         "seq": seq,
-                        "event_type": "assistant_response",
+                        "event_type": "tool_call_finished",
                         "payload": {
-                            "content": assistant_msg.get("content", ""),
-                            "phase": assistant_msg.get("phase"),
-                            "model": model,
-                            "tool_calls": sse_parsed.get("tool_calls") or [],
-                            "tool_results": tool_results_for_turn,
+                            "tool_call_id": tid,
+                            "tool_name": tool_name,
+                            "duration_ms": duration_ms,
+                            "result": result,
                         },
                         "_source": "mitm",
-                    }
-                )
+                    })
+
+                for assistant_msg in sse_parsed.get("assistant_messages", []):
+                    seq += 1
+                    state.agent_events.append(
+                        {
+                            "ts": ts,
+                            "seq": seq,
+                            "event_type": "assistant_response",
+                            "payload": {
+                                "content": assistant_msg.get("content", ""),
+                                "phase": assistant_msg.get("phase"),
+                                "model": model,
+                                "tool_calls": sse_parsed.get("tool_calls") or [],
+                                "tool_results": tool_results_for_turn,
+                            },
+                            "_source": "mitm",
+                        }
+                    )
 
         state.mitm_offset = new_offset
         return True
@@ -903,7 +932,9 @@ class TraceStore:
         inferred = str(event.get("inferred_dest") or "").strip()
 
         if inferred:
-            base = f"{dest} -> {inferred}"
+            # Show only the resolved destination — the proxy address
+            # (e.g. 127.0.0.1:8899) is an implementation detail.
+            base = inferred
             if transport and transport != "other":
                 return f"{transport} {base}"
             return base
@@ -928,42 +959,69 @@ class TraceStore:
             return enriched
 
         def _best_endpoint_for_event_ts(ts: float) -> str:
-            candidates: list[tuple[float, str]] = []
-            for agent_event in trace.agent_events:
-                if str(agent_event.get("event_type") or "") != "api_call":
-                    continue
-                payload = agent_event.get("payload") or {}
-                endpoint = str(payload.get("endpoint") or "")
-                if not endpoint:
-                    continue
-                try:
-                    parsed = urlparse(endpoint)
-                    host = parsed.hostname or ""
-                    if not host:
-                        continue
-                    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-                    dest_label = f"{host}:{port}"
-                except Exception:
-                    continue
-                evt_ts = float(agent_event.get("ts") or 0.0)
-                if evt_ts <= 0 or ts <= 0:
-                    continue
-                candidates.append((abs(evt_ts - ts), dest_label))
+            """Map a BPF timestamp to the MITM call whose active interval
+            contains it.  Falls back to nearest interval within 2 s, then
+            to global MITM endpoints."""
+            if ts <= 0:
+                # No usable timestamp — fall back to global endpoints
+                non_llm = sorted(
+                    ep for ep in trace.mitm_endpoints if ep.split(":", 1)[0] not in KNOWN_LLM_HOSTS
+                )
+                return non_llm[0] if non_llm else sorted(trace.mitm_endpoints)[0]
 
-            if candidates:
-                candidates.sort(key=lambda x: x[0])
-                near = [dest for dist, dest in candidates if dist <= 10.0]
-                if near:
-                    non_llm = [d for d in near if d.split(":", 1)[0] not in KNOWN_LLM_HOSTS]
-                    if non_llm:
-                        return non_llm[0]
-                    return near[0]
+            intervals = trace.mitm_intervals
+            if not intervals:
+                # No interval data yet — fall back to global endpoints
+                non_llm = sorted(
+                    ep for ep in trace.mitm_endpoints if ep.split(":", 1)[0] not in KNOWN_LLM_HOSTS
+                )
+                return non_llm[0] if non_llm else sorted(trace.mitm_endpoints)[0]
 
-            non_llm_global = sorted(
+            # Ensure intervals are sorted by start_ts for binary search
+            # (they are appended in chronological order during ingestion,
+            #  but sort defensively on first use).
+            if not hasattr(trace, '_mitm_intervals_sorted'):
+                trace.mitm_intervals.sort(key=lambda x: x[0])
+                trace._mitm_intervals_sorted = True  # type: ignore[attr-defined]
+
+            # Binary search: find intervals that could contain `ts`.
+            # An interval (s, e, label) contains ts if s <= ts <= e.
+            # Use bisect on start_ts to narrow the search window.
+            start_keys = [iv[0] for iv in intervals]
+            # All intervals starting at or before ts could contain it
+            right = bisect.bisect_right(start_keys, ts)
+
+            best_match: str | None = None
+            best_dist = float("inf")
+
+            # Check a small window of intervals around the insertion point
+            # that could overlap with ts.  We look back further because an
+            # interval starting well before `ts` may still contain it if it
+            # has a long duration.
+            search_range = range(max(0, right - 5), min(len(intervals), right + 2))
+            for i in search_range:
+                s, e, label = intervals[i]
+                if s <= ts <= e:
+                    # Exact containment — prefer this
+                    if best_match is None or (label.split(":", 1)[0] not in KNOWN_LLM_HOSTS):
+                        best_match = label
+                        best_dist = 0
+                else:
+                    # Near miss — track closest within 2s tolerance
+                    d = min(abs(ts - s), abs(ts - e))
+                    if d < best_dist and d <= 2.0:
+                        best_dist = d
+                        best_match = label
+
+            if best_match:
+                return best_match
+
+            # Nothing within 2s — fall back to global MITM endpoints
+            non_llm = sorted(
                 ep for ep in trace.mitm_endpoints if ep.split(":", 1)[0] not in KNOWN_LLM_HOSTS
             )
-            if non_llm_global:
-                return non_llm_global[0]
+            if non_llm:
+                return non_llm[0]
             return sorted(trace.mitm_endpoints)[0]
 
         # Map proxy-local traffic to known MITM upstream endpoints so users can
@@ -1646,7 +1704,7 @@ class TraceStore:
                     flush_file_run()
                     continue
 
-                if et in {"file_read", "file_write"}:
+                if et in {"file_read", "file_write", "file_delete", "file_rename"}:
                     if file_run and int(file_run[0].get("pid", 0)) != pid:
                         flush_file_run()
                     file_run.append(event)
@@ -2398,7 +2456,8 @@ class TraceStore:
             if not parts:
                 continue
 
-            op = "write" if str(event.get("type") or "") == "file_write" else "read"
+            raw_type = str(event.get("type") or "")
+            op = raw_type.replace("file_", "") if raw_type.startswith("file_") else "read"
             node = root
             for seg in parts[:-1]:
                 children = node.setdefault("children", {})
