@@ -139,6 +139,80 @@ def _build_file_authorship(sys_events: list[dict[str, Any]]) -> set[str]:
     return written
 
 
+def _tool_window_scoped_sys_events(
+    sys_events: list[dict[str, Any]],
+    agent_events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return syscall events that happened during agent tool execution windows.
+
+    This removes startup/runtime background noise so taint analysis focuses on
+    user-actionable operations performed by tool calls.
+    """
+    starts: dict[str, float] = {}
+    windows: list[tuple[float, float]] = []
+
+    sorted_agent = sorted(agent_events, key=lambda e: (e.get("ts", 0), e.get("seq", 0)))
+    for event in sorted_agent:
+        et = str(event.get("event_type") or "")
+        payload = event.get("payload") or {}
+        tool_call_id = str(payload.get("tool_call_id") or "")
+        ts = float(event.get("ts") or 0.0)
+        if not tool_call_id or ts <= 0:
+            continue
+
+        if et == "tool_call_started":
+            starts[tool_call_id] = ts
+            continue
+
+        if et != "tool_call_finished":
+            continue
+
+        start_ts = starts.pop(tool_call_id, 0.0)
+        if start_ts <= 0:
+            duration_ms = float(payload.get("duration_ms") or 0.0)
+            start_ts = ts - (duration_ms / 1000.0) if duration_ms > 0 else (ts - 3.0)
+
+        if start_ts > ts:
+            start_ts, ts = ts, start_ts
+        windows.append((start_ts, ts))
+
+    if not windows:
+        return []
+
+    merged: list[list[float]] = []
+    for start, end in sorted(windows, key=lambda w: w[0]):
+        if not merged or start > merged[-1][1] + 0.2:
+            merged.append([start, end])
+            continue
+        merged[-1][1] = max(merged[-1][1], end)
+
+    scoped: list[dict[str, Any]] = []
+    allowed_types = {
+        "file_read",
+        "file_write",
+        "file_delete",
+        "file_rename",
+        "net_connect",
+        "net_send",
+        "net_recv",
+        "command_exec",
+    }
+
+    for ev in sorted(sys_events, key=lambda e: (e.get("ts", 0), e.get("line_no", 0))):
+        et = str(ev.get("type") or "")
+        if et not in allowed_types:
+            continue
+        ts = float(ev.get("ts") or 0.0)
+        if ts <= 0:
+            continue
+        # Small slack to include edge events around start/finish boundaries.
+        in_window = any((start - 0.1) <= ts <= (end + 0.6) for start, end in merged)
+        if in_window:
+            scoped.append(ev)
+
+    return scoped
+
+
 # ── Phase 2: Forward propagation over agent events ──────────────────
 
 
@@ -514,8 +588,12 @@ def run_taint_analysis(
     state = _TaintState()
     state.mitm_endpoints = mitm_endpoints or set()
 
+    # Focus analysis on syscalls that occurred during tool execution windows.
+    # This removes background interpreter/runtime noise from taint propagation.
+    scoped_sys_events = _tool_window_scoped_sys_events(sys_events, agent_events)
+
     # Phase 1: File authorship.
-    state.agent_created_files = _build_file_authorship(sys_events)
+    state.agent_created_files = _build_file_authorship(scoped_sys_events)
 
     # Phase 2: Forward propagation over agent events.
     sorted_events = sorted(agent_events, key=lambda e: (e.get("ts", 0), e.get("seq", 0)))
@@ -531,11 +609,11 @@ def run_taint_analysis(
             _check_network_exfiltration(state, event)
 
         elif event_type == "tool_call_finished":
-            _check_tool_result_taint(state, event, sys_events, trust_policy)
-            _check_external_api_source(state, event, sys_events)
+            _check_tool_result_taint(state, event, scoped_sys_events, trust_policy)
+            _check_external_api_source(state, event, scoped_sys_events)
 
     # Check BPF-level file write sinks.
-    _check_file_write_sink(state, sys_events)
+    _check_file_write_sink(state, scoped_sys_events)
 
     # Phase 3: Report.
     tainted_entities = []

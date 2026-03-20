@@ -15,6 +15,8 @@ from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from mantle.taint_engine import run_taint_analysis
+from mantle.taint_rules import TrustPolicy
 
 LINE_RE = re.compile(r"^(?P<pid>\d+)\s+(?P<syscall>[a-zA-Z0-9_]+)\((?P<args>.*)\)\s+=\s+(?P<ret>.+)$")
 UNFINISHED_RE = re.compile(r"^(?P<pid>\d+)\s+(?P<syscall>[a-zA-Z0-9_]+)\((?P<args>.*)\s+<unfinished \.\.\.>$")
@@ -39,6 +41,17 @@ SYSTEM_PREFIXES = (
     "/var/lib/",
     "/var/cache/",
 )
+
+KNOWN_LLM_HOSTS = {
+    "api.openai.com",
+    "chat-api.tamu.ai",
+    "api.anthropic.com",
+    "generativelanguage.googleapis.com",
+    "api.together.xyz",
+    "api.groq.com",
+    "api.mistral.ai",
+    "api.deepseek.com",
+}
 
 
 @dataclass
@@ -887,13 +900,15 @@ class TraceStore:
         dest = str(event.get("dest") or "unknown")
         transport = str(event.get("transport") or "").strip()
         family = str(event.get("family") or "").strip()
+        inferred = str(event.get("inferred_dest") or "").strip()
+
+        if inferred:
+            base = f"{dest} -> {inferred}"
+            if transport and transport != "other":
+                return f"{transport} {base}"
+            return base
 
         if dest.startswith("fd="):
-            inferred = str(event.get("inferred_dest") or "").strip()
-            if inferred:
-                if transport and transport != "other":
-                    return f"{transport} {inferred} (inferred)"
-                return f"{inferred} (inferred)"
             if transport:
                 return f"{transport} unresolved ({dest})"
             if family:
@@ -909,9 +924,80 @@ class TraceStore:
     def _with_inferred_net_dest(self, trace: TraceState, event: dict[str, Any]) -> dict[str, Any]:
         enriched = dict(event)
         dest = str(enriched.get("dest") or "")
-        if dest.startswith("fd=") and trace.mitm_endpoints and not enriched.get("inferred_dest"):
-            enriched["inferred_dest"] = sorted(trace.mitm_endpoints)[0]
+        if not trace.mitm_endpoints or enriched.get("inferred_dest"):
+            return enriched
+
+        def _best_endpoint_for_event_ts(ts: float) -> str:
+            candidates: list[tuple[float, str]] = []
+            for agent_event in trace.agent_events:
+                if str(agent_event.get("event_type") or "") != "api_call":
+                    continue
+                payload = agent_event.get("payload") or {}
+                endpoint = str(payload.get("endpoint") or "")
+                if not endpoint:
+                    continue
+                try:
+                    parsed = urlparse(endpoint)
+                    host = parsed.hostname or ""
+                    if not host:
+                        continue
+                    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+                    dest_label = f"{host}:{port}"
+                except Exception:
+                    continue
+                evt_ts = float(agent_event.get("ts") or 0.0)
+                if evt_ts <= 0 or ts <= 0:
+                    continue
+                candidates.append((abs(evt_ts - ts), dest_label))
+
+            if candidates:
+                candidates.sort(key=lambda x: x[0])
+                near = [dest for dist, dest in candidates if dist <= 10.0]
+                if near:
+                    non_llm = [d for d in near if d.split(":", 1)[0] not in KNOWN_LLM_HOSTS]
+                    if non_llm:
+                        return non_llm[0]
+                    return near[0]
+
+            non_llm_global = sorted(
+                ep for ep in trace.mitm_endpoints if ep.split(":", 1)[0] not in KNOWN_LLM_HOSTS
+            )
+            if non_llm_global:
+                return non_llm_global[0]
+            return sorted(trace.mitm_endpoints)[0]
+
+        # Map proxy-local traffic to known MITM upstream endpoints so users can
+        # see where traffic really went (for example git clone -> github.com:443).
+        proxy_dests = {"127.0.0.1:8899", "127.0.0.1:8898", "localhost:8899", "localhost:8898"}
+        if dest.startswith("fd=") or dest in proxy_dests:
+            enriched["inferred_dest"] = _best_endpoint_for_event_ts(float(event.get("ts") or 0.0))
         return enriched
+
+    def _command_network_targets(self, command: str) -> list[str]:
+        targets: list[str] = []
+        if not command:
+            return targets
+
+        # URLs like https://github.com/org/repo.git
+        for m in re.finditer(r"https?://([^\s/:]+)(?::(\d+))?", command):
+            host = m.group(1)
+            port = int(m.group(2)) if m.group(2) else (443 if command[m.start():].startswith("https://") else 80)
+            targets.append(f"{host}:{port}")
+
+        # SSH-style git remotes: git@github.com:org/repo.git
+        for m in re.finditer(r"git@([^\s:]+):", command):
+            host = m.group(1)
+            targets.append(f"{host}:22")
+
+        # Keep order while de-duplicating.
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for t in targets:
+            if t in seen:
+                continue
+            seen.add(t)
+            uniq.append(t)
+        return uniq
 
     def _handle_syscall(self, state: TraceState, pid: int, syscall: str, args: str, ret: str) -> bool:
         if state.root_pid is None and syscall == "execve":
@@ -2812,6 +2898,30 @@ class TraceStore:
                 err = str(net_event.get("error") or "")
                 if err:
                     bucket["errors"].add(err)
+
+        # Add command-derived network intents (for example git clone URLs) when
+        # kernel-level connect destination is masked by local proxy forwarding.
+        for event in t.sys_events:
+            if str(event.get("type") or "") != "command_exec":
+                continue
+            command = str(event.get("command") or "")
+            for dest in self._command_network_targets(command):
+                key = (f"{dest} [cmd]", "command")
+                bucket = net_agg.setdefault(
+                    key,
+                    {
+                        "dest": f"{dest} [cmd]",
+                        "ops": set(),
+                        "bytes": 0,
+                        "count": 0,
+                        "transport": "command",
+                        "family": "inferred",
+                        "failed": 0,
+                        "errors": set(),
+                    },
+                )
+                bucket["ops"].add("connect")
+                bucket["count"] += 1
         net_endpoints = [
             {
                 "dest": v["dest"],
@@ -2825,7 +2935,7 @@ class TraceStore:
             }
             for v in net_agg.values()
         ]
-        net_endpoints.sort(key=lambda x: (-x["count"], x["dest"]))
+        net_endpoints.sort(key=lambda x: (0 if x.get("transport") == "command" else 1, -x["count"], x["dest"]))
 
         return {
             "trace_id": trace_id,
@@ -2960,6 +3070,30 @@ class TraceStore:
                 err = str(net_event.get("error") or "")
                 if err:
                     bucket["errors"].add(err)
+
+        for event in related:
+            if not _event_relevant(event):
+                continue
+            if str(event.get("type") or "") != "command_exec":
+                continue
+            command = str(event.get("command") or "")
+            for dest in self._command_network_targets(command):
+                key = (f"{dest} [cmd]", "command")
+                bucket = net_agg.setdefault(
+                    key,
+                    {
+                        "dest": f"{dest} [cmd]",
+                        "ops": set(),
+                        "bytes": 0,
+                        "count": 0,
+                        "transport": "command",
+                        "family": "inferred",
+                        "failed": 0,
+                        "errors": set(),
+                    },
+                )
+                bucket["ops"].add("connect")
+                bucket["count"] += 1
         net_endpoints = [
             {
                 "dest": v["dest"],
@@ -2973,7 +3107,7 @@ class TraceStore:
             }
             for v in net_agg.values()
         ]
-        net_endpoints.sort(key=lambda x: (-x["count"], x["dest"]))
+        net_endpoints.sort(key=lambda x: (0 if x.get("transport") == "command" else 1, -x["count"], x["dest"]))
 
         return {
             "tool_call_id": tool_call_id,
@@ -2981,6 +3115,25 @@ class TraceStore:
             "network": net_endpoints,
             "totals": {"unique_files": len(files), "network_endpoints": len(net_endpoints), "events": len(related)},
         }
+
+    def taint_analysis(self, trace_id: str, trust_policy: str = "nondeterministic") -> dict[str, Any]:
+        t = self._get_trace(trace_id)
+
+        policy = (
+            TrustPolicy.TRUST_EXTERNAL_FILES
+            if trust_policy == TrustPolicy.TRUST_EXTERNAL_FILES.value
+            else TrustPolicy.NONDETERMINISTIC_EXTERNAL_FILES
+        )
+
+        report = run_taint_analysis(
+            sys_events=t.sys_events,
+            agent_events=t.agent_events,
+            trust_policy=policy,
+            mitm_endpoints=t.mitm_endpoints,
+        )
+        payload = report.to_dict()
+        payload["trace_id"] = trace_id
+        return payload
 
 
 app = FastAPI(title="Agent System Observability Dashboard")
@@ -3004,9 +3157,13 @@ def _resolve_paths() -> tuple[Path, Path]:
     if env_trace and env_events:
         return Path(env_trace).expanduser(), Path(env_events).expanduser()
 
-    repo_root = Path(__file__).resolve().parent.parent
+    # app.py lives at <repo>/mantle/dashboard/app.py, so repo root is 3 levels up.
+    repo_root = Path(__file__).resolve().parents[2]
+    obs_root_env = os.getenv("AGENT_OBS_ROOT", "").strip()
+    obs_root = Path(obs_root_env).expanduser() if obs_root_env else (repo_root / "obs")
 
     candidate_pairs = [
+        (obs_root / "traces", obs_root / "events"),
         (
             Path("~/shared/mantle/obs/traces").expanduser(),
             Path("~/shared/mantle/obs/events").expanduser(),
@@ -3015,7 +3172,6 @@ def _resolve_paths() -> tuple[Path, Path]:
             Path("~/ubuntu_shared/mantle/obs/traces").expanduser(),
             Path("~/ubuntu_shared/mantle/obs/events").expanduser(),
         ),
-        (repo_root / "obs" / "traces", repo_root / "obs" / "events"),
     ]
 
     best_pair = candidate_pairs[-1]
@@ -3051,15 +3207,40 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 @app.on_event("startup")
 async def startup() -> None:
+    stop_event = asyncio.Event()
+    app.state.poll_stop_event = stop_event
+
     async def _poll_loop() -> None:
-        while True:
+        while not stop_event.is_set():
             try:
                 await store.poll_once()
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 pass
-            await asyncio.sleep(1.0)
 
-    asyncio.create_task(_poll_loop())
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+
+    app.state.poll_task = asyncio.create_task(_poll_loop(), name="mantle-dashboard-poll")
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    stop_event = getattr(app.state, "poll_stop_event", None)
+    poll_task = getattr(app.state, "poll_task", None)
+
+    if stop_event is not None:
+        stop_event.set()
+
+    if poll_task is not None and not poll_task.done():
+        poll_task.cancel()
+        try:
+            await poll_task
+        except asyncio.CancelledError:
+            pass
 
 
 @app.get("/")
@@ -3131,6 +3312,14 @@ def tool_summary(trace_id: str, tool_call_id: str) -> dict[str, Any]:
         return store.tool_summary(trace_id, tool_call_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Trace or tool call not found")
+
+
+@app.get("/api/traces/{trace_id}/taint-analysis")
+def taint_analysis(trace_id: str, trust_policy: str = "nondeterministic") -> dict[str, Any]:
+    try:
+        return store.taint_analysis(trace_id, trust_policy=trust_policy)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Trace not found")
 
 
 @app.websocket("/ws")

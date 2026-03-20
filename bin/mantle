@@ -37,6 +37,7 @@ EOF
 
 serve_cmd() {
     local host port obs_root python_bin
+    local cli_obs_root repo_obs_root env_obs_root env_score repo_score
 
     if [[ -f "/.dockerenv" ]]; then
         host="0.0.0.0"
@@ -44,7 +45,10 @@ serve_cmd() {
         host="127.0.0.1"
     fi
     port="8099"
-    obs_root="${AGENT_OBS_ROOT:-$REPO_ROOT/obs}"
+    cli_obs_root=""
+    repo_obs_root="$REPO_ROOT/obs"
+    env_obs_root="${AGENT_OBS_ROOT:-}"
+    obs_root="$repo_obs_root"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -57,7 +61,7 @@ serve_cmd() {
                 shift 2
                 ;;
             --obs-root)
-                obs_root="$2"
+                cli_obs_root="$2"
                 shift 2
                 ;;
             -h|--help|help)
@@ -71,6 +75,34 @@ serve_cmd() {
                 ;;
         esac
     done
+
+    # --obs-root should always win. Otherwise, guard against stale AGENT_OBS_ROOT
+    # values left behind after repository moves/renames.
+    if [[ -n "$cli_obs_root" ]]; then
+        obs_root="$cli_obs_root"
+    elif [[ -n "$env_obs_root" ]]; then
+        env_score=0
+        repo_score=0
+        if [[ -d "$env_obs_root/traces" ]]; then
+            env_score=$((env_score + $(find "$env_obs_root/traces" -maxdepth 1 -type f -name '*.ebpf.jsonl' 2>/dev/null | wc -l)))
+        fi
+        if [[ -d "$env_obs_root/events" ]]; then
+            env_score=$((env_score + $(find "$env_obs_root/events" -maxdepth 1 -type f -name '*.events.jsonl' 2>/dev/null | wc -l)))
+        fi
+        if [[ -d "$repo_obs_root/traces" ]]; then
+            repo_score=$((repo_score + $(find "$repo_obs_root/traces" -maxdepth 1 -type f -name '*.ebpf.jsonl' 2>/dev/null | wc -l)))
+        fi
+        if [[ -d "$repo_obs_root/events" ]]; then
+            repo_score=$((repo_score + $(find "$repo_obs_root/events" -maxdepth 1 -type f -name '*.events.jsonl' 2>/dev/null | wc -l)))
+        fi
+
+        if [[ "$env_score" -eq 0 && "$repo_score" -gt 0 ]]; then
+            obs_root="$repo_obs_root"
+            echo "[mantle] AGENT_OBS_ROOT has no logs; using repo obs root: $obs_root" >&2
+        else
+            obs_root="$env_obs_root"
+        fi
+    fi
 
     python_bin="$VENV_PATH/bin/python"
     if [[ ! -x "$python_bin" ]]; then

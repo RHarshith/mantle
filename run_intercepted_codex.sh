@@ -38,7 +38,35 @@ while [[ $# -gt 0 ]]; do
 done
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-OBS_ROOT="${AGENT_OBS_ROOT:-$SCRIPT_DIR/obs}"
+OBS_ROOT_DEFAULT="$SCRIPT_DIR/obs"
+OBS_ROOT_ENV="${AGENT_OBS_ROOT:-}"
+OBS_ROOT="$OBS_ROOT_DEFAULT"
+
+# If AGENT_OBS_ROOT is set but points to stale/empty data while this repo has
+# logs, prefer the repo-local obs folder to avoid silent trace loss after renames.
+if [[ -n "$OBS_ROOT_ENV" ]]; then
+    env_score=0
+    repo_score=0
+    if [[ -d "$OBS_ROOT_ENV/traces" ]]; then
+        env_score=$((env_score + $(find "$OBS_ROOT_ENV/traces" -maxdepth 1 -type f -name '*.ebpf.jsonl' 2>/dev/null | wc -l)))
+    fi
+    if [[ -d "$OBS_ROOT_ENV/events" ]]; then
+        env_score=$((env_score + $(find "$OBS_ROOT_ENV/events" -maxdepth 1 -type f -name '*.events.jsonl' 2>/dev/null | wc -l)))
+    fi
+    if [[ -d "$OBS_ROOT_DEFAULT/traces" ]]; then
+        repo_score=$((repo_score + $(find "$OBS_ROOT_DEFAULT/traces" -maxdepth 1 -type f -name '*.ebpf.jsonl' 2>/dev/null | wc -l)))
+    fi
+    if [[ -d "$OBS_ROOT_DEFAULT/events" ]]; then
+        repo_score=$((repo_score + $(find "$OBS_ROOT_DEFAULT/events" -maxdepth 1 -type f -name '*.events.jsonl' 2>/dev/null | wc -l)))
+    fi
+
+    if [[ "$env_score" -eq 0 && "$repo_score" -gt 0 ]]; then
+        OBS_ROOT="$OBS_ROOT_DEFAULT"
+        echo "[mantle] AGENT_OBS_ROOT has no logs; using repo obs root: $OBS_ROOT" >&2
+    else
+        OBS_ROOT="$OBS_ROOT_ENV"
+    fi
+fi
 AGENT_TAG="$(basename "$AGENT_BIN")"
 [ -z "$TRACE_ID" ] && TRACE_ID="${AGENT_TAG}_$(date +%Y%m%d_%H%M%S).ebpf.jsonl"
 
@@ -59,6 +87,7 @@ export AGENT_TRACE_ID="$TRACE_BASENAME"
 
 # Find mitmdump
 MITMDUMP=""
+MITMDUMP_LAUNCH=()
 if [ -x "$RUNTIME_VENV/bin/mitmdump" ]; then
     MITMDUMP="$RUNTIME_VENV/bin/mitmdump"
 elif [ -x "$SCRIPT_DIR/.venv/bin/mitmdump" ]; then
@@ -74,13 +103,28 @@ fi
     exit 1
 }
 
+# Handle stale shebangs after repo renames by invoking script via Python.
+if [ -x "$RUNTIME_VENV/bin/python" ] && [ -f "$MITMDUMP" ]; then
+    first_line="$(head -n 1 "$MITMDUMP" 2>/dev/null || true)"
+    if [[ "$first_line" == '#!'* ]]; then
+        shebang_path="${first_line#\#!}"
+        shebang_path="${shebang_path%% *}"
+        if [ -n "$shebang_path" ] && [ ! -x "$shebang_path" ]; then
+            MITMDUMP_LAUNCH=("$RUNTIME_VENV/bin/python" "$MITMDUMP")
+        fi
+    fi
+fi
+if [ ${#MITMDUMP_LAUNCH[@]} -eq 0 ]; then
+    MITMDUMP_LAUNCH=("$MITMDUMP")
+fi
+
 # First-run bootstrap: generate mitmproxy CA material if missing.
 if [ ! -f "$MITM_CA" ]; then
     echo "[*] mitmproxy CA cert not found. Bootstrapping mitmproxy config..."
     if command -v timeout >/dev/null 2>&1; then
-        timeout 2 "$MITMDUMP" -q >/dev/null 2>&1 || true
+        timeout 2 "${MITMDUMP_LAUNCH[@]}" -q >/dev/null 2>&1 || true
     else
-        "$MITMDUMP" -q >/dev/null 2>&1 &
+        "${MITMDUMP_LAUNCH[@]}" -q >/dev/null 2>&1 &
         TMP_MITM_PID=$!
         sleep 2
         kill "$TMP_MITM_PID" >/dev/null 2>&1 || true
@@ -152,7 +196,7 @@ if [[ "$INTERCEPT_MODE" == "transparent" ]]; then
     sudo -u "$MITM_USER" \
         MITM_CAPTURE_FILE="$MITM_JSONL" \
         HOME="$MITM_USER_HOME" \
-        "$MITMDUMP" \
+        "${MITMDUMP_LAUNCH[@]}" \
             --mode transparent@"$MITM_PORT" \
             --mode reverse:https://api.openai.com@"$MITM_REV_PORT" \
             --ssl-insecure \
@@ -166,7 +210,7 @@ if [[ "$INTERCEPT_MODE" == "transparent" ]]; then
     echo "[*] mitmdump started as $MITM_USER (PID $MITM_PID)"
 else
     # Stable default for containerized codex: explicit proxy mode.
-    "$MITMDUMP" \
+    "${MITMDUMP_LAUNCH[@]}" \
         -p "$MITM_PORT" \
         --ssl-insecure \
         -s "$SCRIPT_DIR/mantle/mitm_capture.py" \

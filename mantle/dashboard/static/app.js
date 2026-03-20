@@ -18,6 +18,8 @@ let selectedNodeId = null;
 let cachedTraceFiles = []; // trace-level files cache
 let cachedTraceTools = [];
 let currentSyscallMode = false; // true when showing syscall-only (no trajectory)
+let activeTab = "trace"; // "trace" | "taint"
+let taintReportCache = null;
 
 // ─── DOM refs ─────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
@@ -36,10 +38,18 @@ const toolsCountBadge = $("toolsCountBadge");
 const toolsToggle = $("toolsToggle");
 const toolsSectionBody = $("toolsSectionBody");
 const toolsCaret = $("toolsCaret");
+const fileToggle = $("fileToggle");
+const fileSectionBody = $("fileSectionBody");
+const fileCaret = $("fileCaret");
+const selectionToggle = $("selectionToggle");
+const selectionSectionBody = $("selectionSectionBody");
+const selectionCaret = $("selectionCaret");
 const zoomInBtn = $("zoomInBtn");
 const zoomOutBtn = $("zoomOutBtn");
 const fitBtn = $("fitBtn");
 const zoomDisplay = $("zoomDisplay");
+const traceTabBtn = $("traceTabBtn");
+const taintTabBtn = $("taintTabBtn");
 
 const sumPromptsEl = $("sumPrompts");
 const sumToolsEl = $("sumTools");
@@ -67,6 +77,8 @@ function escapeHtml(str) {
 }
 
 let toolsExpanded = true;
+let filesExpanded = false;
+let selectionExpanded = false;
 async function openToolDrilldown(toolCallId, toolName) {
   if (!selectedTraceId || !toolCallId) return;
   currentMode = "tool";
@@ -133,10 +145,29 @@ function renderTools(tools) {
   }
 }
 
+function setActiveTab(tabName) {
+  activeTab = tabName;
+  const isTrace = tabName === "trace";
+  traceTabBtn.classList.toggle("active", isTrace);
+  taintTabBtn.classList.toggle("active", !isTrace);
+}
+
 function setToolsExpanded(expanded) {
   toolsExpanded = expanded;
   toolsSectionBody.style.display = expanded ? "block" : "none";
   toolsCaret.textContent = expanded ? "▼" : "▶";
+}
+
+function setFilesExpanded(expanded) {
+  filesExpanded = expanded;
+  fileSectionBody.style.display = expanded ? "block" : "none";
+  fileCaret.textContent = expanded ? "▼" : "▶";
+}
+
+function setSelectionExpanded(expanded) {
+  selectionExpanded = expanded;
+  selectionSectionBody.style.display = expanded ? "block" : "none";
+  selectionCaret.textContent = expanded ? "▼" : "▶";
 }
 
 // ─── API ──────────────────────────────────────────────────────────
@@ -176,7 +207,11 @@ async function selectTrace(traceId) {
   zoomLevel = 1;
   applyZoom();
   renderTraceList(cachedTraces);
-  await loadHighLevelGraph();
+  if (activeTab === "trace") {
+    await loadHighLevelGraph();
+  } else {
+    await loadTaintAnalysis();
+  }
   await loadTraceSummary();
 }
 
@@ -199,6 +234,16 @@ function updateSummaryCards(summary) {
     <div class="summary-card"><div class="k">Tool Steps</div><div class="v" id="sumTools">${summary.tool_steps ?? 0}</div></div>
     <div class="summary-card"><div class="k">Responses</div><div class="v" id="sumResponses">${summary.responses ?? 0}</div></div>
     <div class="summary-card"><div class="k">Status</div><div class="v" id="sumStatus">${summary.trace_status ?? "-"}</div></div>`;
+}
+
+function updateSummaryCardsTaint(report) {
+  const counts = report.finding_counts || {};
+  const strip = document.getElementById("summaryStrip");
+  strip.innerHTML = `
+    <div class="summary-card"><div class="k">Critical</div><div class="v">${counts.critical ?? 0}</div></div>
+    <div class="summary-card"><div class="k">Warnings</div><div class="v">${counts.warning ?? 0}</div></div>
+    <div class="summary-card"><div class="k">Info</div><div class="v">${counts.info ?? 0}</div></div>
+    <div class="summary-card"><div class="k">Trust Policy</div><div class="v" style="font-size:13px;line-height:1.3;padding-top:6px;">${escapeHtml(report.trust_policy || "nondeterministic")}</div></div>`;
 }
 
 // ─── Breadcrumbs ──────────────────────────────────────────────────
@@ -296,6 +341,12 @@ document.addEventListener("keydown", (e) => {
 
 if (toolsToggle) {
   toolsToggle.addEventListener("click", () => setToolsExpanded(!toolsExpanded));
+}
+if (fileToggle) {
+  fileToggle.addEventListener("click", () => setFilesExpanded(!filesExpanded));
+}
+if (selectionToggle) {
+  selectionToggle.addEventListener("click", () => setSelectionExpanded(!selectionExpanded));
 }
 
 // ─── Linear File Compression ───────────────────────────────────────
@@ -1201,6 +1252,104 @@ function renderSyscallTimeline(payload) {
   graphCanvas.appendChild(timeline);
 }
 
+function renderTaintAnalysis(report) {
+  graphCanvas.innerHTML = "";
+  emptyState.style.display = "none";
+
+  const findings = Array.isArray(report.findings) ? report.findings : [];
+  const entities = Array.isArray(report.tainted_entities) ? report.tainted_entities : [];
+  const flows = Array.isArray(report.taint_flows) ? report.taint_flows : [];
+
+  const sevBadge = (sev) => {
+    const safe = String(sev || "info");
+    return `<span class="sev sev-${escapeHtml(safe)}">${escapeHtml(safe)}</span>`;
+  };
+
+  const wrap = document.createElement("div");
+  wrap.className = "taint-wrap";
+
+  const summaryCard = document.createElement("section");
+  summaryCard.className = "taint-card";
+  summaryCard.innerHTML = `
+    <div class="taint-card-head">
+      <span>Analysis Summary</span>
+      <span class="tag">Trace: ${escapeHtml(report.trace_id || selectedTraceId || "")}</span>
+    </div>
+    <div class="taint-card-body">
+      <div class="taint-summary">${escapeHtml(String(report.summary || "No summary available."))}</div>
+    </div>`;
+  wrap.appendChild(summaryCard);
+
+  const findingsCard = document.createElement("section");
+  findingsCard.className = "taint-card";
+  let findingsBody = '<div class="taint-empty">No taint findings detected.</div>';
+  if (findings.length > 0) {
+    findingsBody = `
+      <div class="taint-table-wrap">
+        <table class="taint-table">
+          <thead>
+            <tr><th>Severity</th><th>Title</th><th>Description</th><th>Source Seq</th><th>Sink Seq</th></tr>
+          </thead>
+          <tbody>
+            ${findings.map((f) => `
+              <tr>
+                <td>${sevBadge(f.severity)}</td>
+                <td>${escapeHtml(String(f.title || ""))}</td>
+                <td>${escapeHtml(String(f.description || ""))}</td>
+                <td>${escapeHtml(String(f.source_event_seq ?? "-"))}</td>
+                <td>${escapeHtml(String(f.sink_event_seq ?? "-"))}</td>
+              </tr>`).join("")}
+          </tbody>
+        </table>
+      </div>`;
+  }
+  findingsCard.innerHTML = `<div class="taint-card-head">Findings <span class="tag">${findings.length}</span></div><div class="taint-card-body">${findingsBody}</div>`;
+  wrap.appendChild(findingsCard);
+
+  const entitiesCard = document.createElement("section");
+  entitiesCard.className = "taint-card";
+  let entitiesBody = '<div class="taint-empty">No tainted entities recorded.</div>';
+  if (entities.length > 0) {
+    entitiesBody = `<div class="taint-list">${entities.map((e) => {
+      const title = e.type === "file" ? (e.path || "file") : (e.id || "tool_result");
+      const meta = [
+        `type=${String(e.type || "-")}`,
+        `label=${String(e.label || "-")}`,
+        e.provenance ? `provenance=${String(e.provenance)}` : "",
+      ].filter(Boolean).join(" | ");
+      return `<div class="taint-item"><div class="name">${escapeHtml(String(title))}</div><div class="meta">${escapeHtml(meta)}</div></div>`;
+    }).join("")}</div>`;
+  }
+  entitiesCard.innerHTML = `<div class="taint-card-head">Tainted Entities <span class="tag">${entities.length}</span></div><div class="taint-card-body">${entitiesBody}</div>`;
+  wrap.appendChild(entitiesCard);
+
+  const flowsCard = document.createElement("section");
+  flowsCard.className = "taint-card";
+  let flowsBody = '<div class="taint-empty">No taint flows captured.</div>';
+  if (flows.length > 0) {
+    flowsBody = `
+      <div class="taint-table-wrap">
+        <table class="taint-table">
+          <thead>
+            <tr><th>From</th><th>To</th><th>Reason</th></tr>
+          </thead>
+          <tbody>
+            ${flows.map((f) => `
+              <tr>
+                <td>${escapeHtml(String(f.from || ""))}</td>
+                <td>${escapeHtml(String(f.to || ""))}</td>
+                <td>${escapeHtml(String(f.reason || ""))}</td>
+              </tr>`).join("")}
+          </tbody>
+        </table>
+      </div>`;
+  }
+  flowsCard.innerHTML = `<div class="taint-card-head">Taint Flows <span class="tag">${flows.length}</span></div><div class="taint-card-body">${flowsBody}</div>`;
+  wrap.appendChild(flowsCard);
+
+  graphCanvas.appendChild(wrap);
+}
+
 // ─── Loaders ──────────────────────────────────────────────────────
 async function loadHighLevelGraph() {
   if (!selectedTraceId) return;
@@ -1251,6 +1400,16 @@ async function loadToolGraph(toolCallId) {
   renderDAGGraph(payload);
 }
 
+async function loadTaintAnalysis() {
+  if (!selectedTraceId) return;
+  renderBreadcrumbs();
+  const report = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/taint-analysis`);
+  taintReportCache = report;
+  currentSyscallMode = false;
+  updateSummaryCardsTaint(report);
+  renderTaintAnalysis(report);
+}
+
 async function loadTraceSummary() {
   if (!selectedTraceId) return;
   try {
@@ -1284,21 +1443,40 @@ async function refreshTraces(keepView = true, force = false) {
   renderTraceList(traces);
   if (!selectedTraceId) return;
 
-  if (!keepView || currentMode === "high") {
-    await loadHighLevelGraph();
-  } else if (currentToolCallId) {
-    await loadToolGraph(currentToolCallId);
-  } else if (currentMode === "internal" && currentInternalRange) {
-    await loadInternalGraph(currentInternalRange.start, currentInternalRange.end);
-  } else if (currentMode === "process" && currentProcessPid) {
-    await loadProcessGraph(currentProcessPid);
+  if (activeTab === "trace") {
+    if (!keepView || currentMode === "high") {
+      await loadHighLevelGraph();
+    } else if (currentToolCallId) {
+      await loadToolGraph(currentToolCallId);
+    } else if (currentMode === "internal" && currentInternalRange) {
+      await loadInternalGraph(currentInternalRange.start, currentInternalRange.end);
+    } else if (currentMode === "process" && currentProcessPid) {
+      await loadProcessGraph(currentProcessPid);
+    }
+  } else {
+    await loadTaintAnalysis();
   }
   await loadTraceSummary();
 }
 
 // ─── Init ─────────────────────────────────────────────────────────
 async function init() {
-  setToolsExpanded(true);
+  setToolsExpanded(false);
+  setFilesExpanded(false);
+  setSelectionExpanded(false);
+  traceTabBtn.addEventListener("click", async () => {
+    if (activeTab === "trace") return;
+    setActiveTab("trace");
+    await loadHighLevelGraph();
+    await loadTraceSummary();
+  });
+  taintTabBtn.addEventListener("click", async () => {
+    if (activeTab === "taint") return;
+    setActiveTab("taint");
+    await loadTaintAnalysis();
+    await loadTraceSummary();
+  });
+
   await refreshTraces(false);
 
   // Polling fallback

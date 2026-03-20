@@ -64,6 +64,11 @@
     .btn-icon { padding: 5px 7px; font-size: 14px; }
     .zoom-display { font-size: 11px; color: var(--text-muted); min-width: 36px; text-align: center; font-variant-numeric: tabular-nums; }
 
+    .view-tabs { display: flex; gap: 8px; padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--surface); }
+    .view-tab { border: 1px solid var(--border); background: var(--slate-50); color: var(--text-secondary); font-size: 12px; font-weight: 600; border-radius: 999px; padding: 6px 12px; cursor: pointer; transition: all .15s; }
+    .view-tab:hover { background: var(--slate-100); color: var(--text-primary); }
+    .view-tab.active { background: var(--blue-50); color: var(--blue-600); border-color: var(--blue-100); }
+
     /* === Summary strip === */
     .summary-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--surface); flex-shrink: 0; }
     .summary-card { background: var(--slate-50); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; }
@@ -191,6 +196,27 @@
     .dag-node.kind-folder_group .expand-hint { font-size: 10px; color: var(--blue-500); margin-top: 2px; }
     .dag-node.kind-placeholder .dag-node-label { color: var(--text-muted); font-weight: 500; font-style: italic; }
 
+    /* === Taint Analysis === */
+    .taint-wrap { max-width: 1100px; margin: 0 auto; display: grid; gap: 12px; }
+    .taint-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow-sm); overflow: hidden; }
+    .taint-card-head { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; font-weight: 700; color: var(--text-primary); display: flex; justify-content: space-between; align-items: center; }
+    .taint-card-body { padding: 10px 12px; }
+    .taint-summary { font-size: 12px; color: var(--text-secondary); white-space: pre-wrap; line-height: 1.5; }
+    .taint-table-wrap { overflow: auto; }
+    .taint-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .taint-table th, .taint-table td { padding: 8px 9px; border-bottom: 1px solid var(--border-light); text-align: left; vertical-align: top; }
+    .taint-table th { background: var(--slate-50); color: var(--text-secondary); font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; }
+    .sev { font-size: 10px; font-weight: 700; text-transform: uppercase; border-radius: 10px; padding: 2px 8px; display: inline-block; }
+    .sev-critical { background: var(--red-100); color: var(--red-600); }
+    .sev-warning { background: var(--amber-100); color: var(--amber-600); }
+    .sev-info { background: var(--blue-100); color: var(--blue-600); }
+    .tag { font-size: 10px; font-weight: 600; border-radius: 10px; padding: 2px 7px; background: var(--slate-100); color: var(--slate-700); margin-left: 6px; }
+    .taint-list { display: grid; gap: 8px; }
+    .taint-item { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 9px; background: var(--slate-50); }
+    .taint-item .name { font-size: 12px; font-weight: 600; color: var(--text-primary); word-break: break-word; }
+    .taint-item .meta { margin-top: 4px; font-size: 11px; color: var(--text-secondary); }
+    .taint-empty { color: var(--text-muted); font-size: 12px; text-align: center; padding: 16px; }
+
     /* === Right panel === */
     .details-panel { background: var(--surface); border-left: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
     .panel-section { border-bottom: 1px solid var(--border); }
@@ -292,6 +318,10 @@
           <button class="btn" id="fitBtn">Reset</button>
         </div>
       </div>
+      <div class="view-tabs">
+        <button class="view-tab active" id="traceTabBtn">Trace View</button>
+        <button class="view-tab" id="taintTabBtn">Taint Analysis</button>
+      </div>
       <div class="summary-strip" id="summaryStrip">
         <div class="summary-card"><div class="k">Prompts</div><div class="v" id="sumPrompts">0</div></div>
         <div class="summary-card"><div class="k">Tool Steps</div><div class="v" id="sumTools">0</div></div>
@@ -311,11 +341,11 @@
     <!-- Right Details Panel -->
     <aside class="details-panel">
       <div class="panel-section">
-        <div class="panel-section-header">
-          <span>Files Affected</span>
+        <div class="panel-section-header tools-toggle" id="fileToggle">
+          <span><span class="caret" id="fileCaret">▶</span>Files Affected</span>
           <span class="muted" id="fileCountBadge"></span>
         </div>
-        <div class="panel-section-body">
+        <div class="panel-section-body" id="fileSectionBody" style="display:none;">
           <div class="file-scope-label" id="fileScopeLabel">Select a trace to view file activity.</div>
           <input type="text" class="file-filter" id="fileFilter" placeholder="Filter files..." style="display:none;" />
           <div class="files-list" id="filesList"></div>
@@ -323,16 +353,18 @@
       </div>
       <div class="panel-section">
         <div class="panel-section-header tools-toggle" id="toolsToggle">
-          <span><span class="caret" id="toolsCaret">▼</span>Tools Available</span>
+          <span><span class="caret" id="toolsCaret">▶</span>Tools Available</span>
           <span class="muted" id="toolsCountBadge"></span>
         </div>
-        <div class="panel-section-body" id="toolsSectionBody">
+        <div class="panel-section-body" id="toolsSectionBody" style="display:none;">
           <div class="tools-list" id="toolsList"></div>
         </div>
       </div>
       <div class="panel-section" style="flex:1; overflow:hidden; display:flex; flex-direction:column;">
-        <div class="panel-section-header">Selection Details</div>
-        <div style="flex:1; overflow-y:auto;">
+        <div class="panel-section-header tools-toggle" id="selectionToggle">
+          <span><span class="caret" id="selectionCaret">▶</span>Selection Details</span>
+        </div>
+        <div id="selectionSectionBody" style="flex:1; overflow-y:auto; display:none;">
           <div class="details-body" id="details">
             <div class="details-empty">Click a node to inspect its metadata.</div>
           </div>
