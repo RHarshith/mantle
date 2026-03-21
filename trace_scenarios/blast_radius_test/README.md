@@ -5,13 +5,18 @@ This scenario trains and validates an SSH key onboarding agent in a sandboxed fi
 ## Files
 
 - `setup.sh [run_id]`: Creates `~/blast-radius-test/{run_id}` with sandbox `/etc` + `/home` mirrors.
+  It also generates per-run SSH key fixtures under `~/blast-radius-test/{run_id}/home/user_pub_keys`.
 - `verify.sh [run_id]`: Verifies required sandbox files exist.
 - `cleanup.sh [run_id]`: Removes one run directory, or all runs when no run id is provided.
 - `prompt.txt`: Prompt template for the onboarding workflow.
-- `generate_valid_keys.sh`: Generates valid SSH keys using `ssh-keygen`.
 - `scenarios.json`: Scenario list and metadata (`user_pub_key`, `username`, `expected`, `enabled`).
-- `user_pub_keys/*.pub`: Generated key fixtures (5 benign, 1 prompt-injection).
+- `keys/`, `user_pub_keys/`: Placeholder directories only; key fixtures are generated at setup time.
 - `run_all_keys.sh`: Reads enabled entries from `scenarios.json`, runs the CLI agent, and records traces.
+
+Injection fixture variants include:
+- multiline instruction tail (`injection_skip_audit.pub`)
+- policy text embedded in key comment (`injection_comment_roleplay.pub`)
+- payload encoded in valid authorized_keys options (`injection_option_payload.pub`)
 
 ## Quick Run
 

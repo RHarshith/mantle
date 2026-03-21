@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="Mantle is a deep observability and safety analysis layer for AI coding agents."
+    />
+    <title>Mantle | Deep Observability</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;700&family=IBM+Plex+Sans:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="terrain-glow" aria-hidden="true"></div>
+    <header class="topbar">
+      <a class="brand" href="#">Mantle</a>
+      <nav>
+        <a href="#layers">Layers</a>
+        <a href="#security">Security</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero reveal">
+        <p class="eyebrow">Deep observability for AI coding agents</p>
+        <h1>
+          Capability requires access.
+          <span>Access creates risk.</span>
+          Mantle closes the gap.
+        </h1>
+        <p class="lead">
+          Mantle gives teams a complete, evidence-backed record of what their AI agent did -
+          every tool call, file write, network request, and process spawn - so you can
+          investigate incidents, enforce policy, and ship with confidence.
+        </p>
+        <div class="cta-row">
+          <a class="btn primary" href="https://github.com/RHarshith/mantle" target="_blank" rel="noreferrer">View Repository</a>
+          <a class="btn ghost" href="#layers">Explore Features</a>
+        </div>
+      </section>
+
+      <section id="layers" class="section reveal">
+        <h2>Main features</h2>
+        <div class="layers-grid">
+          <article class="card">
+            <h3>Multi-source capture</h3>
+            <p>
+              Collects eBPF system telemetry, MITM API/network traffic, and agent-native JSONL
+              events into a single correlated trace so nothing falls through the gaps between
+              layers.
+            </p>
+          </article>
+          <article class="card">
+            <h3>Live dashboard</h3>
+            <p>
+              Provides timeline and drilldown views to inspect tool calls, process activity,
+              file changes, and outbound connections in real time.
+            </p>
+          </article>
+          <article class="card">
+            <h3>Taint-based analysis</h3>
+            <p>
+              Tracks how untrusted input moves through your system and flags dangerous paths -
+              like user data reaching a shell command or a sensitive file write.
+            </p>
+          </article>
+        </div>
+      </section>
+
+      <section id="security" class="section reveal split">
+        <div>
+          <h2>Why Mantle is needed</h2>
+          <p>
+            AI coding agents are useful, but their runtime behavior is often opaque. Mantle makes
+            that behavior inspectable and testable, so teams can move from assumptions to
+            evidence-backed reviews.
+          </p>
+          <ul class="checks">
+            <li>Reconstruct exactly what happened, step by step, for any agent run</li>
+            <li>Surface high-risk operations with the context needed to evaluate them</li>
+            <li>Validate agent behavior against policy with repeatable, scriptable checks</li>
+          </ul>
+        </div>
+        <aside class="status-panel">
+          <p class="status-title">What teams use it for</p>
+          <div class="status-line"><span>Incident Investigation</span><strong>Minutes, not days</strong></div>
+          <div class="status-line"><span>Reliability Reviews</span><strong>Evidence, not guesswork</strong></div>
+          <div class="status-line"><span>Security Validation</span><strong>Policy, not trust</strong></div>
+        </aside>
+      </section>
+
+    </main>
+
+    <footer>
+      <p>Mantle: explicit traces for safer and more reliable agent operations.</p>
+    </footer>
+
+    <script src="app.js"></script>
+  </body>
+</html>

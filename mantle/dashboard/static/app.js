@@ -301,11 +301,12 @@ function updateSummaryCardsTaint(report) {
 function updateSummaryCardsBlast(report) {
   const summary = report.summary || {};
   const strip = document.getElementById("summaryStrip");
+  const consistency = summary.eventual_consistency ? "yes" : "no";
   strip.innerHTML = `
     <div class="summary-card"><div class="k">Baselines</div><div class="v">${(report.baseline_ids || []).length}</div></div>
-    <div class="summary-card"><div class="k">Rows</div><div class="v">${summary.rows ?? 0}</div></div>
+    <div class="summary-card"><div class="k">Checkpoints</div><div class="v">${summary.checkpoints ?? summary.rows ?? 0}</div></div>
     <div class="summary-card"><div class="k">Deviations</div><div class="v">${summary.deviations ?? 0}</div></div>
-    <div class="summary-card"><div class="k">Risk Score</div><div class="v">${summary.deviation_score ?? 0}</div></div>`;
+    <div class="summary-card"><div class="k">Eventual Consistency</div><div class="v" style="font-size:18px;padding-top:7px;">${consistency}</div></div>`;
 }
 
 // ─── Breadcrumbs ──────────────────────────────────────────────────
@@ -1483,39 +1484,54 @@ function renderBlastAnalysis(report) {
   });
 
   const deviations = report.deviations || [];
-  const rows = report.rows || [];
+  const timeline = report.timeline || report.rows || [];
 
-  const card = document.createElement("section");
-  card.className = "taint-card";
-  let body = '<div class="taint-empty">No diff rows available.</div>';
-  if (rows.length > 0) {
+  const timelineCard = document.createElement("section");
+  timelineCard.className = "taint-card";
+  let body = '<div class="taint-empty">No checkpoint timeline available.</div>';
+  if (timeline.length > 0) {
     body = `
       <div class="taint-table-wrap">
         <table class="taint-table">
           <thead>
-            <tr><th>#</th><th>Status</th><th>Expected</th><th>Observed</th><th>Evidence</th></tr>
+            <tr><th>#</th><th>Checkpoint</th><th>Status</th><th>Observed Position</th><th>Reason</th></tr>
           </thead>
           <tbody>
-            ${rows.map((r) => {
-              const expected = r.expected?.label || r.expected?.key || "-";
-              const observed = r.observed?.label || r.observed?.key || "-";
+            ${timeline.map((r) => {
+              const cp = r.checkpoint || r.expected || {};
+              const expected = cp.label || cp.key || "-";
+              const observedLine = r.observed ? `line ${Number(r.observed.line_no || 0)}` : "-";
               const sev = r.severity || "info";
               const statusCls = sev === "high" ? "sev-critical" : sev === "medium" ? "sev-warning" : "sev-info";
-              const evidence = r.observed ? `line ${Number(r.observed.line_no || 0)} · ${escapeHtml(String(r.observed.source || ""))}` : "-";
               return `<tr>
                 <td>${Number(r.index) + 1}</td>
-                <td><span class="sev ${statusCls}">${escapeHtml(String(r.status || "match"))}</span></td>
                 <td>${escapeHtml(String(expected))}</td>
-                <td>${escapeHtml(String(observed))}<div class="muted" style="font-size:11px;margin-top:2px;">${escapeHtml(String(r.reason || ""))}</div></td>
-                <td>${evidence}</td>
+                <td><span class="sev ${statusCls}">${escapeHtml(String(r.status || "aligned"))}</span></td>
+                <td>${escapeHtml(observedLine)}</td>
+                <td>${escapeHtml(String(r.reason || ""))}</td>
               </tr>`;
             }).join("")}
           </tbody>
         </table>
       </div>`;
   }
-  card.innerHTML = `<div class="taint-card-head">Template Diff <span class="tag">${deviations.length} deviations</span></div><div class="taint-card-body">${body}</div>`;
-  wrap.appendChild(card);
+  timelineCard.innerHTML = `<div class="taint-card-head">Deviation Timeline <span class="tag">${deviations.length} deviations</span></div><div class="taint-card-body">${body}</div>`;
+  wrap.appendChild(timelineCard);
+
+  const side = report.side_effect_delta || {};
+  const missing = side.missing_from_candidate || [];
+  const added = side.new_in_candidate || [];
+  const sideCard = document.createElement("section");
+  sideCard.className = "taint-card";
+  sideCard.innerHTML = `
+    <div class="taint-card-head">Side-Effect Delta <span class="tag">impact</span></div>
+    <div class="taint-card-body">
+      <div style="font-size:12px;color:var(--text-secondary);margin-bottom:8px;">Missing from candidate:</div>
+      ${missing.length ? `<div class="taint-list">${missing.map((k) => `<div class="taint-item"><div class="name">${escapeHtml(String(k))}</div></div>`).join("")}</div>` : '<div class="taint-empty" style="padding:6px 0 12px;text-align:left;">None</div>'}
+      <div style="font-size:12px;color:var(--text-secondary);margin:8px 0;">New in candidate:</div>
+      ${added.length ? `<div class="taint-list">${added.map((k) => `<div class="taint-item"><div class="name">${escapeHtml(String(k))}</div></div>`).join("")}</div>` : '<div class="taint-empty" style="padding:6px 0;text-align:left;">None</div>'}
+    </div>`;
+  wrap.appendChild(sideCard);
 
   graphCanvas.appendChild(wrap);
 }
@@ -1587,7 +1603,7 @@ async function loadBlastAnalysis() {
   const baselineIds = Array.from(selectedBlastBaselines);
   if (baselineIds.length === 0) {
     graphCanvas.innerHTML = `<div class="empty-state"><h3>Not enough training traces</h3><p>Select at least one baseline trace to compare against <code>${escapeHtml(selectedTraceId)}</code>.</p></div>`;
-    updateSummaryCardsBlast({ baseline_ids: [], summary: { rows: 0, deviations: 0, deviation_score: 0 } });
+    updateSummaryCardsBlast({ baseline_ids: [], summary: { checkpoints: 0, deviations: 0, deviation_score: 0, eventual_consistency: false } });
     return;
   }
   const params = new URLSearchParams({

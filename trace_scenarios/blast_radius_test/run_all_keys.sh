@@ -18,7 +18,6 @@ REPO_ROOT="$(cd "$SCENARIO_DIR/../.." && pwd)"
 MANTLE_BIN="${REPO_ROOT}/bin/mantle"
 PROMPT_TEMPLATE="${SCENARIO_DIR}/prompt.txt"
 SCENARIO_JSON="${SCENARIO_DIR}/scenarios.json"
-KEY_GENERATOR="${SCENARIO_DIR}/generate_valid_keys.sh"
 VENV_PATH="${MANTLE_VENV:-$REPO_ROOT/.venv}"
 PYTHON_BIN="$VENV_PATH/bin/python"
 
@@ -35,11 +34,6 @@ if [[ ! -x "$MANTLE_BIN" ]]; then
     echo "Missing mantle runner: $MANTLE_BIN" >&2
     exit 1
 fi
-
-if [[ ! -x "$KEY_GENERATOR" ]]; then
-    chmod +x "$KEY_GENERATOR"
-fi
-bash "$KEY_GENERATOR"
 
 scenario_rows=()
 while IFS= read -r line; do
@@ -74,13 +68,7 @@ failed=()
 for row in "${scenario_rows[@]}"; do
     IFS=$'\t' read -r scenario_id key_rel username expected <<< "$row"
 
-    key_file="${SCENARIO_DIR}/${key_rel}"
-    if [[ ! -f "$key_file" ]]; then
-        echo "Skipping ${scenario_id}: key file not found at ${key_file}" >&2
-        continue
-    fi
-
-    key_name="$(basename "$key_file")"
+    key_name="$(basename "$key_rel")"
     run_id="blast_$(date +%Y%m%d_%H%M%S)_${scenario_id}"
     run_root="${HOME}/blast-radius-test/${run_id}"
 
@@ -88,12 +76,17 @@ for row in "${scenario_rows[@]}"; do
     echo "==> Running fixture: ${scenario_id} (${key_name})"
     bash "$SCENARIO_DIR/setup.sh" "$run_id"
 
-    cp "$key_file" "$run_root/home/user_pub_keys/${key_name}"
+    key_file="$run_root/home/user_pub_keys/${key_name}"
+    if [[ ! -f "$key_file" ]]; then
+        echo "Skipping ${scenario_id}: generated key file not found at ${key_file}" >&2
+        bash "$SCENARIO_DIR/cleanup.sh" "$run_id"
+        continue
+    fi
 
     prompt="$(sed "s/{run_id}/${run_id}/g" "$PROMPT_TEMPLATE")"
     prompt="$prompt
 
-Use this key file: $run_root/home/user_pub_keys/${key_name}
+Use this key file: ${key_file}
 Target username: ${username}
 Expected behavior: ${expected}"
 

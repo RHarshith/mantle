@@ -3410,6 +3410,49 @@ class TraceStore:
             prev_key = key
         return compressed
 
+    def _is_checkpoint_key(self, key: str) -> bool:
+        if not key:
+            return False
+        if key in {"phase:user_prompt", "phase:assistant_response"}:
+            return True
+        if key.startswith("cmd:"):
+            return True
+        if key.startswith("tool:command_exec"):
+            return True
+        if key.startswith("fs:write:") or key.startswith("fs:delete:") or key.startswith("fs:rename:"):
+            sensitive = {"etc_passwd", "etc_shadow", "etc_group", "authorized_keys", "audit_log", "etc_ssh"}
+            parts = key.split(":", 2)
+            bucket = parts[2] if len(parts) > 2 else ""
+            return bucket in sensitive
+        if key.startswith("net:connect:"):
+            host = key.split(":", 2)[2] if len(key.split(":")) >= 3 else ""
+            return host not in {"localhost", "llm_provider"}
+        return False
+
+    def _side_effect_key(self, key: str) -> str | None:
+        if key.startswith("cmd:"):
+            return key
+        if key.startswith("fs:write:") or key.startswith("fs:delete:") or key.startswith("fs:rename:"):
+            return key
+        if key.startswith("net:connect:"):
+            host = key.split(":", 2)[2] if len(key.split(":")) >= 3 else ""
+            if host not in {"localhost", "llm_provider"}:
+                return key
+        return None
+
+    def _checkpoint_list_from_steps(self, steps: list[dict[str, Any]]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for s in steps:
+            key = str(s.get("key") or "")
+            if not self._is_checkpoint_key(key):
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+        return out
+
     def blast_radius_template(self, trace_ids: list[str], min_coverage: float = 0.6) -> dict[str, Any]:
         selected = [self._get_trace(tid) for tid in trace_ids]
         if not selected:
@@ -3483,12 +3526,63 @@ class TraceStore:
 
         transitions.sort(key=lambda t: (-int(t["count"]), str(t["from"]), str(t["to"])))
 
+        checkpoint_presence: Counter[str] = Counter()
+        checkpoint_positions: dict[str, list[int]] = defaultdict(list)
+        side_effect_presence: Counter[str] = Counter()
+
+        for steps in per_trace_steps.values():
+            seen_cp: set[str] = set()
+            for idx, key in enumerate(self._checkpoint_list_from_steps(steps)):
+                checkpoint_positions[key].append(idx)
+                if key not in seen_cp:
+                    checkpoint_presence[key] += 1
+                    seen_cp.add(key)
+
+            seen_effects: set[str] = set()
+            for s in steps:
+                effect = self._side_effect_key(str(s.get("key") or ""))
+                if not effect or effect in seen_effects:
+                    continue
+                side_effect_presence[effect] += 1
+                seen_effects.add(effect)
+
+        checkpoint_items: list[dict[str, Any]] = []
+        cp_cutoff = max(min_coverage, 0.7)
+        for key, count in checkpoint_presence.items():
+            coverage = count / total
+            if coverage < cp_cutoff:
+                continue
+            positions = sorted(checkpoint_positions.get(key, []))
+            pos_med = positions[len(positions) // 2] if positions else 0
+            checkpoint_items.append(
+                {
+                    "key": key,
+                    "label": labels.get(key, key),
+                    "coverage": round(coverage, 3),
+                    "position_median": pos_med,
+                }
+            )
+
+        checkpoint_items.sort(key=lambda x: (int(x["position_median"]), -float(x["coverage"]), str(x["key"])))
+
+        guide_effects = [
+            {
+                "key": key,
+                "coverage": round(count / total, 3),
+            }
+            for key, count in side_effect_presence.items()
+            if (count / total) >= min_coverage
+        ]
+        guide_effects.sort(key=lambda x: (-float(x["coverage"]), str(x["key"])))
+
         return {
             "trace_ids": trace_ids,
             "trace_count": total,
             "min_coverage": min_coverage,
             "expected_steps": expected_steps,
+            "checkpoints": checkpoint_items,
             "transitions": transitions,
+            "guide_side_effects": guide_effects,
             "trace_lengths": {k: len(v) for k, v in per_trace_steps.items()},
         }
 
@@ -3499,113 +3593,116 @@ class TraceStore:
         candidate = self._get_trace(candidate_id)
         candidate_steps = self._semantic_trace_steps(candidate)
 
-        expected = template.get("expected_steps") or []
-        expected_keys = [str(s.get("key") or "") for s in expected]
-        expected_set = set(expected_keys)
-        expected_by_key = {str(s.get("key") or ""): s for s in expected}
+        checkpoints = template.get("checkpoints") or []
+        checkpoint_keys = [str(c.get("key") or "") for c in checkpoints if c.get("key")]
+        checkpoint_set = set(checkpoint_keys)
 
-        transition_probs: dict[tuple[str, str], float] = {}
-        transition_counts: dict[tuple[str, str], int] = {}
-        for t in template.get("transitions") or []:
-            src = str(t.get("from") or "")
-            dst = str(t.get("to") or "")
-            transition_probs[(src, dst)] = float(t.get("probability") or 0.0)
-            transition_counts[(src, dst)] = int(t.get("count") or 0)
+        candidate_positions: dict[str, list[int]] = defaultdict(list)
+        for idx, step in enumerate(candidate_steps):
+            key = str(step.get("key") or "")
+            if key:
+                candidate_positions[key].append(idx)
 
-        rows: list[dict[str, Any]] = []
+        timeline: list[dict[str, Any]] = []
         deviations: list[dict[str, Any]] = []
-        max_len = max(len(expected), len(candidate_steps))
+        cursor = -1
 
-        for idx in range(max_len):
-            exp = expected[idx] if idx < len(expected) else None
-            obs = candidate_steps[idx] if idx < len(candidate_steps) else None
-            exp_key = str((exp or {}).get("key") or "")
-            obs_key = str((obs or {}).get("key") or "")
-            status = "match"
-            reason = ""
+        for idx, checkpoint in enumerate(checkpoints):
+            key = str(checkpoint.get("key") or "")
+            label = str(checkpoint.get("label") or key)
+            positions = candidate_positions.get(key, [])
+            next_pos = None
+            for p in positions:
+                if p > cursor:
+                    next_pos = p
+                    break
+
+            status = "aligned"
             severity = "info"
+            reason = "Checkpoint observed in-order"
+            observed = None
 
-            if exp and not obs:
-                status = "missing"
-                coverage = float(exp.get("coverage") or 0.0)
-                severity = "high" if coverage >= 0.8 else "medium"
-                reason = "Expected step missing from candidate trace"
-            elif obs and not exp:
-                status = "extra"
+            if next_pos is not None:
+                cursor = next_pos
+                observed = candidate_steps[next_pos]
+            elif positions:
+                status = "reordered"
                 severity = "medium"
-                reason = "Candidate has additional step beyond trained template"
-            elif exp_key != obs_key:
-                status = "mismatch"
-                if obs_key in expected_set:
-                    severity = "medium"
-                    reason = "Known step occurred out-of-order"
-                else:
-                    severity = "high"
-                    reason = "Unexpected semantic step outside training baseline"
+                reason = "Checkpoint observed out-of-order but eventually consistent"
+                observed = candidate_steps[positions[0]]
+            else:
+                status = "missing"
+                severity = "high" if float(checkpoint.get("coverage") or 0.0) >= 0.85 else "medium"
+                reason = "Checkpoint missing from candidate trace"
 
             row = {
                 "index": idx,
-                "expected": exp,
-                "observed": obs,
+                "checkpoint": checkpoint,
                 "status": status,
-                "reason": reason,
                 "severity": severity,
+                "reason": reason,
+                "observed": observed,
             }
-            rows.append(row)
+            timeline.append(row)
 
-            if status != "match":
+            if status != "aligned":
                 deviations.append(
                     {
                         "index": idx,
                         "kind": status,
                         "severity": severity,
                         "reason": reason,
-                        "expected": exp,
-                        "observed": obs,
+                        "expected": checkpoint,
+                        "observed": observed,
                         "evidence": {
-                            "line_no": int((obs or {}).get("line_no") or 0),
-                            "source": str((obs or {}).get("source") or ""),
-                            "raw_type": str((obs or {}).get("raw_type") or ""),
+                            "line_no": int((observed or {}).get("line_no") or 0),
+                            "source": str((observed or {}).get("source") or ""),
+                            "raw_type": str((observed or {}).get("raw_type") or ""),
                         },
                     }
                 )
 
-        # Transition-level anomalies capture process drift without exact syscall matching.
-        for i in range(len(candidate_steps) - 1):
-            a = str(candidate_steps[i].get("key") or "")
-            b = str(candidate_steps[i + 1].get("key") or "")
-            if not a or not b:
-                continue
-            if a not in expected_set or b not in expected_set:
-                continue
-            prob = transition_probs.get((a, b), 0.0)
-            cnt = transition_counts.get((a, b), 0)
-            if prob < 0.2 and cnt < 2:
-                deviations.append(
-                    {
-                        "index": i,
-                        "kind": "transition",
-                        "severity": "medium",
-                        "reason": "Rare transition between known stages",
-                        "expected": expected_by_key.get(a),
-                        "observed": {
-                            "from": candidate_steps[i],
-                            "to": candidate_steps[i + 1],
-                            "probability": prob,
-                        },
-                        "evidence": {
-                            "line_no": int(candidate_steps[i + 1].get("line_no") or 0),
-                            "source": str(candidate_steps[i + 1].get("source") or ""),
-                            "raw_type": str(candidate_steps[i + 1].get("raw_type") or ""),
-                        },
-                    }
-                )
+        # Side-effect drift: compare only impactful actions, not every intermediate step.
+        guide_effect_keys = {str(e.get("key") or "") for e in template.get("guide_side_effects") or [] if e.get("key")}
+        candidate_effect_keys = {
+            effect
+            for effect in (
+                self._side_effect_key(str(s.get("key") or ""))
+                for s in candidate_steps
+            )
+            if effect
+        }
 
-        deviation_score = min(100, int(round((len(deviations) / max(1, len(rows))) * 100)))
+        missing_effects = sorted(guide_effect_keys - candidate_effect_keys)
+        new_effects = sorted(candidate_effect_keys - guide_effect_keys)
+
+        eventual_consistency = all(item.get("status") in {"aligned", "reordered"} for item in timeline)
+        if eventual_consistency and (missing_effects or new_effects):
+            eventual_consistency = False
+
+        if missing_effects or new_effects:
+            deviations.append(
+                {
+                    "index": len(timeline),
+                    "kind": "side_effect_delta",
+                    "severity": "high" if new_effects else "medium",
+                    "reason": "Side-effect set differs from guide trace baseline",
+                    "expected": {"effects": sorted(guide_effect_keys)},
+                    "observed": {"effects": sorted(candidate_effect_keys)},
+                    "evidence": {
+                        "line_no": 0,
+                        "source": "summary",
+                        "raw_type": "side_effect_delta",
+                    },
+                }
+            )
+
+        deviation_score = min(100, int(round((len(deviations) / max(1, len(timeline))) * 100)))
         summary = {
-            "rows": len(rows),
+            "checkpoints": len(timeline),
             "deviations": len(deviations),
             "deviation_score": deviation_score,
+            "eventual_consistency": eventual_consistency,
             "status": "deviating" if deviations else "aligned",
         }
 
@@ -3614,7 +3711,12 @@ class TraceStore:
             "baseline_ids": baseline_ids,
             "template": template,
             "candidate_steps": candidate_steps,
-            "rows": rows,
+            "timeline": timeline,
+            "rows": timeline,
+            "side_effect_delta": {
+                "missing_from_candidate": missing_effects,
+                "new_in_candidate": new_effects,
+            },
             "deviations": deviations,
             "summary": summary,
         }
