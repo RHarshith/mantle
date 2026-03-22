@@ -78,6 +78,15 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
+function isToolNodeKind(kind) {
+  // Support canonical and legacy node kinds so drilldown works across traces.
+  return kind === "tool_step"
+    || kind === "tool_output"
+    || kind === "tool_call"
+    || kind === "tool_call_started"
+    || kind === "tool_call_finished";
+}
+
 let toolsExpanded = true;
 let filesExpanded = false;
 let selectionExpanded = false;
@@ -768,7 +777,7 @@ function renderGitTreeGraph(payload) {
     card.addEventListener("dblclick", async (e) => {
       e.stopPropagation();
       const meta = node.metadata || {};
-      if ((kind === "tool_step" || kind === "tool_call") && meta.tool_call_id) {
+      if (isToolNodeKind(kind) && meta.tool_call_id) {
         await openToolDrilldown(meta.tool_call_id, meta.tool_name || meta.tool_call_id);
         return;
       }
@@ -944,7 +953,7 @@ function renderHighLevelGraph(payload) {
         return;
       }
 
-      if ((kind === "tool_step" || kind === "tool_call") && meta.tool_call_id) {
+      if (isToolNodeKind(kind) && meta.tool_call_id) {
         await openToolDrilldown(meta.tool_call_id, meta.tool_name || meta.tool_call_id);
       }
     });

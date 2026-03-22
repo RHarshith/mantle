@@ -1457,11 +1457,13 @@ class TraceStore:
             kind = "api_call"
             label = "LLM API Request"
         elif event_type == "tool_call_started":
-            kind = "tool_call_started"
+            # Preserve the frontend contract: started tool events render as tool_step.
+            kind = "tool_step"
             tool_name = payload.get("tool_name") or "unknown"
             label = f"Tool: {tool_name}"
         elif event_type == "tool_call_finished":
-            kind = "tool_call_finished"
+            # Preserve the frontend contract: finished tool events render as tool_output.
+            kind = "tool_output"
             tool_name = payload.get("tool_name") or "unknown"
             label = f"Tool Result: {tool_name}"
         else:
