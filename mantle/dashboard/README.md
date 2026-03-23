@@ -2,6 +2,19 @@
 
 This service monitors low-level eBPF JSONL trace logs + agent instrumentation events + mitm captures and renders a realtime drilldown graph.
 
+## Code Layout
+
+- `mantle/dashboard/app.py`: FastAPI wiring only (routes, startup/shutdown, path resolution).
+- `mantle/dashboard/store.py`: trace ingestion, parsing, graph building, taint-analysis orchestration.
+- `mantle/dashboard/config.py`: observability path/environment resolution.
+- `mantle/dashboard/llm_utils.py`: schema normalization and MITM LLM payload parsing.
+- `mantle/dashboard/syscall_utils.py`: syscall parsing and endpoint/path classification helpers.
+- `mantle/dashboard/logging_utils.py`: centralized dashboard logging helpers.
+
+Use this split when debugging:
+- API/runtime issues (HTTP status, route behavior, websocket updates): start in `app.py`.
+- Data/parsing/graph issues (missing nodes, bad turn mapping, MITM correlation): start in `store.py`.
+
 ## Folder Convention
 
 - eBPF logs directory (watched): `~/shared/mantle/obs/traces`

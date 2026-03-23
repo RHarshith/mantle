@@ -131,7 +131,7 @@ class ChatCompletionCapture:
             if raw_req:
                 req_body = json.loads(raw_req)
         except Exception:
-            pass
+            req_body = {"_raw": flow.request.get_text() or ""}
 
         record = {
             "ts": time.time(),
