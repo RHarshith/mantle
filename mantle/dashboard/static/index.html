@@ -87,7 +87,7 @@
     .view-tab.active { background: var(--blue-50); color: var(--blue-600); border-color: var(--blue-100); }
 
     /* === Summary strip === */
-    .summary-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--surface); flex-shrink: 0; }
+    .summary-strip { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--surface); flex-shrink: 0; }
     .summary-card { background: var(--slate-50); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; }
     .summary-card .k { font-size: 11px; color: var(--text-muted); font-weight: 500; text-transform: uppercase; letter-spacing: 0.04em; }
     .summary-card .v { font-size: 22px; font-weight: 700; color: var(--text-primary); margin-top: 2px; }
@@ -339,12 +339,15 @@
         <button class="view-tab active" id="traceTabBtn">Trace View</button>
         <button class="view-tab" id="taintTabBtn">Taint Analysis</button>
         <button class="view-tab" id="blastTabBtn">Blast Radius</button>
+        <button class="view-tab" id="settingsTabBtn">Settings</button>
       </div>
       <div class="summary-strip" id="summaryStrip">
-        <div class="summary-card"><div class="k">Prompts</div><div class="v" id="sumPrompts">0</div></div>
-        <div class="summary-card"><div class="k">Tool Steps</div><div class="v" id="sumTools">0</div></div>
-        <div class="summary-card"><div class="k">Responses</div><div class="v" id="sumResponses">0</div></div>
-        <div class="summary-card"><div class="k">Status</div><div class="v" id="sumStatus">-</div></div>
+        <div class="summary-card"><div class="k">Turns</div><div class="v" id="sumTurns">0</div></div>
+        <div class="summary-card"><div class="k">Tool Calls</div><div class="v" id="sumTools">0</div></div>
+        <div class="summary-card"><div class="k">Files Read</div><div class="v" id="sumFilesRead">0</div></div>
+        <div class="summary-card"><div class="k">Files Written</div><div class="v" id="sumFilesWritten">0</div></div>
+        <div class="summary-card"><div class="k">Network Calls</div><div class="v" id="sumNetwork">0</div></div>
+        <div class="summary-card"><div class="k">Subprocesses</div><div class="v" id="sumSubprocesses">0</div></div>
       </div>
       <div class="graph-wrapper" id="graphWrapper">
         <div class="graph-canvas" id="graphCanvas">

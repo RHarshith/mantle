@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from mantle.taint_engine import run_taint_analysis
@@ -85,6 +85,268 @@ class TraceStore:
         self.traces: dict[str, TraceState] = {}
         self.version = 0
         self._lock = asyncio.Lock()
+        self.llm_api_schemas: list[dict[str, Any]] = self._builtin_llm_api_schemas()
+
+    def _builtin_llm_api_schemas(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "builtin_tamu_chat_completions",
+                "name": "TAMU Chat Completions",
+                "endpoint_pattern": r"/chat/completions$",
+                "request": {
+                    "messages_path": "messages",
+                    "instructions_path": "instructions",
+                },
+                "response": {
+                    "assistant_paths": [
+                        "choices[].message.content",
+                    ],
+                },
+            },
+            {
+                "id": "builtin_openai_chat_completions",
+                "name": "OpenAI Chat Completions",
+                "endpoint_pattern": r"/chat/completions$",
+                "request": {
+                    "messages_path": "messages",
+                    "instructions_path": "instructions",
+                },
+                "response": {
+                    "assistant_paths": [
+                        "choices[].message.content",
+                    ],
+                },
+            },
+            {
+                "id": "builtin_openai_responses",
+                "name": "OpenAI Responses API",
+                "endpoint_pattern": r"/responses$",
+                "request": {
+                    "messages_path": "input",
+                    "instructions_path": "instructions",
+                },
+                "response": {
+                    "assistant_paths": [
+                        "output[].content[].text",
+                        "output_text",
+                    ],
+                },
+            },
+        ]
+
+    def list_llm_api_schemas(self) -> dict[str, Any]:
+        return {
+            "schemas": self.llm_api_schemas,
+        }
+
+    def set_llm_api_schemas(self, schemas: list[dict[str, Any]]) -> dict[str, Any]:
+        normalized: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw in schemas:
+            if not isinstance(raw, dict):
+                continue
+            schema_id = str(raw.get("id") or "").strip()
+            if not schema_id or schema_id in seen:
+                continue
+            endpoint_pattern = str(raw.get("endpoint_pattern") or "").strip()
+            if not endpoint_pattern:
+                continue
+            req = raw.get("request") if isinstance(raw.get("request"), dict) else {}
+            resp = raw.get("response") if isinstance(raw.get("response"), dict) else {}
+            normalized.append(
+                {
+                    "id": schema_id,
+                    "name": str(raw.get("name") or schema_id),
+                    "endpoint_pattern": endpoint_pattern,
+                    "request": {
+                        "messages_path": str(req.get("messages_path") or "").strip(),
+                        "instructions_path": str(req.get("instructions_path") or "").strip(),
+                    },
+                    "response": {
+                        "assistant_paths": [str(p) for p in (resp.get("assistant_paths") or []) if isinstance(p, str) and p.strip()],
+                    },
+                }
+            )
+            seen.add(schema_id)
+
+        if not normalized:
+            normalized = self._builtin_llm_api_schemas()
+        self.llm_api_schemas = normalized
+        self.version += 1
+        return {"schemas": self.llm_api_schemas}
+
+    def _extract_by_path(self, data: Any, path: str) -> list[Any]:
+        if not path:
+            return []
+        tokens = path.replace("]", "").split(".")
+        curs: list[Any] = [data]
+        for token in tokens:
+            if not token:
+                continue
+            want_all = token.endswith("[]")
+            key = token[:-2] if want_all else token
+            next_curs: list[Any] = []
+            for cur in curs:
+                if key:
+                    if isinstance(cur, dict) and key in cur:
+                        cur_val = cur.get(key)
+                    else:
+                        continue
+                else:
+                    cur_val = cur
+
+                if want_all:
+                    if isinstance(cur_val, list):
+                        next_curs.extend(cur_val)
+                    else:
+                        continue
+                else:
+                    next_curs.append(cur_val)
+            curs = next_curs
+            if not curs:
+                break
+        return curs
+
+    def _extract_texts_from_messages(self, messages: Any) -> list[str]:
+        out: list[str] = []
+        if not isinstance(messages, list):
+            return out
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role") or msg.get("type") or "")
+            content = msg.get("content")
+            if role in {"system", "developer", "user", "input_text"}:
+                text = ""
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    parts: list[str] = []
+                    for c in content:
+                        if isinstance(c, str):
+                            parts.append(c)
+                        elif isinstance(c, dict) and isinstance(c.get("text"), str):
+                            parts.append(str(c.get("text")))
+                    text = "\n".join([p for p in parts if p])
+                if text.strip():
+                    out.append(text.strip())
+        return out
+
+    def _parse_llm_calls_from_mitm(self, trace: TraceState) -> list[dict[str, Any]]:
+        if not trace.mitm_path or not trace.mitm_path.exists():
+            return []
+
+        compiled: list[tuple[dict[str, Any], re.Pattern[str]]] = []
+        for schema in self.llm_api_schemas:
+            pattern = str(schema.get("endpoint_pattern") or "").strip()
+            if not pattern:
+                continue
+            try:
+                compiled.append((schema, re.compile(pattern)))
+            except re.error:
+                continue
+
+        if not compiled:
+            return []
+
+        pending: list[dict[str, Any]] = []
+        calls: list[dict[str, Any]] = []
+
+        with trace.mitm_path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                url = str(rec.get("url") or "")
+                schema_match: dict[str, Any] | None = None
+                for schema, regex in compiled:
+                    if regex.search(url):
+                        schema_match = schema
+                        break
+                if schema_match is None:
+                    continue
+
+                direction = str(rec.get("direction") or "")
+                ts = float(rec.get("ts") or 0.0)
+                req_body = rec.get("request_body") or {}
+                resp_body = rec.get("response_body") or {}
+                req_cfg = schema_match.get("request") or {}
+                resp_cfg = schema_match.get("response") or {}
+
+                if direction == "request":
+                    prompt_texts: list[str] = []
+                    instructions_path = str(req_cfg.get("instructions_path") or "")
+                    if instructions_path:
+                        for value in self._extract_by_path(req_body, instructions_path):
+                            if isinstance(value, str) and value.strip():
+                                prompt_texts.append(value.strip())
+
+                    messages_path = str(req_cfg.get("messages_path") or "")
+                    if messages_path:
+                        for value in self._extract_by_path(req_body, messages_path):
+                            if isinstance(value, list):
+                                prompt_texts.extend(self._extract_texts_from_messages(value))
+
+                    pending.append(
+                        {
+                            "ts": ts,
+                            "url": url,
+                            "schema_id": schema_match.get("id"),
+                            "prompt_text": "\n\n".join([p for p in prompt_texts if p]),
+                            "response_text": "",
+                            "matched": False,
+                        }
+                    )
+                    continue
+
+                if direction == "response":
+                    response_texts: list[str] = []
+                    for path in resp_cfg.get("assistant_paths") or []:
+                        for value in self._extract_by_path(resp_body, str(path)):
+                            if isinstance(value, str) and value.strip():
+                                response_texts.append(value.strip())
+
+                    # Fall back to parser-friendly content hints.
+                    if not response_texts:
+                        choices = resp_body.get("choices")
+                        if isinstance(choices, list):
+                            for choice in choices:
+                                if not isinstance(choice, dict):
+                                    continue
+                                msg = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+                                content = msg.get("content")
+                                if isinstance(content, str) and content.strip():
+                                    response_texts.append(content.strip())
+
+                    target_idx: int | None = None
+                    for i in range(len(pending) - 1, -1, -1):
+                        item = pending[i]
+                        if item.get("matched"):
+                            continue
+                        if str(item.get("url") or "") != url:
+                            continue
+                        if float(item.get("ts") or 0.0) <= ts:
+                            target_idx = i
+                            break
+
+                    if target_idx is not None:
+                        item = pending[target_idx]
+                        item["matched"] = True
+                        item["response_text"] = "\n\n".join([t for t in response_texts if t])
+                        calls.append(item)
+
+        # Include unmatched requests as turns with empty responses.
+        for item in pending:
+            if not item.get("matched"):
+                calls.append(item)
+
+        calls.sort(key=lambda x: float(x.get("ts") or 0.0))
+        return calls
 
     def _trace_to_event_candidates(self, trace_file: Path) -> list[Path]:
         name = trace_file.name
@@ -793,6 +1055,14 @@ class TraceStore:
 
             if event_type == "command_exec" and state.root_pid is None:
                 state.root_pid = int(normalized.get("pid", 0)) or None
+
+            # Some captures may miss sched_process_fork for a child but still
+            # include command_exec with ppid. Use this to preserve ancestry.
+            if event_type == "command_exec":
+                pid = int(normalized.get("pid", 0))
+                ppid = int(normalized.get("ppid", 0))
+                if pid > 0 and ppid > 0 and pid not in state.process_parent:
+                    state.process_parent[pid] = ppid
 
             if event_type == "process_spawn":
                 parent_pid = int(normalized.get("pid", 0))
@@ -2951,6 +3221,818 @@ class TraceStore:
             include_agent_events=False,
         )
 
+    def _event_ts(self, event: dict[str, Any]) -> float:
+        try:
+            return float(event.get("ts") or 0.0)
+        except Exception:
+            return 0.0
+
+    def _event_seq(self, event: dict[str, Any]) -> int:
+        try:
+            return int(event.get("seq") or 0)
+        except Exception:
+            return 0
+
+    def _tool_pairs(self, agent_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        starts: dict[str, dict[str, Any]] = {}
+        finishes: dict[str, dict[str, Any]] = {}
+
+        for ev in agent_events:
+            et = str(ev.get("event_type") or "")
+            payload = ev.get("payload") or {}
+            tool_call_id = str(payload.get("tool_call_id") or "").strip()
+            if not tool_call_id:
+                continue
+            if et == "tool_call_started" and tool_call_id not in starts:
+                starts[tool_call_id] = ev
+            elif et == "tool_call_finished":
+                finishes[tool_call_id] = ev
+
+        out: list[dict[str, Any]] = []
+        for tool_call_id, start_ev in starts.items():
+            start_payload = start_ev.get("payload") or {}
+            finish_ev = finishes.get(tool_call_id)
+            finish_payload = (finish_ev or {}).get("payload") or {}
+            out.append(
+                {
+                    "tool_call_id": tool_call_id,
+                    "tool_name": str(start_payload.get("tool_name") or finish_payload.get("tool_name") or "unknown"),
+                    "started_ts": self._event_ts(start_ev),
+                    "finished_ts": self._event_ts(finish_ev) if finish_ev else None,
+                    "arguments": start_payload.get("arguments") or {},
+                    "result": finish_payload.get("result") if finish_ev else None,
+                }
+            )
+
+        out.sort(key=lambda x: float(x.get("started_ts") or 0.0))
+        return out
+
+    def _pid_depth(self, trace: TraceState, pid: int, root_pid: int | None) -> int | None:
+        if pid <= 0:
+            return None
+        if root_pid is None or root_pid <= 0:
+            return None
+        depth = 0
+        current = int(pid)
+        seen: set[int] = set()
+        while current > 0 and current not in seen:
+            if current == root_pid:
+                return depth
+            seen.add(current)
+            parent = int(trace.process_parent.get(current, 0))
+            if parent <= 0:
+                return None
+            current = parent
+            depth += 1
+        return None
+
+    def _turns_for_trace(self, trace: TraceState) -> list[dict[str, Any]]:
+        agent_events = sorted(
+            list(trace.agent_events),
+            key=lambda e: (self._event_ts(e), self._event_seq(e)),
+        )
+        sys_events = sorted(list(trace.sys_events), key=lambda e: (self._event_ts(e), int(e.get("line_no") or 0)))
+
+        llm_calls = self._parse_llm_calls_from_mitm(trace)
+        boundaries = sorted([float(c.get("ts") or 0.0) for c in llm_calls if float(c.get("ts") or 0.0) > 0.0])
+
+        spans: list[tuple[str, float | None, float | None]] = []
+        if boundaries:
+            first = boundaries[0]
+            has_setup = any(self._event_ts(e) < first for e in agent_events) or any(self._event_ts(e) < first for e in sys_events)
+            if has_setup:
+                spans.append(("setup", None, first))
+            for i, start_ts in enumerate(boundaries):
+                end_ts = boundaries[i + 1] if i + 1 < len(boundaries) else None
+                spans.append((f"turn_{i + 1}", start_ts, end_ts))
+        else:
+            spans.append(("setup", None, None))
+
+        turns: list[dict[str, Any]] = []
+        root_pid = int(trace.root_pid or 0) or None
+
+        for idx, (turn_id, start_ts, end_ts) in enumerate(spans):
+            def _in_span(ts: float) -> bool:
+                if start_ts is not None and ts < start_ts:
+                    return False
+                if end_ts is not None and ts >= end_ts:
+                    return False
+                return True
+
+            agent_slice = [e for e in agent_events if _in_span(self._event_ts(e))]
+            sys_slice = [e for e in sys_events if _in_span(self._event_ts(e))]
+
+            tool_pairs = self._tool_pairs(agent_slice)
+            files_read = {str(e.get("path") or "") for e in sys_slice if str(e.get("type") or "") == "file_read" and str(e.get("path") or "")}
+            files_written = {
+                str(e.get("path") or "")
+                for e in sys_slice
+                if str(e.get("type") or "") in {"file_write", "file_delete", "file_rename"} and str(e.get("path") or "")
+            }
+            network_calls = [e for e in sys_slice if str(e.get("type") or "") == "net_connect"]
+
+            direct_children_pids_set: set[int] = {
+                int(e.get("child_pid") or 0)
+                for e in sys_slice
+                if str(e.get("type") or "") == "process_spawn" and int(e.get("child_pid") or 0) > 0
+            }
+            # Some traces miss process_spawn. Infer parent->child from command_exec
+            # ppid so subprocesses are still counted and nestable.
+            direct_children_pids_set.update(
+                int(e.get("pid") or 0)
+                for e in sys_slice
+                if str(e.get("type") or "") == "command_exec"
+                and int(e.get("pid") or 0) > 0
+                and int(e.get("ppid") or 0) > 0
+                and int(e.get("pid") or 0) != int(e.get("ppid") or 0)
+            )
+            direct_children_pids = sorted(pid for pid in direct_children_pids_set if pid > 0)
+
+            has_grandchildren = False
+            for e in sys_slice:
+                if str(e.get("type") or "") != "process_spawn":
+                    continue
+                child_pid = int(e.get("child_pid") or 0)
+                depth = self._pid_depth(trace, child_pid, root_pid)
+                if depth is not None and depth >= 2:
+                    has_grandchildren = True
+                    break
+
+            has_tool_writes = any(
+                any(tok in str(tp.get("tool_name") or "").lower() for tok in ["write", "edit", "patch", "create", "delete", "rename", "replace", "insert"])
+                for tp in tool_pairs
+            )
+
+            has_response = False
+            response_texts: list[str] = []
+            for ev in agent_slice:
+                if str(ev.get("event_type") or "") != "assistant_response":
+                    continue
+                payload = ev.get("payload") or {}
+                content = str(payload.get("content") or "").strip()
+                phase = str(payload.get("phase") or "").strip()
+                if content and phase != "tool_call":
+                    has_response = True
+                    response_texts.append(content)
+
+            prompt_texts: list[str] = []
+            if llm_calls:
+                for call in llm_calls:
+                    cts = float(call.get("ts") or 0.0)
+                    if _in_span(cts):
+                        ptxt = str(call.get("prompt_text") or "").strip()
+                        if ptxt:
+                            prompt_texts.append(ptxt)
+                        rtxt = str(call.get("response_text") or "").strip()
+                        if rtxt:
+                            response_texts.append(rtxt)
+                            has_response = True
+            else:
+                for ev in agent_slice:
+                    et = str(ev.get("event_type") or "")
+                    payload = ev.get("payload") or {}
+                    if et == "user_prompt":
+                        text = str(payload.get("content") or "").strip()
+                        if text:
+                            prompt_texts.append(text)
+                    elif et == "user_prompt_batch":
+                        for p in payload.get("prompts") or []:
+                            text = str(p or "").strip()
+                            if text:
+                                prompt_texts.append(text)
+
+            tags: list[str] = []
+            only_reads = bool(tool_pairs) and bool(files_read) and not files_written and not has_grandchildren
+            if only_reads:
+                tags.append("read and plan")
+            if files_written or has_tool_writes:
+                tags.append("edit")
+            if has_grandchildren:
+                tags.append("execute")
+            if network_calls:
+                tags.append("network")
+            if has_response:
+                tags.append("response")
+
+            dominant = "No major actions"
+            if files_written:
+                dominant = f"Wrote {len(files_written)} files · {len(tool_pairs)} tool calls"
+            elif files_read:
+                dominant = f"Read {len(files_read)} files · {len(tool_pairs)} tool calls"
+            elif direct_children_pids:
+                dominant = f"Spawned {len(direct_children_pids)} processes · {len(tool_pairs)} tool calls"
+            elif network_calls:
+                dominant = f"{len(network_calls)} network calls · {len(tool_pairs)} tool calls"
+            elif tool_pairs:
+                dominant = f"{len(tool_pairs)} tool calls"
+
+            first_tool_ts: float | None = None
+            if tool_pairs:
+                first_tool_ts = min(float(tp.get("started_ts") or 0.0) for tp in tool_pairs if float(tp.get("started_ts") or 0.0) > 0.0)
+
+            pre_tool_events: list[dict[str, Any]] = []
+            if first_tool_ts is not None:
+                pre_tool_events = [e for e in sys_slice if self._event_ts(e) < first_tool_ts]
+
+            pre_tool_counts = {
+                "file_read": sum(1 for e in pre_tool_events if str(e.get("type") or "") == "file_read"),
+                "file_write": sum(1 for e in pre_tool_events if str(e.get("type") or "") in {"file_write", "file_delete", "file_rename"}),
+                "process_spawn": sum(1 for e in pre_tool_events if str(e.get("type") or "") == "process_spawn"),
+                "network": sum(1 for e in pre_tool_events if str(e.get("type") or "") in {"net_connect", "net_send", "net_recv"}),
+            }
+
+            turns.append(
+                {
+                    "turn_id": turn_id,
+                    "index": idx,
+                    "label": "Setup" if turn_id == "setup" else f"T{idx if spans[0][0] == 'setup' else idx + 1}",
+                    "start_ts": start_ts,
+                    "end_ts": end_ts,
+                    "tool_call_count": len(tool_pairs),
+                    "tags": tags,
+                    "dominant_summary": dominant,
+                    "prompt_text": "\n\n".join(prompt_texts),
+                    "response_text": "\n\n".join(response_texts),
+                    "files_read_count": len(files_read),
+                    "files_written_count": len(files_written),
+                    "subprocess_direct_count": len(direct_children_pids),
+                    "network_call_count": len(network_calls),
+                    "pre_tool_counts": pre_tool_counts,
+                    "first_tool_ts": first_tool_ts,
+                    "_agent_events": agent_slice,
+                    "_sys_events": sys_slice,
+                    "_tool_pairs": tool_pairs,
+                }
+            )
+
+        return turns
+
+    def _file_tree(self, file_items: list[dict[str, Any]]) -> dict[str, Any]:
+        root: dict[str, Any] = {"name": "/", "kind": "dir", "children": []}
+        child_map: dict[tuple[int, str], dict[str, Any]] = {}
+
+        def _child(parent: dict[str, Any], name: str, kind: str) -> dict[str, Any]:
+            key = (id(parent), f"{kind}:{name}")
+            existing = child_map.get(key)
+            if existing is not None:
+                return existing
+            node = {"name": name, "kind": kind, "children": [] if kind == "dir" else None}
+            parent.setdefault("children", []).append(node)
+            child_map[key] = node
+            return node
+
+        for item in sorted(file_items, key=lambda x: str(x.get("path") or "")):
+            path = str(item.get("path") or "")
+            if not path:
+                continue
+            parts = [p for p in Path(path).parts if p not in {"/", ""}]
+            cur = root
+            for part in parts[:-1]:
+                cur = _child(cur, part, "dir")
+            leaf = _child(cur, parts[-1] if parts else path, "file")
+            leaf["path"] = path
+            leaf["state"] = item.get("state")
+            leaf["read"] = bool(item.get("read"))
+            leaf["write"] = bool(item.get("write"))
+            leaf["event_count"] = int(item.get("event_count") or 0)
+
+        return root
+
+    def _build_unified_timeline(
+        self,
+        trace: TraceState,
+        sys_events: list[dict[str, Any]],
+        tool_pairs: list[dict[str, Any]] | None,
+        anchor_pid: int | None = None,
+    ) -> list[dict[str, Any]]:
+        tool_pairs = tool_pairs or []
+
+        def _sys_cat(event: dict[str, Any]) -> str:
+            et = str(event.get("type") or "")
+            if et in {"file_read", "file_write", "file_delete", "file_rename"}:
+                return "file"
+            if et in {"process_spawn", "process_exit", "command_exec"}:
+                return "process"
+            if et in {"net_connect", "net_send", "net_recv"}:
+                return "network"
+            return "other"
+
+        parent_map: dict[int, int] = {int(k): int(v) for k, v in trace.process_parent.items()}
+        for ev in sys_events:
+            et = str(ev.get("type") or "")
+            if et == "process_spawn":
+                parent = int(ev.get("pid") or 0)
+                child = int(ev.get("child_pid") or 0)
+                if parent > 0 and child > 0 and parent != child:
+                    parent_map[child] = parent
+            elif et == "command_exec":
+                pid = int(ev.get("pid") or 0)
+                ppid = int(ev.get("ppid") or 0)
+                if pid > 0 and ppid > 0 and pid != ppid and pid not in parent_map:
+                    # Missing process_spawn fallback.
+                    parent_map[pid] = ppid
+
+        resolved_anchor = int(anchor_pid or 0)
+        if resolved_anchor <= 0:
+            candidate = int(trace.root_pid or 0)
+            if candidate > 0 and any(int(e.get("pid") or 0) == candidate for e in sys_events):
+                resolved_anchor = candidate
+            elif candidate <= 0:
+                for ev in sys_events:
+                    if str(ev.get("type") or "") == "command_exec":
+                        candidate = int(ev.get("pid") or 0)
+                        if candidate > 0:
+                            resolved_anchor = candidate
+                            break
+
+        def _has_parent(pid: int) -> bool:
+            return int(parent_map.get(pid, 0)) > 0
+
+        def _should_keep_at_current_level(ev: dict[str, Any]) -> bool:
+            cat = _sys_cat(ev)
+            if cat == "process":
+                return True
+
+            pid = int(ev.get("pid") or 0)
+            if pid <= 0:
+                return True
+
+            # Root/anchor process activity remains visible at the current level.
+            if resolved_anchor > 0 and pid == resolved_anchor:
+                return True
+
+            # Child process events belong under that process collapsible, not the
+            # top-level timeline.
+            if _has_parent(pid):
+                return False
+
+            return True
+
+        merged: list[dict[str, Any]] = []
+        for tp in tool_pairs:
+            merged.append({"kind": "tool", "ts": float(tp.get("started_ts") or 0.0), "tool": tp})
+        for ev in sys_events:
+            if not _should_keep_at_current_level(ev):
+                continue
+            merged.append({"kind": "sys", "ts": self._event_ts(ev), "event": ev, "category": _sys_cat(ev)})
+        merged.sort(key=lambda x: (float(x.get("ts") or 0.0), 0 if x.get("kind") == "tool" else 1))
+
+        timeline: list[dict[str, Any]] = []
+        current_cat = ""
+        current_events: list[dict[str, Any]] = []
+
+        def _flush_group() -> None:
+            nonlocal current_cat, current_events
+            if not current_events:
+                return
+            cat = current_cat
+            events = current_events
+            current_cat = ""
+            current_events = []
+
+            if cat == "file":
+                file_map: dict[str, dict[str, Any]] = {}
+                for e in events:
+                    path = str(e.get("path") or "")
+                    if not path:
+                        continue
+                    bucket = file_map.setdefault(path, {"path": path, "read": False, "write": False, "event_count": 0})
+                    et = str(e.get("type") or "")
+                    if et == "file_read":
+                        bucket["read"] = True
+                    if et in {"file_write", "file_delete", "file_rename"}:
+                        bucket["write"] = True
+                    bucket["event_count"] += 1
+
+                files = []
+                for info in file_map.values():
+                    if info["read"] and info["write"]:
+                        state = "read_write"
+                    elif info["write"]:
+                        state = "write"
+                    else:
+                        state = "read"
+                    files.append({**info, "state": state})
+
+                timeline.append(
+                    {
+                        "entry_type": "system_group",
+                        "category": "file",
+                        "standalone": len(events) == 1,
+                        "title": f"{len(files)} files touched",
+                        "events_count": len(events),
+                        "files": files,
+                        "tree": self._file_tree(files),
+                    }
+                )
+                return
+
+            if cat == "process":
+                commands: list[str] = []
+                by_pid: dict[int, dict[str, Any]] = {}
+                children_by_parent: dict[int, list[int]] = defaultdict(list)
+
+                for e in events:
+                    et = str(e.get("type") or "")
+                    if et == "command_exec":
+                        pid = int(e.get("pid") or 0)
+                        if pid <= 0:
+                            continue
+                        ppid = int(e.get("ppid") or 0)
+                        cmd = str(e.get("command") or e.get("exec_path") or "").strip()
+                        if cmd:
+                            commands.append(cmd)
+                        node = by_pid.setdefault(pid, {"pid": pid, "command": cmd, "start_ts": self._event_ts(e), "end_ts": None, "exit_code": None, "children": []})
+                        if cmd and not node.get("command"):
+                            node["command"] = cmd
+                        node["start_ts"] = min(float(node.get("start_ts") or self._event_ts(e)), self._event_ts(e))
+                        if ppid > 0 and ppid != pid:
+                            children_by_parent[ppid].append(pid)
+                            by_pid.setdefault(ppid, {"pid": ppid, "command": "", "start_ts": None, "end_ts": None, "exit_code": None, "children": []})
+                    elif et == "process_exit":
+                        pid = int(e.get("pid") or 0)
+                        if pid <= 0:
+                            continue
+                        node = by_pid.setdefault(pid, {"pid": pid, "command": "", "start_ts": None, "end_ts": self._event_ts(e), "exit_code": None, "children": []})
+                        node["end_ts"] = self._event_ts(e)
+                        if "exit_code" in e:
+                            node["exit_code"] = e.get("exit_code")
+                    elif et == "process_spawn":
+                        parent = int(e.get("pid") or 0)
+                        child = int(e.get("child_pid") or 0)
+                        if parent > 0 and child > 0:
+                            children_by_parent[parent].append(child)
+                            by_pid.setdefault(parent, {"pid": parent, "command": "", "start_ts": None, "end_ts": None, "exit_code": None, "children": []})
+                            by_pid.setdefault(child, {"pid": child, "command": "", "start_ts": None, "end_ts": None, "exit_code": None, "children": []})
+
+                for parent, kids in children_by_parent.items():
+                    node = by_pid.get(parent)
+                    if node is None:
+                        continue
+                    node["children"] = sorted(set([*node.get("children", []), *kids]))
+
+                if resolved_anchor > 0:
+                    direct_children = sorted({
+                        int(child)
+                        for child in children_by_parent.get(resolved_anchor, [])
+                        if int(child) > 0 and int(child) != resolved_anchor
+                    })
+                else:
+                    direct_children = sorted({
+                        int(child)
+                        for _parent, kids in children_by_parent.items()
+                        for child in kids
+                        if int(child) > 0
+                    })
+
+                process_tree = [by_pid[k] for k in direct_children if k in by_pid]
+                child_commands = [
+                    str(node.get("command") or "").strip()
+                    for node in process_tree
+                    if str(node.get("command") or "").strip()
+                ]
+
+                # No child spawn in this segment: do not emit a process group.
+                # This avoids synthetic "0 processes spawned" / execute rows.
+                if not direct_children:
+                    return
+
+                timeline.append(
+                    {
+                        "entry_type": "system_group",
+                        "category": "process",
+                        "standalone": len(events) == 1,
+                        "title": f"{len(direct_children)} {'process' if len(direct_children) == 1 else 'processes'} spawned",
+                        "events_count": len(events),
+                        "commands": list(dict.fromkeys(child_commands or commands))[:8],
+                        "direct_children": direct_children,
+                        "process_tree": process_tree,
+                    }
+                )
+                return
+
+            if cat == "network":
+                calls: dict[str, dict[str, Any]] = {}
+                for e in events:
+                    ne = self._with_inferred_net_dest(trace, e)
+                    dest = self._network_display_label(ne)
+                    bucket = calls.setdefault(dest, {"dest": dest, "bytes_sent": 0, "bytes_recv": 0, "count": 0, "full_capture": False})
+                    et = str(ne.get("type") or "")
+                    if et == "net_send":
+                        bucket["bytes_sent"] += int(ne.get("bytes") or 0)
+                    elif et == "net_recv":
+                        bucket["bytes_recv"] += int(ne.get("bytes") or 0)
+                    bucket["count"] += 1
+
+                    host = str(dest).split(" ")[-1].split(":", 1)[0].strip()
+                    if host and any(ep.split(":", 1)[0] == host for ep in trace.mitm_endpoints):
+                        bucket["full_capture"] = True
+
+                timeline.append(
+                    {
+                        "entry_type": "system_group",
+                        "category": "network",
+                        "standalone": len(events) == 1,
+                        "title": f"{len(calls)} network calls",
+                        "events_count": len(events),
+                        "destinations": sorted(calls.keys()),
+                        "calls": [calls[k] for k in sorted(calls.keys())],
+                    }
+                )
+                return
+
+            e = events[0]
+            timeline.append(
+                {
+                    "entry_type": "system_group",
+                    "category": "other",
+                    "standalone": True,
+                    "title": str(e.get("label") or e.get("type") or "event"),
+                    "events_count": 1,
+                    "event": e,
+                }
+            )
+
+        for item in merged:
+            if item["kind"] == "tool":
+                _flush_group()
+                timeline.append(
+                    {
+                        "entry_type": "tool_call",
+                        "tool_call_id": item["tool"].get("tool_call_id"),
+                        "tool_name": item["tool"].get("tool_name"),
+                        "arguments": item["tool"].get("arguments") or {},
+                        "result": item["tool"].get("result"),
+                        "started_ts": item["tool"].get("started_ts"),
+                        "finished_ts": item["tool"].get("finished_ts"),
+                    }
+                )
+                continue
+
+            cat = str(item.get("category") or "other")
+            ev = item["event"]
+            if not current_events:
+                current_cat = cat
+                current_events = [ev]
+            elif cat == current_cat:
+                current_events.append(ev)
+            else:
+                _flush_group()
+                current_cat = cat
+                current_events = [ev]
+
+        _flush_group()
+        return timeline
+
+    def turns_overview(self, trace_id: str) -> dict[str, Any]:
+        t = self._get_trace(trace_id)
+        turns = self._turns_for_trace(t)
+
+        tool_calls_total = sum(int(turn.get("tool_call_count") or 0) for turn in turns)
+        files_read_total = len({
+            str(e.get("path") or "")
+            for turn in turns
+            for e in turn.get("_sys_events", [])
+            if str(e.get("type") or "") == "file_read" and str(e.get("path") or "")
+        })
+        files_written_total = len({
+            str(e.get("path") or "")
+            for turn in turns
+            for e in turn.get("_sys_events", [])
+            if str(e.get("type") or "") in {"file_write", "file_delete", "file_rename"} and str(e.get("path") or "")
+        })
+        network_total = sum(
+            1 for turn in turns for e in turn.get("_sys_events", []) if str(e.get("type") or "") == "net_connect"
+        )
+        subprocess_total = sum(
+            int(turn.get("subprocess_direct_count") or 0)
+            for turn in turns
+        )
+
+        turn_rows = [
+            {
+                "turn_id": turn["turn_id"],
+                "label": turn["label"],
+                "index": turn["index"],
+                "tool_call_count": turn["tool_call_count"],
+                "tags": turn["tags"],
+                "dominant_summary": turn["dominant_summary"],
+            }
+            for turn in turns
+        ]
+
+        turn_count = len([r for r in turn_rows if r.get("turn_id") != "setup"])
+        return {
+            "trace_id": trace_id,
+            "executive_summary": {
+                "turns": turn_count,
+                "tool_calls": tool_calls_total,
+                "files_read": files_read_total,
+                "files_written": files_written_total,
+                "network_calls": network_total,
+                "subprocesses_spawned": subprocess_total,
+            },
+            "turns": turn_rows,
+        }
+
+    def turn_detail(self, trace_id: str, turn_id: str) -> dict[str, Any]:
+        t = self._get_trace(trace_id)
+        turns = self._turns_for_trace(t)
+        match = next((turn for turn in turns if str(turn.get("turn_id")) == turn_id), None)
+        if match is None:
+            raise KeyError(turn_id)
+
+        sys_events = list(match.get("_sys_events", []))
+        tool_pairs = list(match.get("_tool_pairs", []))
+        timeline = self._build_unified_timeline(t, sys_events, tool_pairs, anchor_pid=int(t.root_pid or 0) or None)
+
+        direct_children = {
+            int(e.get("child_pid") or 0)
+            for e in sys_events
+            if str(e.get("type") or "") == "process_spawn" and int(e.get("child_pid") or 0) > 0
+        }
+        direct_children.update(
+            int(e.get("pid") or 0)
+            for e in sys_events
+            if str(e.get("type") or "") == "command_exec"
+            and int(e.get("pid") or 0) > 0
+            and int(e.get("ppid") or 0) > 0
+            and int(e.get("pid") or 0) != int(e.get("ppid") or 0)
+        )
+        net_calls = [e for e in sys_events if str(e.get("type") or "") == "net_connect"]
+
+        return {
+            "trace_id": trace_id,
+            "turn_id": turn_id,
+            "label": match.get("label"),
+            "summary": {
+                "tool_calls": int(match.get("tool_call_count") or 0),
+                "files_read": int(match.get("files_read_count") or 0),
+                "files_written": int(match.get("files_written_count") or 0),
+                "subprocesses_spawned": len([pid for pid in direct_children if int(pid) > 0]),
+                "network_calls": len(net_calls),
+            },
+            "prompt_text": match.get("prompt_text") or "",
+            "response_text": match.get("response_text") or "",
+            "pre_tool_counts": match.get("pre_tool_counts") or {},
+            "timeline": timeline,
+            "start_ts": match.get("start_ts"),
+            "end_ts": match.get("end_ts"),
+        }
+
+    def process_subtrace(self, trace_id: str, turn_id: str, pid: int) -> dict[str, Any]:
+        t = self._get_trace(trace_id)
+        turns = self._turns_for_trace(t)
+        match = next((turn for turn in turns if str(turn.get("turn_id")) == turn_id), None)
+        if match is None:
+            raise KeyError(turn_id)
+
+        pid = int(pid)
+        if pid <= 0:
+            raise KeyError("pid")
+
+        sys_events = [
+            e
+            for e in match.get("_sys_events", [])
+            if self._is_descendant_or_same_pid(t, int(e.get("pid") or 0), pid)
+        ]
+
+        timeline = self._build_unified_timeline(t, sys_events, tool_pairs=[], anchor_pid=pid)
+        command = ""
+        start_ts: float | None = None
+        end_ts: float | None = None
+        exit_code: int | None = None
+
+        for e in sys_events:
+            et = str(e.get("type") or "")
+            if et == "command_exec" and int(e.get("pid") or 0) == pid:
+                command = str(e.get("command") or e.get("exec_path") or command)
+                ts = self._event_ts(e)
+                start_ts = ts if start_ts is None else min(start_ts, ts)
+            if et == "process_exit" and int(e.get("pid") or 0) == pid:
+                ts = self._event_ts(e)
+                end_ts = ts if end_ts is None else max(end_ts, ts)
+                if "exit_code" in e:
+                    try:
+                        exit_code = int(e.get("exit_code"))
+                    except Exception:
+                        pass
+
+        files_read = {str(e.get("path") or "") for e in sys_events if str(e.get("type") or "") == "file_read" and str(e.get("path") or "")}
+        files_written = {
+            str(e.get("path") or "")
+            for e in sys_events
+            if str(e.get("type") or "") in {"file_write", "file_delete", "file_rename"} and str(e.get("path") or "")
+        }
+        direct_children = {
+            int(e.get("child_pid") or 0)
+            for e in sys_events
+            if str(e.get("type") or "") == "process_spawn"
+            and int(e.get("pid") or 0) == pid
+            and int(e.get("child_pid") or 0) > 0
+        }
+        direct_children.update(
+            int(e.get("pid") or 0)
+            for e in sys_events
+            if str(e.get("type") or "") == "command_exec"
+            and int(e.get("ppid") or 0) == pid
+            and int(e.get("pid") or 0) > 0
+        )
+        net_calls = [e for e in sys_events if str(e.get("type") or "") == "net_connect"]
+
+        parent_pid = int(t.process_parent.get(pid, 0)) if pid in t.process_parent else None
+        if not parent_pid:
+            for e in sys_events:
+                if str(e.get("type") or "") != "command_exec":
+                    continue
+                if int(e.get("pid") or 0) != pid:
+                    continue
+                ppid = int(e.get("ppid") or 0)
+                if ppid > 0:
+                    parent_pid = ppid
+                    break
+
+        duration_ms: float | None = None
+        if start_ts is not None and end_ts is not None and end_ts >= start_ts:
+            duration_ms = (end_ts - start_ts) * 1000.0
+
+        return {
+            "trace_id": trace_id,
+            "turn_id": turn_id,
+            "pid": pid,
+            "summary": {
+                "command": command,
+                "pid": pid,
+                "parent_pid": parent_pid,
+                "duration_ms": duration_ms,
+                "exit_code": exit_code,
+                "files_read": len(files_read),
+                "files_written": len(files_written),
+                "child_processes_spawned": len([child for child in direct_children if int(child) > 0]),
+                "network_calls": len(net_calls),
+            },
+            "timeline": timeline,
+        }
+
+    def raw_resource_events(self, trace_id: str, turn_id: str, resource_type: str, resource_key: str) -> dict[str, Any]:
+        t = self._get_trace(trace_id)
+        turns = self._turns_for_trace(t)
+        match = next((turn for turn in turns if str(turn.get("turn_id")) == turn_id), None)
+        if match is None:
+            raise KeyError(turn_id)
+
+        start_ts = match.get("start_ts")
+        rows: list[dict[str, Any]] = []
+
+        for e in match.get("_sys_events", []):
+            et = str(e.get("type") or "")
+            include = False
+            if resource_type == "file" and et in {"file_read", "file_write", "file_delete", "file_rename"}:
+                include = str(e.get("path") or "") == resource_key
+            elif resource_type == "network" and et in {"net_connect", "net_send", "net_recv"}:
+                ne = self._with_inferred_net_dest(t, e)
+                display = self._network_display_label(ne)
+                include = display == resource_key
+
+            if not include:
+                continue
+
+            ts = self._event_ts(e)
+            rel_ms: float | None = None
+            if start_ts is not None:
+                rel_ms = max(0.0, (ts - float(start_ts)) * 1000.0)
+
+            rows.append(
+                {
+                    "syscall": et,
+                    "ts_rel_ms": rel_ms,
+                    "pid": int(e.get("pid") or 0),
+                    "summary": str(e.get("label") or et),
+                    "args": e,
+                }
+            )
+
+        rows.sort(key=lambda r: float(r.get("ts_rel_ms") or 0.0))
+
+        preview: dict[str, Any] = {"kind": "unavailable", "message": "Snapshot unavailable from BPF event stream"}
+        if resource_type == "file":
+            path = Path(resource_key)
+            if path.exists() and path.is_file():
+                try:
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                    preview = {"kind": "snapshot", "content": text[:12000]}
+                except Exception:
+                    pass
+
+        return {
+            "trace_id": trace_id,
+            "turn_id": turn_id,
+            "resource_type": resource_type,
+            "resource_key": resource_key,
+            "preview": preview,
+            "events": rows,
+        }
+
     def trace_summary(self, trace_id: str) -> dict[str, Any]:
         t = self._get_trace(trace_id)
 
@@ -3858,12 +4940,59 @@ def config() -> dict[str, Any]:
     }
 
 
+@app.get("/api/settings/llm-schemas")
+def get_llm_schemas() -> dict[str, Any]:
+    return store.list_llm_api_schemas()
+
+
+@app.post("/api/settings/llm-schemas")
+def set_llm_schemas(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    schemas = payload.get("schemas") if isinstance(payload, dict) else []
+    if not isinstance(schemas, list):
+        raise HTTPException(status_code=400, detail="schemas must be a list")
+    return store.set_llm_api_schemas(schemas)
+
+
 @app.get("/api/traces/{trace_id}/high-level-graph")
 def high_level_graph(trace_id: str) -> dict[str, Any]:
     try:
         return store.high_level_graph(trace_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Trace not found")
+
+
+@app.get("/api/traces/{trace_id}/turns")
+def turns_overview(trace_id: str) -> dict[str, Any]:
+    try:
+        return store.turns_overview(trace_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Trace not found")
+
+
+@app.get("/api/traces/{trace_id}/turns/{turn_id}")
+def turn_detail(trace_id: str, turn_id: str) -> dict[str, Any]:
+    try:
+        return store.turn_detail(trace_id, turn_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Trace turn not found")
+
+
+@app.get("/api/traces/{trace_id}/process-subtrace/{turn_id}/{pid}")
+def process_subtrace(trace_id: str, turn_id: str, pid: int) -> dict[str, Any]:
+    try:
+        return store.process_subtrace(trace_id, turn_id, pid)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Process sub-trace not found")
+
+
+@app.get("/api/traces/{trace_id}/raw-resource-events")
+def raw_resource_events(trace_id: str, turn_id: str, resource_type: str, resource_key: str) -> dict[str, Any]:
+    if resource_type not in {"file", "network"}:
+        raise HTTPException(status_code=400, detail="resource_type must be 'file' or 'network'")
+    try:
+        return store.raw_resource_events(trace_id, turn_id, resource_type, resource_key)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Resource events not found")
 
 
 @app.get("/api/traces/{trace_id}/process-graph/{pid}")
