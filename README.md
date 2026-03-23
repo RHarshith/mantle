@@ -123,12 +123,14 @@ Open `http://127.0.0.1:8099`.
 `mantle watch`
 
 - Runs an executable under MITM + eBPF capture.
-- Usage: `mantle watch [--mode <proxy|transparent>] [--trace-id <id>] [--port <mitm_port>] <executable> [exec] [prompt...]`
+- Interactive mode (`mantle watch <agent>`) preserves TTY behavior and disables eBPF capture by default; use `--interactive-ebpf` to opt in to interactive eBPF tracing.
+- Usage: `mantle watch [--mode <proxy|transparent>] [--trace-id <id>] [--port <mitm_port>] [--interactive-ebpf] <executable> [exec] [prompt...]`
 
 Examples:
 
 ```bash
 mantle watch codex
+mantle watch --interactive-ebpf codex
 mantle watch codex exec "summarize this repository"
 mantle watch --mode transparent codex exec "trace outbound API calls"
 mantle watch aider "fix failing tests"
@@ -195,7 +197,7 @@ Dashboard unreachable from host in Docker:
 No low-level syscall nodes in drilldown:
 
 - Ensure `bpftrace` is installed and runnable as root.
-- Confirm run output prints `eBPF trace: true`.
+- Confirm run output prints `eBPF trace: true` (`mantle watch <agent>` prints `false` unless `--interactive-ebpf` is provided).
 
 Codex authentication issues:
 

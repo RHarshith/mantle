@@ -782,8 +782,8 @@ async function refreshTraces(force = false) {
 function installStyles() {
   const style = document.createElement("style");
   style.textContent = `
-    .turn-tabs { display:flex; gap:10px; overflow:auto; padding: 6px 0 14px; }
-    .turn-tab { min-width: 220px; border:1px solid var(--border); border-radius:8px; background:var(--surface); text-align:left; padding:10px; cursor:pointer; }
+    .turn-tabs { display:flex; flex-direction:column; gap:10px; padding: 6px 0 14px; }
+    .turn-tab { width:100%; border:1px solid var(--border); border-radius:8px; background:var(--surface); text-align:left; padding:10px; cursor:pointer; }
     .turn-tab.active { box-shadow: inset 0 0 0 2px var(--blue-500); background: var(--blue-50); }
     .turn-tab-top { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
     .turn-id { font-weight:700; font-size:12px; }

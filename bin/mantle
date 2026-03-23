@@ -20,7 +20,7 @@ usage() {
     cat <<'EOF'
 Usage:
   mantle serve [--host <host>] [--port <port>] [--obs-root <path>]
-  mantle watch [--mode <proxy|transparent>] [--trace-id <id>] [--port <mitm_port>] <executable> [exec] [prompt...]
+    mantle watch [--mode <proxy|transparent>] [--trace-id <id>] [--port <mitm_port>] [--interactive-ebpf] <executable> [exec] [prompt...]
 
 Commands:
     serve    Start the observability dashboard.
@@ -139,6 +139,10 @@ watch_cmd() {
                 fi
                 passthrough+=("$1" "$2")
                 shift 2
+                ;;
+            --interactive-ebpf)
+                passthrough+=("$1")
+                shift
                 ;;
             -h|--help|help)
                 usage

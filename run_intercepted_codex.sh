@@ -20,10 +20,13 @@ TRACE_ID=""
 MITM_PORT=8899
 MITM_REV_PORT=8898
 AGENT_BIN="codex"
-TASK=""
+TASK=()
 MITM_USER="mitmproxyuser"
 INTERCEPT_MODE="${MANTLE_INTERCEPT_MODE:-${RTRACE_INTERCEPT_MODE:-proxy}}"
 AGENT_TAG="codex"
+ENABLE_EBPF=true
+INTERACTIVE_EBPF=false
+USE_PTY_WRAPPER=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -31,6 +34,7 @@ while [[ $# -gt 0 ]]; do
         --port)        MITM_PORT="$2"; shift 2 ;;
         --mode)        INTERCEPT_MODE="$2"; shift 2 ;;
         --agent)       AGENT_BIN="$2"; shift 2 ;;
+        --interactive-ebpf) INTERACTIVE_EBPF=true; shift ;;
         --)            shift; TASK=("$@"); break ;;
         -*)            echo "Unknown flag: $1" >&2; exit 1 ;;
         *)             TASK=("$@"); break ;;
@@ -69,6 +73,23 @@ if [[ -n "$OBS_ROOT_ENV" ]]; then
 fi
 AGENT_TAG="$(basename "$AGENT_BIN")"
 [ -z "$TRACE_ID" ] && TRACE_ID="${AGENT_TAG}_$(date +%Y%m%d_%H%M%S).ebpf.jsonl"
+
+# Interactive CLI flows require a real TTY. When no task is provided, launch
+# the agent directly (still under MITM capture) instead of piping through
+# bpftrace output capture, which forces stdout/stderr to non-TTY pipes.
+if [[ ${#TASK[@]} -eq 0 ]]; then
+    if $INTERACTIVE_EBPF; then
+        if command -v script >/dev/null 2>&1; then
+            ENABLE_EBPF=true
+            USE_PTY_WRAPPER=true
+        else
+            ENABLE_EBPF=false
+            echo "[mantle] --interactive-ebpf requested, but 'script' is unavailable; running without eBPF." >&2
+        fi
+    else
+        ENABLE_EBPF=false
+    fi
+fi
 
 # Resolve runtime venv path (allows consistent tool discovery under sudo).
 RUNTIME_VENV="${MANTLE_VENV:-${RTRACE_VENV:-$SCRIPT_DIR/.venv}}"
@@ -172,7 +193,7 @@ echo "  Trace ID:    $TRACE_ID"
 echo "  MITM mode:   $INTERCEPT_MODE"
 echo "  MITM proxy:  localhost:$MITM_PORT"
 echo "  MITM log:    $MITM_JSONL"
-echo "  eBPF trace:  true"
+echo "  eBPF trace:  $ENABLE_EBPF"
 echo "  eBPF file:   $EBPF_FILE"
 echo "═══════════════════════════════════════════════════════════"
 
@@ -312,7 +333,21 @@ cleanup() {
 trap cleanup EXIT
 
 # Build the agent command args
-AGENT_ARGS=("${TASK[@]:-}")
+AGENT_ARGS=("${TASK[@]}")
+
+if ! $ENABLE_EBPF; then
+    echo "[*] Running $AGENT_BIN interactively (eBPF disabled to preserve TTY)..."
+    "$AGENT_BIN_PATH" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"
+    echo "[*] $AGENT_BIN finished."
+    exit 0
+fi
+
+CAPTURE_CMD=("$AGENT_BIN_PATH" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}")
+if $USE_PTY_WRAPPER; then
+    printf -v PTY_AGENT_CMD '%q ' "$AGENT_BIN_PATH" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"
+    CAPTURE_CMD=(script -qefc "$PTY_AGENT_CMD" /dev/null)
+    echo "[*] Interactive PTY wrapper enabled for eBPF capture."
+fi
 
 if ! command -v bpftrace >/dev/null 2>&1; then
     echo "Error: bpftrace is required for BPF tracing but was not found in PATH." >&2
@@ -324,6 +359,6 @@ if [ ! -f "$EBPF_CAPTURE_SCRIPT" ]; then
 fi
 
 echo "[*] Running $AGENT_BIN with eBPF capture..."
-python3 "$EBPF_CAPTURE_SCRIPT" --output "$EBPF_FILE" -- "$AGENT_BIN_PATH" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"
+python3 "$EBPF_CAPTURE_SCRIPT" --output "$EBPF_FILE" -- "${CAPTURE_CMD[@]}"
 
 echo "[*] $AGENT_BIN finished."

@@ -161,10 +161,10 @@ class TraceStore:
                         "output_text",
                     ],
                     "sections": [
-                        {"id": "assistant_text", "label": "Assistant text", "path": "output[].content[].text", "mode": "text"},
-                        {"id": "output_text", "label": "Output text", "path": "output_text", "mode": "text"},
+                        {"id": "assistant_text", "label": "Assistant text", "path": "output_text", "mode": "text"},
+                        {"id": "assistant_messages", "label": "Assistant messages", "path": "output[].content[].text", "mode": "text"},
+                        {"id": "tool_calls", "label": "Tool calls", "path": "tool_calls", "mode": "json"},
                         {"id": "output_items", "label": "Output items", "path": "output", "mode": "json"},
-                        {"id": "response_stream", "label": "Response stream", "path": "_raw", "mode": "text"},
                         {"id": "usage", "label": "Usage", "path": "usage", "mode": "json"},
                     ],
                 },
@@ -386,6 +386,195 @@ class TraceStore:
 
         return [merged[sid] for sid in order if merged[sid].get("values")]
 
+    def _parse_sse_data_events(self, raw: str) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        if not raw:
+            return events
+
+        for line in raw.splitlines():
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict):
+                events.append(data)
+        return events
+
+    def _normalize_streaming_response_body(self, raw: str) -> dict[str, Any]:
+        events = self._parse_sse_data_events(raw)
+        if not events:
+            return {}
+
+        def _parse_json_or_raw(value: Any) -> Any:
+            if isinstance(value, (dict, list)):
+                return value
+            if isinstance(value, str):
+                txt = value.strip()
+                if not txt:
+                    return {}
+                try:
+                    return json.loads(txt)
+                except json.JSONDecodeError:
+                    return {"_raw": txt}
+            return {}
+
+        items_by_id: dict[str, dict[str, Any]] = {}
+        item_order: list[str] = []
+        message_text_parts: dict[str, list[str]] = defaultdict(list)
+        output_text_done: dict[str, str] = {}
+        function_args_parts: dict[str, str] = defaultdict(str)
+        custom_input_parts: dict[str, str] = defaultdict(str)
+        usage: dict[str, Any] | None = None
+
+        for event in events:
+            ev_type = str(event.get("type") or "")
+
+            if ev_type == "response.output_item.added":
+                item = event.get("item") or {}
+                if not isinstance(item, dict):
+                    continue
+                item_id = str(item.get("id") or "")
+                if not item_id:
+                    continue
+                if item_id not in items_by_id:
+                    item_order.append(item_id)
+                    items_by_id[item_id] = dict(item)
+                else:
+                    items_by_id[item_id].update(item)
+                continue
+
+            if ev_type == "response.output_item.done":
+                item = event.get("item") or {}
+                if not isinstance(item, dict):
+                    continue
+                item_id = str(item.get("id") or "")
+                if not item_id:
+                    continue
+                if item_id not in items_by_id:
+                    item_order.append(item_id)
+                    items_by_id[item_id] = {}
+                items_by_id[item_id].update(item)
+                continue
+
+            if ev_type == "response.output_text.delta":
+                item_id = str(event.get("item_id") or "")
+                delta = str(event.get("delta") or "")
+                if item_id and delta:
+                    message_text_parts[item_id].append(delta)
+                continue
+
+            if ev_type == "response.output_text.done":
+                item_id = str(event.get("item_id") or "")
+                text = str(event.get("text") or "")
+                if item_id and text:
+                    output_text_done[item_id] = text
+                continue
+
+            if ev_type == "response.function_call_arguments.delta":
+                item_id = str(event.get("item_id") or "")
+                if item_id:
+                    function_args_parts[item_id] += str(event.get("delta") or "")
+                continue
+
+            if ev_type == "response.custom_tool_call_input.delta":
+                item_id = str(event.get("item_id") or "")
+                if item_id:
+                    custom_input_parts[item_id] += str(event.get("delta") or "")
+                continue
+
+            if ev_type == "response.custom_tool_call_input.done":
+                item_id = str(event.get("item_id") or "")
+                if item_id:
+                    custom_input_parts[item_id] = str(event.get("input") or custom_input_parts.get(item_id) or "")
+                continue
+
+            if ev_type == "response.completed":
+                resp = event.get("response") or {}
+                if isinstance(resp, dict) and isinstance(resp.get("usage"), dict):
+                    usage = resp.get("usage")
+
+        output_items: list[dict[str, Any]] = []
+        assistant_texts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+
+        for item_id in item_order:
+            item = dict(items_by_id.get(item_id) or {})
+            if not item:
+                continue
+            item_type = str(item.get("type") or "")
+
+            if item_type == "message":
+                content = item.get("content")
+                text = ""
+                if isinstance(content, list):
+                    parts: list[str] = []
+                    for c in content:
+                        if isinstance(c, dict) and isinstance(c.get("text"), str) and str(c.get("text") or "").strip():
+                            parts.append(str(c.get("text") or "").strip())
+                    text = "\n".join(parts)
+                if not text:
+                    text = str(output_text_done.get(item_id) or "").strip()
+                if not text and message_text_parts.get(item_id):
+                    text = "".join(message_text_parts[item_id]).strip()
+                if text:
+                    item["content"] = [{"type": "output_text", "text": text}]
+                    assistant_texts.append(text)
+
+            if item_type == "function_call":
+                args_raw = str(item.get("arguments") or function_args_parts.get(item_id) or "")
+                if args_raw:
+                    item["arguments"] = args_raw
+                tool_calls.append(
+                    {
+                        "tool_call_id": item.get("call_id") or item.get("id") or item_id,
+                        "tool_name": item.get("name") or "unknown",
+                        "arguments": _parse_json_or_raw(args_raw),
+                    }
+                )
+
+            if item_type == "custom_tool_call":
+                call_input = str(item.get("input") or custom_input_parts.get(item_id) or "")
+                if call_input:
+                    item["input"] = call_input
+                tool_calls.append(
+                    {
+                        "tool_call_id": item.get("call_id") or item.get("id") or item_id,
+                        "tool_name": item.get("name") or "unknown",
+                        "input": call_input,
+                    }
+                )
+
+            output_items.append(item)
+
+        normalized: dict[str, Any] = {
+            "output": output_items,
+            "output_text": "\n\n".join([t for t in assistant_texts if t]),
+            "tool_calls": tool_calls,
+            "_raw": raw,
+        }
+        if usage is not None:
+            normalized["usage"] = usage
+        return normalized
+
+    def _normalize_response_body_for_sections(self, response_body: Any) -> dict[str, Any]:
+        if not isinstance(response_body, dict):
+            return {}
+
+        raw = response_body.get("_raw")
+        if isinstance(raw, str) and raw.strip():
+            parsed = self._normalize_streaming_response_body(raw)
+            if parsed:
+                merged = dict(response_body)
+                merged.update(parsed)
+                return merged
+
+        return response_body
+
     def _parse_llm_calls_from_mitm(self, trace: TraceState) -> list[dict[str, Any]]:
         if not trace.mitm_path or not trace.mitm_path.exists():
             return []
@@ -468,13 +657,16 @@ class TraceStore:
                             if isinstance(path, str) and str(path).strip()
                         ]
 
-                    response_sections = self._section_values(resp_body, resp_sections)
+                    normalized_resp_body = self._normalize_response_body_for_sections(resp_body)
+                    response_sections = self._section_values(normalized_resp_body, resp_sections)
+                    if normalized_resp_body is not resp_body:
+                        response_sections = self._merge_sections(response_sections, self._section_values(resp_body, resp_sections))
                     response_text = self._sections_to_text(response_sections)
 
                     # Fall back to parser-friendly content hints.
                     if not response_text:
                         response_texts: list[str] = []
-                        choices = resp_body.get("choices")
+                        choices = normalized_resp_body.get("choices")
                         if isinstance(choices, list):
                             for choice in choices:
                                 if not isinstance(choice, dict):
@@ -483,13 +675,32 @@ class TraceStore:
                                 content = msg.get("content")
                                 if isinstance(content, str) and content.strip():
                                     response_texts.append(content.strip())
+
+                        output_text = normalized_resp_body.get("output_text")
+                        if isinstance(output_text, str) and output_text.strip():
+                            response_texts.append(output_text.strip())
+
+                        tool_calls = normalized_resp_body.get("tool_calls")
+                        fallback_sections: list[dict[str, Any]] = []
+                        if isinstance(tool_calls, list) and tool_calls:
+                            fallback_sections.append(
+                                {
+                                    "id": "tool_calls",
+                                    "label": "Tool calls",
+                                    "values": [tool_calls],
+                                }
+                            )
+
                         if response_texts:
                             fallback_section = {
                                 "id": "assistant_text",
                                 "label": "Assistant text",
                                 "values": response_texts,
                             }
-                            response_sections = self._merge_sections(response_sections, [fallback_section])
+                            fallback_sections.insert(0, fallback_section)
+
+                        if fallback_sections:
+                            response_sections = self._merge_sections(response_sections, fallback_sections)
                             response_text = self._sections_to_text(response_sections)
 
                     target_idx: int | None = None
@@ -3710,6 +3921,7 @@ class TraceStore:
         sys_events: list[dict[str, Any]],
         tool_pairs: list[dict[str, Any]] | None,
         anchor_pid: int | None = None,
+        strict_anchor_children: bool = False,
     ) -> list[dict[str, Any]]:
         tool_pairs = tool_pairs or []
 
@@ -3897,12 +4109,12 @@ class TraceStore:
                     # running, so direct children of the anchor are not visible
                     # in this slice. Fall back to observed children in-slice so
                     # process/file kernel activity is still represented.
-                    if not direct_children:
+                    if not direct_children and not strict_anchor_children:
                         direct_children = sorted({
                             int(child)
                             for _parent, kids in children_by_parent.items()
                             for child in kids
-                            if int(child) > 0
+                            if int(child) > 0 and int(child) != resolved_anchor
                         })
                 else:
                     direct_children = sorted({
@@ -4126,7 +4338,13 @@ class TraceStore:
             if self._is_descendant_or_same_pid(t, int(e.get("pid") or 0), pid)
         ]
 
-        timeline = self._build_unified_timeline(t, sys_events, tool_pairs=[], anchor_pid=pid)
+        timeline = self._build_unified_timeline(
+            t,
+            sys_events,
+            tool_pairs=[],
+            anchor_pid=pid,
+            strict_anchor_children=True,
+        )
         command = ""
         start_ts: float | None = None
         end_ts: float | None = None
