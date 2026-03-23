@@ -197,6 +197,45 @@ function jsonBlock(value) {
   return `<pre class="mono-block">${escapeHtml(JSON.stringify(value ?? {}, null, 2))}</pre>`;
 }
 
+function sectionValueBlock(value) {
+  if (typeof value === "string") {
+    return `<pre class="mono-block">${escapeHtml(value || "")}</pre>`;
+  }
+  return `<pre class="mono-block">${escapeHtml(JSON.stringify(value ?? null, null, 2))}</pre>`;
+}
+
+function renderSectionPanels(title, sections, emptyText) {
+  const list = Array.isArray(sections) ? sections : [];
+  if (list.length === 0) {
+    return `<div class="mini-label">${escapeHtml(title)}</div><pre class="mono-block">${escapeHtml(emptyText)}</pre>`;
+  }
+
+  const items = list.map((section, idx) => {
+    const label = String(section?.label || section?.id || `section_${idx + 1}`);
+    const values = Array.isArray(section?.values) ? section.values : [];
+    const blocks = values.map((v) => sectionValueBlock(v)).join("");
+    return `
+      <details class="section-panel" ${idx === 0 ? "open" : ""}>
+        <summary>${escapeHtml(label)} <span class="section-count">(${formatNumber(values.length)})</span></summary>
+        <div class="section-body">${blocks || `<pre class="mono-block">${escapeHtml("No values")}</pre>`}</div>
+      </details>`;
+  }).join("");
+
+  return `<div class="mini-label">${escapeHtml(title)}</div><div class="section-panel-list">${items}</div>`;
+}
+
+function renderCountPills(counts) {
+  const c = counts || {};
+  const read = Number(c.read || 0);
+  const write = Number(c.write || 0);
+  const rename = Number(c.rename || 0);
+  const pills = [];
+  if (read > 0) pills.push(`<span class="op-pill op-read">R ${formatNumber(read)}</span>`);
+  if (write > 0) pills.push(`<span class="op-pill op-write">W ${formatNumber(write)}</span>`);
+  if (rename > 0) pills.push(`<span class="op-pill op-rename">Mv ${formatNumber(rename)}</span>`);
+  return pills.join("");
+}
+
 function makeToggle(button, panel) {
   button.addEventListener("click", () => {
     const expanded = panel.style.display !== "none";
@@ -258,7 +297,7 @@ function createFileTreeNode(node, turnId) {
   details.className = "tree-dir";
   details.open = true;
   const summary = document.createElement("summary");
-  summary.textContent = node.name || "/";
+  summary.innerHTML = `<span>${escapeHtml(node.name || "/")}</span><span class="tree-pills">${renderCountPills(node.counts)}</span>`;
   details.appendChild(summary);
 
   for (const child of node.children || []) {
@@ -270,6 +309,7 @@ function createFileTreeNode(node, turnId) {
 function renderSystemGroup(entry, turnId) {
   const row = document.createElement("div");
   row.className = `timeline-row ${systemTone(entry.category)}`;
+  const groupPills = entry.category === "file" ? renderCountPills(entry.counts) : "";
 
   const hasExpand = entry.category === "process"
     ? Array.isArray(entry.process_tree) && entry.process_tree.length > 0
@@ -278,6 +318,7 @@ function renderSystemGroup(entry, turnId) {
     <div class="timeline-head">
       <span class="row-title">${escapeHtml(entry.title)}</span>
       <span class="row-sub">${escapeHtml(entry.category)}</span>
+      ${groupPills ? `<span class="group-pills">${groupPills}</span>` : ""}
       ${hasExpand ? '<button class="inline-btn group-toggle">Expand</button>' : ""}
     </div>
     <div class="row-content" style="display:${hasExpand ? "none" : "block"};"></div>`;
@@ -386,59 +427,27 @@ function renderTurnDetail(payload) {
   const collapsible = document.createElement("details");
   collapsible.className = "prompt-response";
   collapsible.open = true;
+  const promptPanels = renderSectionPanels(
+    "Prompt",
+    payload.prompt_sections || [],
+    payload.prompt_text || "No prompt text captured"
+  );
+  const responsePanels = renderSectionPanels(
+    "Response",
+    payload.response_sections || [],
+    payload.response_text || "No response text captured"
+  );
   collapsible.innerHTML = `
     <summary>Prompt and model response</summary>
     <div class="pr-grid">
-      <div>
-        <div class="mini-label">Prompt</div>
-        <pre class="mono-block">${escapeHtml(payload.prompt_text || "No prompt text captured")}</pre>
-      </div>
-      <div>
-        <div class="mini-label">Response</div>
-        <pre class="mono-block">${escapeHtml(payload.response_text || "No response text captured")}</pre>
-      </div>
+      <div>${promptPanels}</div>
+      <div>${responsePanels}</div>
     </div>`;
 
   const timeline = document.createElement("div");
   timeline.className = "timeline-wrap";
   const rawTimeline = payload.timeline || [];
-
-  // Collapse kernel activity that occurred before the first tool call.
-  let firstToolIdx = -1;
-  for (let i = 0; i < rawTimeline.length; i += 1) {
-    if (rawTimeline[i].entry_type === "tool_call") {
-      firstToolIdx = i;
-      break;
-    }
-  }
-  if (firstToolIdx > 0) {
-    const pre = rawTimeline.slice(0, firstToolIdx).filter((e) => e.entry_type === "system_group");
-    if (pre.length > 0) {
-      const counts = payload.pre_tool_counts || {};
-      const preRow = document.createElement("div");
-      preRow.className = "timeline-row row-process";
-      preRow.innerHTML = `
-        <div class="timeline-head">
-          <span class="row-title">Kernel setup activity before first tool</span>
-          <span class="row-sub">pre-tool block</span>
-          <button class="inline-btn group-toggle">Expand</button>
-        </div>
-        <div class="row-content" style="display:none;">
-          <div class="mono-text">reads=${formatNumber(counts.file_read || 0)} · writes=${formatNumber(counts.file_write || 0)} · spawns=${formatNumber(counts.process_spawn || 0)} · network_ops=${formatNumber(counts.network || 0)}</div>
-          <div class="nested-groups"></div>
-        </div>`;
-      const nested = preRow.querySelector(".nested-groups");
-      for (const entry of pre) {
-        nested.appendChild(renderSystemGroup(entry, payload.turn_id));
-      }
-      makeToggle(preRow.querySelector(".group-toggle"), preRow.querySelector(".row-content"));
-      timeline.appendChild(preRow);
-    }
-  }
-
-  const startIdx = firstToolIdx > 0 ? firstToolIdx : 0;
-  for (let i = startIdx; i < rawTimeline.length; i += 1) {
-    const entry = rawTimeline[i];
+  for (const entry of rawTimeline) {
     if (entry.entry_type === "tool_call") {
       timeline.appendChild(renderToolEntry(entry, payload.turn_id));
     } else {
@@ -797,6 +806,11 @@ function installStyles() {
     .prompt-response { background:var(--surface); border:1px solid var(--border); border-radius:8px; margin-bottom:12px; }
     .prompt-response > summary { cursor:pointer; padding:10px 12px; font-weight:700; }
     .pr-grid { display:grid; grid-template-columns: 1fr 1fr; gap:10px; padding:0 12px 12px; }
+    .section-panel-list { display:grid; gap:8px; }
+    .section-panel { border:1px solid var(--border); border-radius:8px; background:var(--surface); }
+    .section-panel > summary { cursor:pointer; padding:8px 10px; font-size:12px; font-weight:700; }
+    .section-body { padding:0 10px 10px; display:grid; gap:8px; }
+    .section-count { color:var(--text-muted); font-weight:600; }
 
     .timeline-wrap { display:flex; flex-direction:column; gap:10px; }
     .timeline-row { border:1px solid var(--border); border-radius:8px; background:var(--surface); padding:10px 12px; }
@@ -817,13 +831,19 @@ function installStyles() {
     .mini-label { font-size:10px; text-transform:uppercase; font-weight:700; color:var(--text-muted); margin-bottom:4px; }
 
     .tree-dir { margin-left: 6px; }
-    .tree-dir > summary { cursor:pointer; font-size:12px; font-weight:600; }
+    .tree-dir > summary { cursor:pointer; font-size:12px; font-weight:600; display:flex; align-items:center; justify-content:space-between; gap:8px; }
+    .tree-pills { display:flex; gap:6px; }
     .tree-file { margin-left: 18px; display:flex; justify-content:space-between; font-size:12px; border:1px solid var(--border-light); border-radius:6px; padding:4px 8px; cursor:pointer; }
     .tree-file:hover { background: var(--slate-50); }
     .tree-read { border-left:3px solid #d97706; }
     .tree-write { border-left:3px solid #dc2626; }
     .tree-read_write { border-left:3px solid #b45309; }
     .tree-state { font-size:10px; text-transform:uppercase; color:var(--text-muted); }
+    .group-pills { display:flex; gap:6px; }
+    .op-pill { font-size:10px; font-weight:700; border-radius:999px; padding:2px 7px; }
+    .op-read { background:#fef3c7; color:#92400e; }
+    .op-write { background:#fee2e2; color:#991b1b; }
+    .op-rename { background:#dbeafe; color:#1e40af; }
 
     .proc-list, .net-list { display:flex; flex-direction:column; gap:6px; margin-top:8px; }
     .proc-node, .net-node { border:1px solid var(--border); background:var(--surface); border-radius:6px; text-align:left; padding:6px 8px; cursor:pointer; font-size:12px; font-family:Consolas, Monaco, monospace; list-style:none; }

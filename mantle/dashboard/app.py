@@ -96,10 +96,21 @@ class TraceStore:
                 "request": {
                     "messages_path": "messages",
                     "instructions_path": "instructions",
+                    "sections": [
+                        {"id": "instructions", "label": "Instructions", "path": "instructions", "mode": "text"},
+                        {"id": "messages", "label": "Messages", "path": "messages", "mode": "messages_text"},
+                        {"id": "available_tools", "label": "Available tools", "path": "tools", "mode": "json"},
+                    ],
                 },
                 "response": {
                     "assistant_paths": [
                         "choices[].message.content",
+                    ],
+                    "sections": [
+                        {"id": "assistant_text", "label": "Assistant text", "path": "choices[].message.content", "mode": "text"},
+                        {"id": "tool_calls", "label": "Tool calls", "path": "choices[].message.tool_calls", "mode": "json"},
+                        {"id": "finish_reason", "label": "Finish reason", "path": "choices[].finish_reason", "mode": "text"},
+                        {"id": "usage", "label": "Usage", "path": "usage", "mode": "json"},
                     ],
                 },
             },
@@ -110,10 +121,21 @@ class TraceStore:
                 "request": {
                     "messages_path": "messages",
                     "instructions_path": "instructions",
+                    "sections": [
+                        {"id": "instructions", "label": "Instructions", "path": "instructions", "mode": "text"},
+                        {"id": "messages", "label": "Messages", "path": "messages", "mode": "messages_text"},
+                        {"id": "available_tools", "label": "Available tools", "path": "tools", "mode": "json"},
+                    ],
                 },
                 "response": {
                     "assistant_paths": [
                         "choices[].message.content",
+                    ],
+                    "sections": [
+                        {"id": "assistant_text", "label": "Assistant text", "path": "choices[].message.content", "mode": "text"},
+                        {"id": "tool_calls", "label": "Tool calls", "path": "choices[].message.tool_calls", "mode": "json"},
+                        {"id": "finish_reason", "label": "Finish reason", "path": "choices[].finish_reason", "mode": "text"},
+                        {"id": "usage", "label": "Usage", "path": "usage", "mode": "json"},
                     ],
                 },
             },
@@ -124,11 +146,26 @@ class TraceStore:
                 "request": {
                     "messages_path": "input",
                     "instructions_path": "instructions",
+                    "sections": [
+                        {"id": "instructions", "label": "Instructions", "path": "instructions", "mode": "text"},
+                        {"id": "input_messages", "label": "Input messages", "path": "input", "mode": "messages_text"},
+                        {"id": "input_text", "label": "Input text", "path": "input[].content[].text", "mode": "text"},
+                        {"id": "input_types", "label": "Input item types", "path": "input[].type", "mode": "text"},
+                        {"id": "tool_inputs", "label": "Tool inputs", "path": "input[].arguments", "mode": "json"},
+                        {"id": "available_tools", "label": "Available tools", "path": "tools", "mode": "json"},
+                    ],
                 },
                 "response": {
                     "assistant_paths": [
                         "output[].content[].text",
                         "output_text",
+                    ],
+                    "sections": [
+                        {"id": "assistant_text", "label": "Assistant text", "path": "output[].content[].text", "mode": "text"},
+                        {"id": "output_text", "label": "Output text", "path": "output_text", "mode": "text"},
+                        {"id": "output_items", "label": "Output items", "path": "output", "mode": "json"},
+                        {"id": "response_stream", "label": "Response stream", "path": "_raw", "mode": "text"},
+                        {"id": "usage", "label": "Usage", "path": "usage", "mode": "json"},
                     ],
                 },
             },
@@ -153,6 +190,28 @@ class TraceStore:
                 continue
             req = raw.get("request") if isinstance(raw.get("request"), dict) else {}
             resp = raw.get("response") if isinstance(raw.get("response"), dict) else {}
+
+            req_sections = req.get("sections") if isinstance(req.get("sections"), list) else []
+            resp_sections = resp.get("sections") if isinstance(resp.get("sections"), list) else []
+
+            def _norm_sections(items: list[Any]) -> list[dict[str, str]]:
+                out_sections: list[dict[str, str]] = []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    path = str(item.get("path") or "").strip()
+                    if not path:
+                        continue
+                    out_sections.append(
+                        {
+                            "id": str(item.get("id") or path).strip(),
+                            "label": str(item.get("label") or item.get("id") or path).strip(),
+                            "path": path,
+                            "mode": str(item.get("mode") or "text").strip(),
+                        }
+                    )
+                return out_sections
+
             normalized.append(
                 {
                     "id": schema_id,
@@ -161,9 +220,11 @@ class TraceStore:
                     "request": {
                         "messages_path": str(req.get("messages_path") or "").strip(),
                         "instructions_path": str(req.get("instructions_path") or "").strip(),
+                        "sections": _norm_sections(req_sections),
                     },
                     "response": {
                         "assistant_paths": [str(p) for p in (resp.get("assistant_paths") or []) if isinstance(p, str) and p.strip()],
+                        "sections": _norm_sections(resp_sections),
                     },
                 }
             )
@@ -232,6 +293,99 @@ class TraceStore:
                     out.append(text.strip())
         return out
 
+    def _section_values(self, data: Any, specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        sections: list[dict[str, Any]] = []
+        for spec in specs:
+            if not isinstance(spec, dict):
+                continue
+            path = str(spec.get("path") or "").strip()
+            if not path:
+                continue
+            mode = str(spec.get("mode") or "text").strip()
+            values: list[Any] = []
+
+            for raw in self._extract_by_path(data, path):
+                if mode == "messages_text":
+                    for text in self._extract_texts_from_messages(raw):
+                        if text:
+                            values.append(text)
+                    continue
+
+                if mode == "json":
+                    values.append(raw)
+                    continue
+
+                if isinstance(raw, str):
+                    txt = raw.strip()
+                    if txt:
+                        values.append(txt)
+                    continue
+
+                if isinstance(raw, list):
+                    for item in raw:
+                        if isinstance(item, str) and item.strip():
+                            values.append(item.strip())
+                        elif isinstance(item, dict) and isinstance(item.get("text"), str) and str(item.get("text") or "").strip():
+                            values.append(str(item.get("text") or "").strip())
+                    continue
+
+                if raw is not None:
+                    values.append(raw)
+
+            if not values:
+                continue
+
+            sections.append(
+                {
+                    "id": str(spec.get("id") or path),
+                    "label": str(spec.get("label") or spec.get("id") or path),
+                    "values": values,
+                }
+            )
+        return sections
+
+    def _sections_to_text(self, sections: list[dict[str, Any]]) -> str:
+        parts: list[str] = []
+        for section in sections:
+            for value in section.get("values") or []:
+                if isinstance(value, str):
+                    if value.strip():
+                        parts.append(value.strip())
+                else:
+                    parts.append(json.dumps(value, ensure_ascii=False))
+        return "\n\n".join([p for p in parts if p])
+
+    def _merge_sections(self, base: list[dict[str, Any]], extra: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        order: list[str] = []
+        merged: dict[str, dict[str, Any]] = {}
+
+        for source in [base, extra]:
+            for section in source:
+                sid = str(section.get("id") or "").strip()
+                if not sid:
+                    continue
+                if sid not in merged:
+                    merged[sid] = {
+                        "id": sid,
+                        "label": str(section.get("label") or sid),
+                        "values": [],
+                    }
+                    order.append(sid)
+
+                existing = merged[sid]
+                seen: set[str] = set()
+                for v in existing["values"]:
+                    seen.add(json.dumps(v, ensure_ascii=False, sort_keys=True))
+
+                for v in section.get("values") or []:
+                    sig = json.dumps(v, ensure_ascii=False, sort_keys=True)
+                    if sig in seen:
+                        continue
+                    existing["values"].append(v)
+                    seen.add(sig)
+
+        return [merged[sid] for sid in order if merged[sid].get("values")]
+
     def _parse_llm_calls_from_mitm(self, trace: TraceState) -> list[dict[str, Any]]:
         if not trace.mitm_path or not trace.mitm_path.exists():
             return []
@@ -279,25 +433,26 @@ class TraceStore:
                 resp_cfg = schema_match.get("response") or {}
 
                 if direction == "request":
-                    prompt_texts: list[str] = []
-                    instructions_path = str(req_cfg.get("instructions_path") or "")
-                    if instructions_path:
-                        for value in self._extract_by_path(req_body, instructions_path):
-                            if isinstance(value, str) and value.strip():
-                                prompt_texts.append(value.strip())
+                    req_sections = req_cfg.get("sections") if isinstance(req_cfg.get("sections"), list) else []
+                    if not req_sections:
+                        req_sections = []
+                        instructions_path = str(req_cfg.get("instructions_path") or "")
+                        messages_path = str(req_cfg.get("messages_path") or "")
+                        if instructions_path:
+                            req_sections.append({"id": "instructions", "label": "Instructions", "path": instructions_path, "mode": "text"})
+                        if messages_path:
+                            req_sections.append({"id": "messages", "label": "Messages", "path": messages_path, "mode": "messages_text"})
 
-                    messages_path = str(req_cfg.get("messages_path") or "")
-                    if messages_path:
-                        for value in self._extract_by_path(req_body, messages_path):
-                            if isinstance(value, list):
-                                prompt_texts.extend(self._extract_texts_from_messages(value))
+                    prompt_sections = self._section_values(req_body, req_sections)
 
                     pending.append(
                         {
                             "ts": ts,
                             "url": url,
                             "schema_id": schema_match.get("id"),
-                            "prompt_text": "\n\n".join([p for p in prompt_texts if p]),
+                            "prompt_sections": prompt_sections,
+                            "prompt_text": self._sections_to_text(prompt_sections),
+                            "response_sections": [],
                             "response_text": "",
                             "matched": False,
                         }
@@ -305,14 +460,20 @@ class TraceStore:
                     continue
 
                 if direction == "response":
-                    response_texts: list[str] = []
-                    for path in resp_cfg.get("assistant_paths") or []:
-                        for value in self._extract_by_path(resp_body, str(path)):
-                            if isinstance(value, str) and value.strip():
-                                response_texts.append(value.strip())
+                    resp_sections = resp_cfg.get("sections") if isinstance(resp_cfg.get("sections"), list) else []
+                    if not resp_sections:
+                        resp_sections = [
+                            {"id": "assistant_text", "label": "Assistant text", "path": str(path), "mode": "text"}
+                            for path in (resp_cfg.get("assistant_paths") or [])
+                            if isinstance(path, str) and str(path).strip()
+                        ]
+
+                    response_sections = self._section_values(resp_body, resp_sections)
+                    response_text = self._sections_to_text(response_sections)
 
                     # Fall back to parser-friendly content hints.
-                    if not response_texts:
+                    if not response_text:
+                        response_texts: list[str] = []
                         choices = resp_body.get("choices")
                         if isinstance(choices, list):
                             for choice in choices:
@@ -322,6 +483,14 @@ class TraceStore:
                                 content = msg.get("content")
                                 if isinstance(content, str) and content.strip():
                                     response_texts.append(content.strip())
+                        if response_texts:
+                            fallback_section = {
+                                "id": "assistant_text",
+                                "label": "Assistant text",
+                                "values": response_texts,
+                            }
+                            response_sections = self._merge_sections(response_sections, [fallback_section])
+                            response_text = self._sections_to_text(response_sections)
 
                     target_idx: int | None = None
                     for i in range(len(pending) - 1, -1, -1):
@@ -337,7 +506,8 @@ class TraceStore:
                     if target_idx is not None:
                         item = pending[target_idx]
                         item["matched"] = True
-                        item["response_text"] = "\n\n".join([t for t in response_texts if t])
+                        item["response_sections"] = response_sections
+                        item["response_text"] = response_text
                         calls.append(item)
 
         # Include unmatched requests as turns with empty responses.
@@ -3365,6 +3535,8 @@ class TraceStore:
 
             has_response = False
             response_texts: list[str] = []
+            prompt_sections: list[dict[str, Any]] = []
+            response_sections: list[dict[str, Any]] = []
             for ev in agent_slice:
                 if str(ev.get("event_type") or "") != "assistant_response":
                     continue
@@ -3383,10 +3555,12 @@ class TraceStore:
                         ptxt = str(call.get("prompt_text") or "").strip()
                         if ptxt:
                             prompt_texts.append(ptxt)
+                        prompt_sections = self._merge_sections(prompt_sections, call.get("prompt_sections") or [])
                         rtxt = str(call.get("response_text") or "").strip()
                         if rtxt:
                             response_texts.append(rtxt)
                             has_response = True
+                        response_sections = self._merge_sections(response_sections, call.get("response_sections") or [])
             else:
                 for ev in agent_slice:
                     et = str(ev.get("event_type") or "")
@@ -3400,6 +3574,11 @@ class TraceStore:
                             text = str(p or "").strip()
                             if text:
                                 prompt_texts.append(text)
+
+            if not prompt_sections and prompt_texts:
+                prompt_sections = [{"id": "prompt", "label": "Prompt", "values": prompt_texts}]
+            if not response_sections and response_texts:
+                response_sections = [{"id": "response", "label": "Response", "values": response_texts}]
 
             tags: list[str] = []
             only_reads = bool(tool_pairs) and bool(files_read) and not files_written and not has_grandchildren
@@ -3453,6 +3632,8 @@ class TraceStore:
                     "dominant_summary": dominant,
                     "prompt_text": "\n\n".join(prompt_texts),
                     "response_text": "\n\n".join(response_texts),
+                    "prompt_sections": prompt_sections,
+                    "response_sections": response_sections,
                     "files_read_count": len(files_read),
                     "files_written_count": len(files_written),
                     "subprocess_direct_count": len(direct_children_pids),
@@ -3494,7 +3675,32 @@ class TraceStore:
             leaf["state"] = item.get("state")
             leaf["read"] = bool(item.get("read"))
             leaf["write"] = bool(item.get("write"))
+            leaf["rename"] = bool(item.get("rename"))
+            leaf["read_count"] = int(item.get("read_count") or 0)
+            leaf["write_count"] = int(item.get("write_count") or 0)
+            leaf["rename_count"] = int(item.get("rename_count") or 0)
             leaf["event_count"] = int(item.get("event_count") or 0)
+
+        def _annotate_counts(node: dict[str, Any]) -> dict[str, int]:
+            if str(node.get("kind") or "") == "file":
+                counts = {
+                    "read": int(node.get("read_count") or (1 if node.get("read") else 0)),
+                    "write": int(node.get("write_count") or (1 if node.get("write") else 0)),
+                    "rename": int(node.get("rename_count") or (1 if node.get("rename") else 0)),
+                }
+                node["counts"] = counts
+                return counts
+
+            total = {"read": 0, "write": 0, "rename": 0}
+            for child in node.get("children") or []:
+                child_counts = _annotate_counts(child)
+                total["read"] += int(child_counts.get("read") or 0)
+                total["write"] += int(child_counts.get("write") or 0)
+                total["rename"] += int(child_counts.get("rename") or 0)
+            node["counts"] = total
+            return total
+
+        _annotate_counts(root)
 
         return root
 
@@ -3592,6 +3798,7 @@ class TraceStore:
 
             if cat == "file":
                 file_map: dict[str, dict[str, Any]] = {}
+                group_counts = {"read": 0, "write": 0, "rename": 0}
                 for e in events:
                     path = str(e.get("path") or "")
                     if not path:
@@ -3600,8 +3807,16 @@ class TraceStore:
                     et = str(e.get("type") or "")
                     if et == "file_read":
                         bucket["read"] = True
+                        bucket["read_count"] = int(bucket.get("read_count") or 0) + 1
+                        group_counts["read"] += 1
                     if et in {"file_write", "file_delete", "file_rename"}:
                         bucket["write"] = True
+                        bucket["write_count"] = int(bucket.get("write_count") or 0) + 1
+                        group_counts["write"] += 1
+                    if et == "file_rename":
+                        bucket["rename"] = True
+                        bucket["rename_count"] = int(bucket.get("rename_count") or 0) + 1
+                        group_counts["rename"] += 1
                     bucket["event_count"] += 1
 
                 files = []
@@ -3620,6 +3835,7 @@ class TraceStore:
                         "category": "file",
                         "standalone": len(events) == 1,
                         "title": f"{len(files)} files touched",
+                        "counts": group_counts,
                         "events_count": len(events),
                         "files": files,
                         "tree": self._file_tree(files),
@@ -3677,6 +3893,17 @@ class TraceStore:
                         for child in children_by_parent.get(resolved_anchor, [])
                         if int(child) > 0 and int(child) != resolved_anchor
                     })
+                    # Some turns begin after the true parent process is already
+                    # running, so direct children of the anchor are not visible
+                    # in this slice. Fall back to observed children in-slice so
+                    # process/file kernel activity is still represented.
+                    if not direct_children:
+                        direct_children = sorted({
+                            int(child)
+                            for _parent, kids in children_by_parent.items()
+                            for child in kids
+                            if int(child) > 0
+                        })
                 else:
                     direct_children = sorted({
                         int(child)
@@ -3874,6 +4101,8 @@ class TraceStore:
             },
             "prompt_text": match.get("prompt_text") or "",
             "response_text": match.get("response_text") or "",
+            "prompt_sections": match.get("prompt_sections") or [],
+            "response_sections": match.get("response_sections") or [],
             "pre_tool_counts": match.get("pre_tool_counts") or {},
             "timeline": timeline,
             "start_ts": match.get("start_ts"),
