@@ -75,6 +75,19 @@ KNOWN_LLM_HOSTS = {
 }
 
 
+def _ordered_unique_int(values: list[int]) -> list[int]:
+    """Deduplicate integer sequence while preserving first-seen order."""
+    out: list[int] = []
+    seen: set[int] = set()
+    for raw in values:
+        value = int(raw)
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
 @dataclass
 class TraceState:
     """In-memory mutable state for a single trace id."""
@@ -3018,6 +3031,283 @@ class TraceStore:
 
         return steps[:8]
 
+    def _collect_argument_strings(self, value: Any, depth: int = 0) -> list[str]:
+        if depth > 5:
+            return []
+
+        out: list[str] = []
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                out.append(text)
+            return out
+
+        if isinstance(value, list):
+            for item in value:
+                out.extend(self._collect_argument_strings(item, depth + 1))
+            return out
+
+        if isinstance(value, dict):
+            for key, item in value.items():
+                out.extend(self._collect_argument_strings(item, depth + 1))
+                if isinstance(key, str) and key.strip():
+                    out.append(key.strip())
+            return out
+
+        return out
+
+    def _extract_argument_path_hints(self, arguments: Any) -> list[str]:
+        candidates: list[str] = []
+        strings = self._collect_argument_strings(arguments)
+        path_re = re.compile(r"(?:~?/|\./|\.\./|/)[A-Za-z0-9_./\-~]+")
+
+        for text in strings:
+            if not text:
+                continue
+            if "/" in text or text.startswith("~"):
+                candidates.append(text)
+            for match in path_re.findall(text):
+                candidates.append(match)
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for value in candidates:
+            v = str(value).strip().strip('"\'')
+            if not v:
+                continue
+            if len(v) < 2 or len(v) > 512:
+                continue
+            key = v.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(v)
+        return normalized
+
+    def _extract_argument_command_hints(self, tool_pair: dict[str, Any]) -> list[str]:
+        out: list[str] = []
+        args = tool_pair.get("arguments") or {}
+        if isinstance(args, dict):
+            for key in ("command", "cmd", "script", "query"):
+                value = args.get(key)
+                if isinstance(value, str) and value.strip():
+                    out.append(value.strip())
+        base = self._extract_tool_command_text(tool_pair)
+        if base:
+            out.append(base)
+        tool_name = str(tool_pair.get("tool_name") or "").strip()
+        if tool_name:
+            out.append(tool_name)
+
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for item in out:
+            key = self._normalize_command_text(item)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            uniq.append(item)
+        return uniq
+
+    def _path_match_score(self, hint: str, event_path: str) -> int:
+        h = str(hint or "").strip().lower()
+        p = str(event_path or "").strip().lower()
+        if not h or not p:
+            return 0
+        if h == p:
+            return 120
+
+        h_base = Path(h).name.lower()
+        p_base = Path(p).name.lower()
+        if h_base and h_base == p_base:
+            return 70
+        if p.endswith(h) or h.endswith(p):
+            return 60
+        if h in p or p in h:
+            return 40
+        return 0
+
+    def _oldest_matching_command_root_pid(
+        self,
+        trace: TraceState,
+        sys_events: list[dict[str, Any]],
+        start_pid: int,
+        cmd_hints: list[str],
+        min_match_score: int = 8,
+    ) -> int:
+        """Return the oldest ancestor whose command_exec still matches tool params.
+
+        Traversal rules:
+        - Walk the process lineage upward from start_pid within the current scope.
+        - Track the first command_exec match and continue while ancestors also match.
+        - Stop at the first non-matching command_exec *after* matching has started.
+        - Never climb outside current scoped pids.
+        """
+        current = int(start_pid)
+        if current <= 0:
+            return 0
+
+        scope_pids: set[int] = set()
+        exec_by_pid: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for e in sys_events:
+            pid = int(e.get("pid") or 0)
+            child = int(e.get("child_pid") or 0)
+            if pid > 0:
+                scope_pids.add(pid)
+            if child > 0:
+                scope_pids.add(child)
+            if str(e.get("type") or "") == "command_exec" and pid > 0:
+                exec_by_pid[pid].append(e)
+
+        for pid in list(exec_by_pid.keys()):
+            exec_by_pid[pid].sort(key=lambda ev: int(ev.get("line_no") or 0))
+
+        best_root = current
+        found_match = False
+        seen: set[int] = set()
+
+        while current > 0 and current not in seen:
+            seen.add(current)
+            if current not in scope_pids:
+                break
+
+            exec_events = exec_by_pid.get(current) or []
+            has_match_here = False
+            if exec_events and cmd_hints:
+                best_score_here = 0
+                for ev in exec_events:
+                    for hint in cmd_hints:
+                        best_score_here = max(best_score_here, self._command_match_score(hint, ev))
+                has_match_here = best_score_here >= min_match_score
+
+            if has_match_here:
+                found_match = True
+                best_root = current
+            elif found_match:
+                # Stop once matching chain is broken.
+                break
+
+            parent = int(trace.process_parent.get(current, 0))
+            if parent <= 0:
+                break
+            current = parent
+
+        return best_root if found_match else int(start_pid)
+
+    def _match_tool_source_for_turn(
+        self,
+        trace: TraceState,
+        sys_events: list[dict[str, Any]],
+        tool_pair: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not sys_events:
+            return {"status": "source_not_found"}
+
+        start_ts = float(tool_pair.get("started_ts") or 0.0)
+        end_ts = float(tool_pair.get("finished_ts") or 0.0)
+        if end_ts <= 0.0 and start_ts > 0.0:
+            end_ts = start_ts + 5.0
+        if end_ts < start_ts:
+            end_ts = start_ts + 5.0
+
+        window: list[dict[str, Any]]
+        if start_ts > 0.0:
+            lo = start_ts - 1.0
+            hi = end_ts + 1.0
+            window = [e for e in sys_events if lo <= self._event_ts(e) <= hi]
+        else:
+            window = list(sys_events)
+        if not window:
+            window = list(sys_events)
+
+        cmd_hints = self._extract_argument_command_hints(tool_pair)
+        path_hints = self._extract_argument_path_hints(tool_pair.get("arguments") or {})
+
+        score_by_pid: defaultdict[int, int] = defaultdict(int)
+        best_event_for_pid: dict[int, dict[str, Any]] = {}
+
+        for ev in window:
+            et = str(ev.get("type") or "")
+            pid = int(ev.get("pid") or 0)
+            if pid <= 0:
+                continue
+
+            score = 0
+            if et == "command_exec":
+                best_cmd = 0
+                for hint in cmd_hints:
+                    best_cmd = max(best_cmd, self._command_match_score(hint, ev))
+                if best_cmd > 0:
+                    score += best_cmd + 20
+                if self._is_agent_internal_command(ev):
+                    score -= 40
+
+            if et in {"file_read", "file_write", "file_delete", "file_rename"}:
+                event_path = str(ev.get("path") or "")
+                best_path = 0
+                for hint in path_hints:
+                    best_path = max(best_path, self._path_match_score(hint, event_path))
+                if best_path > 0:
+                    score += best_path + 15
+
+            if score <= 0:
+                continue
+
+            score_by_pid[pid] += score
+            existing = best_event_for_pid.get(pid)
+            if existing is None or score > int(existing.get("_tool_source_score") or 0):
+                ev_copy = dict(ev)
+                ev_copy["_tool_source_score"] = score
+                best_event_for_pid[pid] = ev_copy
+
+        if not score_by_pid:
+            fallback_exec = [
+                e for e in window
+                if str(e.get("type") or "") == "command_exec" and not self._is_agent_internal_command(e)
+            ]
+            if not fallback_exec:
+                return {"status": "source_not_found"}
+
+            if start_ts > 0:
+                fallback_exec.sort(key=lambda e: abs(self._event_ts(e) - start_ts))
+            else:
+                fallback_exec.sort(key=lambda e: int(e.get("line_no") or 0))
+
+            pid = int(fallback_exec[0].get("pid") or 0)
+            if pid <= 0:
+                return {"status": "source_not_found"}
+            source_pid = self._oldest_matching_command_root_pid(trace, window, pid, cmd_hints)
+            if source_pid <= 0:
+                return {"status": "source_not_found"}
+            return {
+                "status": "matched",
+                "pid": source_pid,
+                "matched_by": "fallback_command",
+            }
+
+        best_pid = max(score_by_pid.items(), key=lambda item: item[1])[0]
+        total_score = int(score_by_pid.get(best_pid) or 0)
+        if total_score < 20:
+            return {"status": "source_not_found"}
+
+        source_pid = self._oldest_matching_command_root_pid(trace, window, best_pid, cmd_hints)
+        if source_pid <= 0:
+            return {"status": "source_not_found"}
+
+        best_event = best_event_for_pid.get(best_pid) or {}
+        matched_by = "command_or_path"
+        if str(best_event.get("type") or "") in {"file_read", "file_write", "file_delete", "file_rename"}:
+            matched_by = "path"
+        elif str(best_event.get("type") or "") == "command_exec":
+            matched_by = "command"
+
+        return {
+            "status": "matched",
+            "pid": source_pid,
+            "matched_by": matched_by,
+            "score": total_score,
+        }
+
     def _shell_step_needs_synthetic_node(self, step: str, visible_exec_events: list[dict[str, Any]]) -> bool:
         step_norm = self._normalize_command_text(step)
         if not step_norm:
@@ -3702,6 +3992,12 @@ class TraceStore:
         strict_anchor_children: bool = False,
     ) -> list[dict[str, Any]]:
         tool_pairs = tool_pairs or []
+        tool_source_by_id: dict[str, dict[str, Any]] = {}
+        for tp in tool_pairs:
+            tool_call_id = str(tp.get("tool_call_id") or "").strip()
+            if not tool_call_id:
+                continue
+            tool_source_by_id[tool_call_id] = self._match_tool_source_for_turn(trace, sys_events, tp)
 
         def _sys_cat(event: dict[str, Any]) -> str:
             et = str(event.get("type") or "")
@@ -3747,6 +4043,14 @@ class TraceStore:
         def _should_keep_at_current_level(ev: dict[str, Any]) -> bool:
             cat = _sys_cat(ev)
             if cat == "process":
+                # In strict anchor views (popup process subtrace), root pid
+                # command/exit records don't render as process groups and can
+                # fragment adjacent file groups into consecutive folder cards.
+                if strict_anchor_children and resolved_anchor > 0:
+                    et = str(ev.get("type") or "")
+                    ep = int(ev.get("pid") or 0)
+                    if ep == resolved_anchor and et in {"command_exec", "process_exit"}:
+                        return False
                 return True
 
             pid = int(ev.get("pid") or 0)
@@ -3875,32 +4179,32 @@ class TraceStore:
                     node = by_pid.get(parent)
                     if node is None:
                         continue
-                    node["children"] = sorted(set([*node.get("children", []), *kids]))
+                    node["children"] = _ordered_unique_int([*node.get("children", []), *kids])
 
                 if resolved_anchor > 0:
-                    direct_children = sorted({
+                    direct_children = _ordered_unique_int([
                         int(child)
                         for child in children_by_parent.get(resolved_anchor, [])
                         if int(child) > 0 and int(child) != resolved_anchor
-                    })
+                    ])
                     # Some turns begin after the true parent process is already
                     # running, so direct children of the anchor are not visible
                     # in this slice. Fall back to observed children in-slice so
                     # process/file kernel activity is still represented.
                     if not direct_children and not strict_anchor_children:
-                        direct_children = sorted({
+                        direct_children = _ordered_unique_int([
                             int(child)
                             for _parent, kids in children_by_parent.items()
                             for child in kids
                             if int(child) > 0 and int(child) != resolved_anchor
-                        })
+                        ])
                 else:
-                    direct_children = sorted({
+                    direct_children = _ordered_unique_int([
                         int(child)
                         for _parent, kids in children_by_parent.items()
                         for child in kids
                         if int(child) > 0
-                    })
+                    ])
 
                 process_tree = [by_pid[k] for k in direct_children if k in by_pid]
                 child_commands = [
@@ -3982,6 +4286,10 @@ class TraceStore:
                         "result": item["tool"].get("result"),
                         "started_ts": item["tool"].get("started_ts"),
                         "finished_ts": item["tool"].get("finished_ts"),
+                        "source": tool_source_by_id.get(
+                            str(item["tool"].get("tool_call_id") or ""),
+                            {"status": "source_not_found"},
+                        ),
                     }
                 )
                 continue
@@ -4099,22 +4407,91 @@ class TraceStore:
             "end_ts": match.get("end_ts"),
         }
 
-    def process_subtrace(self, trace_id: str, turn_id: str, pid: int) -> dict[str, Any]:
+    def process_subtrace(self, trace_id: str, turn_id: str, pid: int, full_lifecycle: bool = False) -> dict[str, Any]:
         t = self._get_trace(trace_id)
         turns = self._turns_for_trace(t)
         match = next((turn for turn in turns if str(turn.get("turn_id")) == turn_id), None)
-        if match is None:
+        if match is None and not full_lifecycle:
             raise KeyError(turn_id)
 
         pid = int(pid)
         if pid <= 0:
             raise KeyError("pid")
 
-        sys_events = [
-            e
-            for e in match.get("_sys_events", [])
-            if self._is_descendant_or_same_pid(t, int(e.get("pid") or 0), pid)
-        ]
+        # Keep process popup scoped to the selected turn when available.
+        # This prevents sibling tool-call activity from other turns from
+        # interleaving with this PID's file stream.
+        scoped_turn_events = list(match.get("_sys_events", [])) if isinstance(match, dict) else []
+        base_events = scoped_turn_events if scoped_turn_events else list(t.sys_events)
+
+        if full_lifecycle:
+            def _collect_filtered_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                all_events = sorted(events, key=lambda e: (self._event_ts(e), int(e.get("line_no") or 0)))
+                start_ts_local: float | None = None
+                end_ts_local: float | None = None
+
+                for e in all_events:
+                    et = str(e.get("type") or "")
+                    if et == "command_exec" and int(e.get("pid") or 0) == pid:
+                        ets = self._event_ts(e)
+                        start_ts_local = ets if start_ts_local is None else min(start_ts_local, ets)
+                    if et == "process_spawn" and int(e.get("child_pid") or 0) == pid:
+                        ets = self._event_ts(e)
+                        start_ts_local = ets if start_ts_local is None else min(start_ts_local, ets)
+                    if et == "process_exit" and int(e.get("pid") or 0) == pid:
+                        ets = self._event_ts(e)
+                        end_ts_local = ets if end_ts_local is None else max(end_ts_local, ets)
+
+                if start_ts_local is None:
+                    for e in all_events:
+                        if int(e.get("pid") or 0) == pid:
+                            start_ts_local = self._event_ts(e)
+                            break
+
+                out: list[dict[str, Any]] = []
+                # Criteria requested by user: pid == target_pid OR ppid == target_pid.
+                for e in all_events:
+                    ets = self._event_ts(e)
+                    if start_ts_local is not None and ets < start_ts_local:
+                        continue
+                    if end_ts_local is not None and ets > end_ts_local:
+                        continue
+
+                    ep = int(e.get("pid") or 0)
+                    ppid = int(e.get("ppid") or 0)
+                    if ep == pid or ppid == pid:
+                        out.append(e)
+                return out
+
+            # Primary path: selected-turn syscalls only.
+            sys_events = _collect_filtered_events(base_events)
+
+            if not sys_events and match is not None:
+                # Fallback for sparse turn slices: expand to full trace around the
+                # turn time span before doing pid/ppid filtering.
+                turn_start = match.get("start_ts")
+                turn_end = match.get("end_ts")
+                span_events: list[dict[str, Any]] = []
+                for e in t.sys_events:
+                    ets = self._event_ts(e)
+                    if turn_start is not None and ets < float(turn_start):
+                        continue
+                    if turn_end is not None and ets >= float(turn_end):
+                        continue
+                    span_events.append(e)
+                sys_events = _collect_filtered_events(span_events)
+
+            if not sys_events:
+                # Last resort to avoid empty popup when source mapping points just
+                # outside turn boundaries. pid/ppid filtering still applies.
+                sys_events = _collect_filtered_events(list(t.sys_events))
+        else:
+            assert match is not None
+            sys_events = [
+                e
+                for e in match.get("_sys_events", [])
+                if self._is_descendant_or_same_pid(t, int(e.get("pid") or 0), pid)
+            ]
 
         timeline = self._build_unified_timeline(
             t,
@@ -4185,6 +4562,7 @@ class TraceStore:
             "trace_id": trace_id,
             "turn_id": turn_id,
             "pid": pid,
+            "full_lifecycle": bool(full_lifecycle),
             "summary": {
                 "command": command,
                 "pid": pid,

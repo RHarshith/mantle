@@ -7,6 +7,10 @@ let activeTab = "trace";
 let replayOverview = null;
 let currentReplayTurnId = null;
 let currentReplayPaneTab = "context";
+let currentReplayToolSourceIndex = [];
+let replaySourceByToolCallId = new Map();
+let replaySourceByResultText = new Map();
+let replaySourceMapTraceId = null;
 
 let turnsOverview = null;
 let currentTurnId = null;
@@ -202,6 +206,162 @@ function jsonBlock(value) {
   return `<pre class="mono-block">${escapeHtml(JSON.stringify(value ?? {}, null, 2))}</pre>`;
 }
 
+function normalizeForMatch(value) {
+  return String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function collectResultTexts(value, out, depth = 0) {
+  if (depth > 4) return;
+  if (typeof value === "string") {
+    const v = normalizeForMatch(value);
+    if (v) out.push(v);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectResultTexts(item, out, depth + 1);
+    }
+    return;
+  }
+  if (value && typeof value === "object") {
+    for (const key of Object.keys(value)) {
+      collectResultTexts(value[key], out, depth + 1);
+      const k = normalizeForMatch(key);
+      if (k) out.push(k);
+    }
+  }
+}
+
+function extractToolCallIdFromValue(value) {
+  if (!value) return "";
+  if (typeof value === "object") {
+    const direct = value.tool_call_id || value.call_id || value.id;
+    return typeof direct === "string" ? direct : "";
+  }
+  if (typeof value !== "string") return "";
+  const text = value;
+  const patterns = [
+    /"tool_call_id"\s*:\s*"([^"]+)"/i,
+    /"call_id"\s*:\s*"([^"]+)"/i,
+    /\btool_call_id\s*=\s*([A-Za-z0-9_\-]+)/i,
+    /\bcall_id\s*=\s*([A-Za-z0-9_\-]+)/i,
+  ];
+  for (const re of patterns) {
+    const m = text.match(re);
+    if (m && m[1]) return m[1];
+  }
+  return "";
+}
+
+function extractResultTextsForLookup(result) {
+  const out = [];
+  if (typeof result === "string") {
+    const norm = normalizeForMatch(result);
+    if (norm) out.push(norm);
+    return out;
+  }
+  if (result == null) return out;
+
+  const jsonNorm = normalizeForMatch(JSON.stringify(result));
+  if (jsonNorm) out.push(jsonNorm);
+
+  if (typeof result === "object") {
+    const output = result.output;
+    if (typeof output === "string") {
+      const outputNorm = normalizeForMatch(output);
+      if (outputNorm) out.push(outputNorm);
+    }
+  }
+  return out;
+}
+
+function buildReplayToolSourceIndex(turnDetailPayload) {
+  const timeline = (turnDetailPayload && turnDetailPayload.timeline) || [];
+  const out = [];
+  for (const entry of timeline) {
+    if (!entry || entry.entry_type !== "tool_call") continue;
+    const source = entry.source && typeof entry.source === "object" ? entry.source : {};
+    const pid = Number(source.pid || 0);
+    const sourceInfo = pid > 0 ? { status: "matched", pid } : { status: "source_not_found" };
+
+    const texts = extractResultTextsForLookup(entry.result);
+
+    const unique = [];
+    const seen = new Set();
+    for (const t of texts) {
+      if (!t || seen.has(t)) continue;
+      seen.add(t);
+      unique.push(t);
+    }
+
+    for (const text of unique) {
+      out.push({ text, source: sourceInfo });
+    }
+  }
+  return out;
+}
+
+function findReplaySourceForValue(value) {
+  const callId = extractToolCallIdFromValue(value);
+  if (callId && replaySourceByToolCallId.has(callId)) {
+    return replaySourceByToolCallId.get(callId);
+  }
+
+  const norm = normalizeForMatch(value);
+  if (!norm) return { status: "source_not_found" };
+
+  if (replaySourceByResultText.has(norm)) {
+    return replaySourceByResultText.get(norm);
+  }
+
+  for (const item of currentReplayToolSourceIndex || []) {
+    const text = String(item.text || "");
+    if (!text) continue;
+    if (norm === text) return item.source;
+  }
+  return { status: "source_not_found" };
+}
+
+function absorbReplayToolSourcesFromTurnDetail(turnDetailPayload) {
+  const index = buildReplayToolSourceIndex(turnDetailPayload);
+  for (const item of index) {
+    const source = item && item.source ? item.source : { status: "source_not_found" };
+    const pid = Number(source.pid || 0);
+    if (pid <= 0) continue;
+
+    const timeline = (turnDetailPayload && turnDetailPayload.timeline) || [];
+    for (const entry of timeline) {
+      if (!entry || entry.entry_type !== "tool_call") continue;
+      if (entry.source && Number(entry.source.pid || 0) !== pid) continue;
+      const tcid = String(entry.tool_call_id || "").trim();
+      if (tcid) replaySourceByToolCallId.set(tcid, source);
+    }
+
+    const text = String(item.text || "").trim();
+    if (text) replaySourceByResultText.set(text, source);
+  }
+}
+
+async function primeReplaySourceMaps() {
+  if (!selectedTraceId || !replayOverview) return;
+  if (replaySourceMapTraceId === selectedTraceId) return;
+
+  replaySourceByToolCallId = new Map();
+  replaySourceByResultText = new Map();
+
+  const turns = (replayOverview.turns || []).map((t) => t.turn_id).filter(Boolean);
+  const results = await Promise.all(
+    turns.map((turnId) =>
+      api(`/api/traces/${encodeURIComponent(selectedTraceId)}/turns/${encodeURIComponent(turnId)}`).catch(() => null)
+    )
+  );
+  for (const payload of results) {
+    if (!payload) continue;
+    absorbReplayToolSourcesFromTurnDetail(payload);
+  }
+  replaySourceMapTraceId = selectedTraceId;
+}
+
 function sectionValueBlock(value) {
   if (typeof value === "string") {
     return `<pre class="mono-block">${escapeHtml(value || "")}</pre>`;
@@ -255,11 +415,18 @@ function renderToolEntry(entry, turnId) {
 
   const resultText = entry.result ? JSON.stringify(entry.result, null, 2) : "No result captured";
   const t = truncateLines(resultText, 3);
+  const source = entry && typeof entry.source === "object" ? entry.source : {};
+  const sourcePid = Number(source.pid || 0);
+  const hasSource = sourcePid > 0;
+  const sourceHtml = hasSource
+    ? `<button class="source-link" data-source-pid="${String(sourcePid)}">source: pid${String(sourcePid)}</button>`
+    : '<span class="source-missing">source: not found</span>';
 
   card.innerHTML = `
     <div class="timeline-head">
       <span class="row-title">Tool: ${escapeHtml(entry.tool_name || "unknown")}</span>
       <span class="row-sub">${escapeHtml(entry.tool_call_id || "")}</span>
+      ${sourceHtml}
     </div>
     <div class="row-content">
       <div><div class="mini-label">Input arguments</div>${jsonBlock(entry.arguments)}</div>
@@ -280,11 +447,19 @@ function renderToolEntry(entry, turnId) {
     });
   }
 
+  const sourceLink = card.querySelector(".source-link");
+  if (sourceLink && turnId) {
+    sourceLink.addEventListener("click", async () => {
+      await openSourceTracePopup(turnId, sourcePid, entry.tool_name || "unknown");
+    });
+  }
+
   return card;
 }
 
-function createFileTreeNode(node, turnId) {
+function createFileTreeNode(node, turnId, options = {}) {
   if (!node) return document.createElement("div");
+  const disableDrilldown = Boolean(options.disableDrilldown || options.disableResourceDrilldown);
 
   if (node.kind === "file") {
     const row = document.createElement("div");
@@ -292,9 +467,11 @@ function createFileTreeNode(node, turnId) {
     const stateText = state === "read_write" ? "read/write" : state;
     row.className = `tree-file tree-${state}`;
     row.innerHTML = `<span class="tree-name">${escapeHtml(node.name)}</span><span class="tree-state">${escapeHtml(stateText)}</span>`;
-    row.addEventListener("click", async () => {
-      await loadRawResource(turnId, "file", node.path, `${node.path} (${stateText})`);
-    });
+    if (!disableDrilldown && turnId) {
+      row.addEventListener("click", async () => {
+        await loadRawResource(turnId, "file", node.path, `${node.path} (${stateText})`);
+      });
+    }
     return row;
   }
 
@@ -306,15 +483,19 @@ function createFileTreeNode(node, turnId) {
   details.appendChild(summary);
 
   for (const child of node.children || []) {
-    details.appendChild(createFileTreeNode(child, turnId));
+    details.appendChild(createFileTreeNode(child, turnId, options));
   }
   return details;
 }
 
-function renderSystemGroup(entry, turnId) {
+function renderSystemGroup(entry, turnId, options = {}) {
   const row = document.createElement("div");
   row.className = `timeline-row ${systemTone(entry.category)}`;
   const groupPills = entry.category === "file" ? renderCountPills(entry.counts) : "";
+  const disableResourceDrilldown = Boolean(options.disableResourceDrilldown);
+  const disableProcessDrilldown = Boolean(options.disableProcessDrilldown);
+  const recursiveProcessExpand = Boolean(options.recursiveProcessExpand);
+  const fullLifecycle = Boolean(options.fullLifecycle);
 
   const hasExpand = entry.category === "process"
     ? Array.isArray(entry.process_tree) && entry.process_tree.length > 0
@@ -331,7 +512,7 @@ function renderSystemGroup(entry, turnId) {
   const content = row.querySelector(".row-content");
 
   if (entry.category === "file") {
-    const tree = createFileTreeNode(entry.tree, turnId);
+    const tree = createFileTreeNode(entry.tree, turnId, options);
     content.appendChild(tree);
   } else if (entry.category === "process") {
     const hints = document.createElement("div");
@@ -359,7 +540,8 @@ function renderSystemGroup(entry, turnId) {
 
         const nested = block.querySelector(".proc-inline-timeline");
         try {
-          const payload = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/process-subtrace/${encodeURIComponent(turnId)}/${encodeURIComponent(p.pid)}`);
+          const lifecycleQuery = fullLifecycle ? "?full_lifecycle=1" : "";
+          const payload = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/process-subtrace/${encodeURIComponent(turnId)}/${encodeURIComponent(p.pid)}${lifecycleQuery}`);
           const s = payload.summary || {};
           nested.innerHTML = "";
 
@@ -369,7 +551,7 @@ function renderSystemGroup(entry, turnId) {
           nested.appendChild(summary);
 
           for (const subEntry of payload.timeline || []) {
-            nested.appendChild(renderSystemGroup(subEntry, turnId));
+            nested.appendChild(renderSystemGroup(subEntry, turnId, options));
           }
         } catch (_err) {
           nested.innerHTML = '<div class="mono-text">Failed to load process activity for this PID.</div>';
@@ -379,7 +561,20 @@ function renderSystemGroup(entry, turnId) {
 
     content.appendChild(list);
 
-    if (!hasExpand) {
+    if (disableProcessDrilldown) {
+      content.style.display = "block";
+      const toggle = row.querySelector(".group-toggle");
+      if (toggle) {
+        toggle.style.display = "none";
+      }
+    } else if (recursiveProcessExpand) {
+      content.style.display = "block";
+      const toggle = row.querySelector(".group-toggle");
+      if (toggle) {
+        toggle.style.display = "none";
+      }
+      loadChildTimelines();
+    } else if (!hasExpand) {
       loadChildTimelines();
     } else {
       const toggle = row.querySelector(".group-toggle");
@@ -399,9 +594,11 @@ function renderSystemGroup(entry, turnId) {
       const btn = document.createElement("button");
       btn.className = "net-node";
       btn.innerHTML = `${escapeHtml(call.dest)} · tx ${formatNumber(call.bytes_sent)}B · rx ${formatNumber(call.bytes_recv)}B${call.full_capture ? ' · <span class="capture-flag">full capture available</span>' : ""}`;
-      btn.addEventListener("click", async () => {
-        await loadRawResource(turnId, "network", call.dest, call.dest);
-      });
+      if (!disableResourceDrilldown && turnId) {
+        btn.addEventListener("click", async () => {
+          await loadRawResource(turnId, "network", call.dest, call.dest);
+        });
+      }
       calls.appendChild(btn);
     }
     content.appendChild(calls);
@@ -415,6 +612,223 @@ function renderSystemGroup(entry, turnId) {
   }
 
   return row;
+}
+
+function ensureProcessTracePopup() {
+  let overlay = document.getElementById("processTraceOverlay");
+  if (overlay) {
+    return overlay;
+  }
+
+  overlay = document.createElement("div");
+  overlay.id = "processTraceOverlay";
+  overlay.className = "process-trace-overlay";
+  overlay.innerHTML = `
+    <div class="process-trace-modal" role="dialog" aria-modal="true" aria-label="Process trace">
+      <div class="process-trace-head">
+        <div>
+          <div class="process-trace-title" id="processTraceTitle">Process Trace</div>
+          <div class="process-trace-subtitle" id="processTraceSubtitle"></div>
+        </div>
+        <button class="btn" id="processTraceCloseBtn">Close</button>
+      </div>
+      <div class="process-trace-body" id="processTraceBody"></div>
+    </div>`;
+
+  document.body.appendChild(overlay);
+
+  const closeBtn = overlay.querySelector("#processTraceCloseBtn");
+  closeBtn.addEventListener("click", () => {
+    overlay.classList.remove("open");
+  });
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) {
+      overlay.classList.remove("open");
+    }
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      overlay.classList.remove("open");
+    }
+  });
+
+  return overlay;
+}
+
+function renderProcessTracePopup(payload, turnId, toolName) {
+  const overlay = ensureProcessTracePopup();
+  const titleEl = overlay.querySelector("#processTraceTitle");
+  const subtitleEl = overlay.querySelector("#processTraceSubtitle");
+  const bodyEl = overlay.querySelector("#processTraceBody");
+  const s = payload.summary || {};
+
+  titleEl.textContent = `Process Trace · pid ${String(s.pid || payload.pid || "-")}`;
+  subtitleEl.textContent = `Tool: ${String(toolName || "unknown")} · lifecycle ${payload.full_lifecycle ? "full" : "turn"}`;
+
+  const wrap = document.createElement("div");
+  wrap.className = "process-trace-content";
+
+  const meta = document.createElement("div");
+  meta.className = "group-pills";
+  const rootPills = [];
+  if (Number(s.child_processes_spawned || 0) > 0) rootPills.push(`${formatNumber(s.child_processes_spawned)} process${Number(s.child_processes_spawned) === 1 ? "" : "es"} spawned`);
+  if (Number(s.files_read || 0) > 0) rootPills.push(`reads ${formatNumber(s.files_read)}`);
+  if (Number(s.files_written || 0) > 0) rootPills.push(`writes ${formatNumber(s.files_written)}`);
+  if (Number(s.network_calls || 0) > 0) rootPills.push(`network ${formatNumber(s.network_calls)}`);
+  meta.innerHTML = rootPills.map((label) => `<span class="op-pill op-rename">${escapeHtml(label)}</span>`).join("");
+
+  const processTree = document.createElement("div");
+  processTree.className = "proc-list";
+
+  const renderProcessNode = (node, parentEl, depth = 0) => {
+    const row = document.createElement("div");
+    row.className = "timeline-row row-process";
+    row.style.marginLeft = `${Math.max(0, depth) * 16}px`;
+    row.innerHTML = `
+      <div class="timeline-head">
+        <span class="row-title">pid ${escapeHtml(String(node.pid))}</span>
+        <span class="row-sub mono-small">${escapeHtml(node.command || "(command unknown)")}</span>
+        <span class="group-pills"></span>
+        <button class="inline-btn group-toggle">Expand</button>
+      </div>
+      <div class="row-content" style="display:none;"><div class="mono-text">Loading process activity...</div></div>`;
+
+    const toggle = row.querySelector(".group-toggle");
+    const content = row.querySelector(".row-content");
+    const pillsHost = row.querySelector(".group-pills");
+    let loaded = false;
+
+    toggle.addEventListener("click", async () => {
+      const expanded = content.style.display !== "none";
+      content.style.display = expanded ? "none" : "block";
+      toggle.textContent = expanded ? "Expand" : "Collapse";
+      if (expanded || loaded) return;
+      loaded = true;
+
+      try {
+        const childPayload = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/process-subtrace/${encodeURIComponent(turnId)}/${encodeURIComponent(node.pid)}?full_lifecycle=1`);
+        const cs = childPayload.summary || {};
+        const childPills = [];
+        if (Number(cs.child_processes_spawned || 0) > 0) childPills.push(`${formatNumber(cs.child_processes_spawned)} process${Number(cs.child_processes_spawned) === 1 ? "" : "es"} spawned`);
+        if (Number(cs.files_read || 0) > 0) childPills.push(`reads ${formatNumber(cs.files_read)}`);
+        if (Number(cs.files_written || 0) > 0) childPills.push(`writes ${formatNumber(cs.files_written)}`);
+        if (Number(cs.network_calls || 0) > 0) childPills.push(`network ${formatNumber(cs.network_calls)}`);
+        pillsHost.innerHTML = childPills.map((label) => `<span class="op-pill op-rename">${escapeHtml(label)}</span>`).join("");
+
+        const children = extractChildren(childPayload.timeline || []);
+        content.innerHTML = "";
+        renderTimelineSequence(childPayload.timeline || [], content, depth + 1);
+        if (!content.children.length) {
+          content.innerHTML = '<div class="mono-text">No child activity.</div>';
+          return;
+        }
+      } catch (_err) {
+        content.innerHTML = '<div class="mono-text">Failed to load process activity for this PID.</div>';
+      }
+    });
+
+    parentEl.appendChild(row);
+  };
+
+  const renderCommandRow = (command, parentEl, depth = 0) => {
+    const row = document.createElement("div");
+    row.className = "timeline-row row-process";
+    row.style.marginLeft = `${Math.max(0, depth) * 16}px`;
+    row.innerHTML = `
+      <div class="timeline-head">
+        <span class="row-title">command_exec</span>
+        <span class="row-sub mono-small">${escapeHtml(command || "(command unknown)")}</span>
+      </div>`;
+    parentEl.appendChild(row);
+  };
+
+  const renderFileRow = (entry, parentEl, depth = 0) => {
+    const row = document.createElement("div");
+    row.className = "timeline-row row-file";
+    row.style.marginLeft = `${Math.max(0, depth) * 16}px`;
+    row.innerHTML = `
+      <div class="timeline-head">
+        <span class="row-title">${escapeHtml(entry.title || "files touched")}</span>
+        <span class="group-pills">${renderCountPills(entry.counts)}</span>
+      </div>
+      <div class="row-content" style="display:block;"></div>`;
+    const content = row.querySelector(".row-content");
+    content.appendChild(createFileTreeNode(entry.tree, null, { disableResourceDrilldown: true }));
+    parentEl.appendChild(row);
+  };
+
+  const renderNetworkRow = (entry, parentEl, depth = 0) => {
+    const row = document.createElement("div");
+    row.className = "timeline-row row-network";
+    row.style.marginLeft = `${Math.max(0, depth) * 16}px`;
+    const calls = Array.isArray(entry.calls) ? entry.calls : [];
+    const parts = [];
+    for (const call of calls) {
+      const sent = Number(call.bytes_sent || 0);
+      const recv = Number(call.bytes_recv || 0);
+      parts.push(`${call.dest} (tx ${sent}B rx ${recv}B)`);
+    }
+    row.innerHTML = `
+      <div class="timeline-head">
+        <span class="row-title">${escapeHtml(entry.title || "network")}</span>
+        <span class="row-sub mono-small">${escapeHtml(parts.join(" | ") || "No network details")}</span>
+      </div>`;
+    parentEl.appendChild(row);
+  };
+
+  const renderTimelineSequence = (timeline, parentEl, depth = 0) => {
+    for (const entry of timeline || []) {
+      if (!entry) continue;
+      const category = String(entry.category || "");
+
+      if (category === "file") {
+        renderFileRow(entry, parentEl, depth);
+        continue;
+      }
+
+      if (category === "process") {
+        const commands = Array.isArray(entry.commands) ? entry.commands : [];
+        for (const cmd of commands) {
+          renderCommandRow(String(cmd || ""), parentEl, depth);
+        }
+
+        const children = Array.isArray(entry.process_tree) ? entry.process_tree : [];
+        for (const child of children) {
+          const pid = Number(child && child.pid);
+          if (!pid) continue;
+          renderProcessNode({ pid, command: String((child && child.command) || "") }, parentEl, depth);
+        }
+        continue;
+      }
+
+      if (category === "network") {
+        renderNetworkRow(entry, parentEl, depth);
+      }
+    }
+  };
+
+  renderTimelineSequence(payload.timeline || [], processTree, 0);
+
+  wrap.appendChild(meta);
+  wrap.appendChild(processTree);
+  bodyEl.innerHTML = "";
+  bodyEl.appendChild(wrap);
+  overlay.classList.add("open");
+}
+
+async function openSourceTracePopup(turnId, pid, toolName) {
+  if (!selectedTraceId || !turnId || !pid) return;
+  const overlay = ensureProcessTracePopup();
+  const bodyEl = overlay.querySelector("#processTraceBody");
+  bodyEl.innerHTML = '<div class="mono-text">Loading process trace...</div>';
+  overlay.classList.add("open");
+
+  try {
+    const payload = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/process-subtrace/${encodeURIComponent(turnId)}/${encodeURIComponent(pid)}?full_lifecycle=1`);
+    renderProcessTracePopup(payload, turnId, toolName);
+  } catch (_err) {
+    bodyEl.innerHTML = '<div class="mono-text">Failed to load process trace for this source PID.</div>';
+  }
 }
 
 function renderTurnDetail(payload) {
@@ -465,16 +879,33 @@ function renderTurnDetail(payload) {
   graphCanvas.appendChild(timeline);
 }
 
-function replayValueBlock(value) {
-  if (typeof value === "string") {
-    return `<pre class="replay-pre">${escapeHtml(value)}</pre>`;
+function replayValueBlock(value, options = {}) {
+  const showSource = Boolean(options.showSource);
+  const source = options.source && typeof options.source === "object" ? options.source : { status: "source_not_found" };
+  const sourcePid = Number(source.pid || 0);
+  let sourceHtml = "";
+  if (showSource) {
+    sourceHtml = sourcePid > 0
+      ? `<button class="replay-source-link" data-source-pid="${String(sourcePid)}">source: pid${String(sourcePid)}</button>`
+      : '<span class="replay-source-missing">source: not found</span>';
   }
-  return `<pre class="replay-pre">${escapeHtml(JSON.stringify(value ?? null, null, 2))}</pre>`;
+
+  if (typeof value === "string") {
+    return `<div class="replay-value-wrap">${showSource ? `<div class="replay-value-head">${sourceHtml}</div>` : ""}<pre class="replay-pre">${escapeHtml(value)}</pre></div>`;
+  }
+  return `<div class="replay-value-wrap">${showSource ? `<div class="replay-value-head">${sourceHtml}</div>` : ""}<pre class="replay-pre">${escapeHtml(JSON.stringify(value ?? null, null, 2))}</pre></div>`;
 }
 
-function replaySectionCard(section) {
+function replaySectionCard(section, turnId) {
   const values = Array.isArray(section.values) ? section.values : [];
-  const blocks = values.map((v) => replayValueBlock(v)).join("");
+  const isToolOutput = String(section.style || "") === "tool_output";
+  const blocks = values.map((v) => {
+    if (!isToolOutput) {
+      return replayValueBlock(v);
+    }
+    const source = findReplaySourceForValue(v);
+    return replayValueBlock(v, { showSource: true, source, turnId });
+  }).join("");
   return `
     <details class="replay-card replay-${escapeHtml(section.style || "generic")}">
       <summary class="replay-band">
@@ -493,7 +924,7 @@ function renderReplayDetail(payload) {
   const title = isContext ? "Context" : "Action";
 
   const sectionsHtml = sections.length
-    ? sections.map((s) => replaySectionCard(s)).join("")
+    ? sections.map((s) => replaySectionCard(s, payload.turn_id)).join("")
     : '<div class="replay-empty">No structured sections for this tab.</div>';
 
   const right = graphCanvas.querySelector("#replayRightPane");
@@ -508,6 +939,14 @@ function renderReplayDetail(payload) {
       <button class="replay-subtab ${!isContext ? "active" : ""}" id="replayActionTab">Action</button>
     </div>
     <div class="replay-sections">${sectionsHtml}</div>`;
+
+  right.querySelectorAll(".replay-source-link").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const pid = Number(btn.getAttribute("data-source-pid") || "0");
+      if (!pid || !payload.turn_id) return;
+      await openSourceTracePopup(payload.turn_id, pid, "tool output");
+    });
+  });
 
   $("replayContextTab").addEventListener("click", () => {
     if (currentReplayPaneTab === "context") return;
@@ -558,7 +997,15 @@ function renderReplayShell(overview) {
 
 async function loadReplayTurnDetail(turnId) {
   if (!selectedTraceId) return;
-  const payload = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/replay-turns/${encodeURIComponent(turnId)}`);
+  await primeReplaySourceMaps();
+  const [payload, turnDetail] = await Promise.all([
+    api(`/api/traces/${encodeURIComponent(selectedTraceId)}/replay-turns/${encodeURIComponent(turnId)}`),
+    api(`/api/traces/${encodeURIComponent(selectedTraceId)}/turns/${encodeURIComponent(turnId)}`).catch(() => null),
+  ]);
+  currentReplayToolSourceIndex = turnDetail ? buildReplayToolSourceIndex(turnDetail) : [];
+  if (turnDetail) {
+    absorbReplayToolSourcesFromTurnDetail(turnDetail);
+  }
   renderReplayShell(replayOverview || { turns: [] });
   renderReplayDetail(payload);
 }
@@ -567,6 +1014,7 @@ async function loadReplayOverview() {
   if (!selectedTraceId) return;
   const payload = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/replay-turns`);
   replayOverview = payload;
+  replaySourceMapTraceId = null;
 
   const turns = payload.turns || [];
   const strip = $("summaryStrip");
@@ -954,6 +1402,9 @@ function installStyles() {
     .row-content { margin-top:8px; }
 
     .tool-entry { border-left:4px solid #7e22ce; }
+    .source-link { margin-left:auto; border:1px solid var(--blue-100); background:var(--blue-50); color:var(--blue-600); border-radius:999px; padding:2px 8px; font-size:10px; font-weight:700; cursor:pointer; }
+    .source-link:hover { background:var(--blue-100); }
+    .source-missing { margin-left:auto; font-size:10px; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.03em; }
     .row-file { border-left:4px solid #d97706; }
     .row-network { border-left:4px solid #2563eb; }
     .row-process { border-left:4px solid #6b7280; }
@@ -1028,6 +1479,11 @@ function installStyles() {
     .replay-card[open] .replay-band-toggle::before { content: "Collapse"; }
     .replay-band { padding:7px 10px; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.04em; }
     .replay-card-body { padding:8px; display:grid; gap:8px; overflow:visible; }
+    .replay-value-wrap { display:grid; gap:4px; }
+    .replay-value-head { display:flex; justify-content:flex-end; }
+    .replay-source-link { border:1px solid var(--blue-100); background:var(--blue-50); color:var(--blue-600); border-radius:999px; padding:2px 8px; font-size:10px; font-weight:700; cursor:pointer; }
+    .replay-source-link:hover { background:var(--blue-100); }
+    .replay-source-missing { font-size:10px; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.03em; }
     .replay-pre { margin:0; white-space:pre-wrap; word-break:break-word; font-family:Consolas, Monaco, monospace; font-size:11px; background:var(--slate-50); border:1px solid var(--border); border-radius:6px; padding:8px; overflow:visible; }
     .replay-empty { color:var(--text-muted); font-size:12px; padding:16px; text-align:center; }
 
@@ -1042,6 +1498,15 @@ function installStyles() {
 
     .graph-wrapper.replay-mode { overflow: hidden; }
     .graph-wrapper.replay-mode .graph-canvas { padding: 10px 12px 12px; height:100%; min-height:0; }
+
+    .process-trace-overlay { position:fixed; inset:0; background:rgba(15,23,42,0.42); display:none; align-items:center; justify-content:center; padding:18px; z-index:1200; }
+    .process-trace-overlay.open { display:flex; }
+    .process-trace-modal { width:min(1120px, 96vw); max-height:90vh; background:var(--surface); border:1px solid var(--border); border-radius:12px; box-shadow:0 24px 48px rgba(15,23,42,0.22); display:flex; flex-direction:column; overflow:hidden; }
+    .process-trace-head { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 12px; border-bottom:1px solid var(--border); }
+    .process-trace-title { font-size:14px; font-weight:700; color:var(--text-primary); }
+    .process-trace-subtitle { font-size:11px; color:var(--text-muted); margin-top:2px; }
+    .process-trace-body { padding:12px; overflow:auto; }
+    .process-trace-content { display:grid; gap:10px; }
 
     @media (max-width: 1200px) {
       .turn-exec-summary { grid-template-columns: repeat(3, 1fr); }

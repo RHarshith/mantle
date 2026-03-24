@@ -176,10 +176,10 @@ def replay_turn_detail(trace_id: str, turn_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/traces/{trace_id}/process-subtrace/{turn_id}/{pid}")
-def process_subtrace(trace_id: str, turn_id: str, pid: int) -> dict[str, Any]:
+def process_subtrace(trace_id: str, turn_id: str, pid: int, full_lifecycle: bool = False) -> dict[str, Any]:
 	"""Return a focused sub-trace for one process within a turn."""
 	try:
-		return store.process_subtrace(trace_id, turn_id, pid)
+		return store.process_subtrace(trace_id, turn_id, pid, full_lifecycle=full_lifecycle)
 	except KeyError:
 		raise HTTPException(status_code=404, detail="Process sub-trace not found")
 
