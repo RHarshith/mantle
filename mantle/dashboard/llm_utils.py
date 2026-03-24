@@ -23,6 +23,15 @@ def builtin_llm_api_schemas() -> list[dict[str, Any]]:
                     {"id": "messages", "label": "Messages", "path": "messages", "mode": "messages_text"},
                     {"id": "available_tools", "label": "Available tools", "path": "tools", "mode": "json"},
                 ],
+                "replay_context_sections": [
+                    {"id": "system_prompt", "label": "System prompt", "path": "instructions", "mode": "text"},
+                    {"id": "system_messages", "label": "System messages", "path": "messages", "mode": "messages_role_text", "roles": ["system"]},
+                    {"id": "developer_messages", "label": "Developer messages", "path": "messages", "mode": "messages_role_text", "roles": ["developer"]},
+                    {"id": "user_messages", "label": "User messages", "path": "messages", "mode": "messages_role_text", "roles": ["user"]},
+                    {"id": "assistant_messages", "label": "Assistant messages", "path": "messages", "mode": "messages_role_text", "roles": ["assistant"]},
+                    {"id": "tool_outputs", "label": "Tool outputs", "path": "messages", "mode": "messages_role_text", "roles": ["tool", "function_call_output", "custom_tool_call_output"]},
+                    {"id": "available_tools", "label": "Available tools", "path": "tools", "mode": "tools_compact"},
+                ],
             },
             "response": {
                 "assistant_paths": ["choices[].message.content"],
@@ -31,6 +40,10 @@ def builtin_llm_api_schemas() -> list[dict[str, Any]]:
                     {"id": "tool_calls", "label": "Tool calls", "path": "choices[].message.tool_calls", "mode": "json"},
                     {"id": "finish_reason", "label": "Finish reason", "path": "choices[].finish_reason", "mode": "text"},
                     {"id": "usage", "label": "Usage", "path": "usage", "mode": "json"},
+                ],
+                "replay_action_sections": [
+                    {"id": "assistant_text", "label": "Assistant text", "path": "choices[].message.content", "mode": "text"},
+                    {"id": "tool_calls", "label": "Tool calls", "path": "choices[].message.tool_calls", "mode": "tool_calls_compact"},
                 ],
             },
         },
@@ -46,6 +59,15 @@ def builtin_llm_api_schemas() -> list[dict[str, Any]]:
                     {"id": "messages", "label": "Messages", "path": "messages", "mode": "messages_text"},
                     {"id": "available_tools", "label": "Available tools", "path": "tools", "mode": "json"},
                 ],
+                "replay_context_sections": [
+                    {"id": "system_prompt", "label": "System prompt", "path": "instructions", "mode": "text"},
+                    {"id": "system_messages", "label": "System messages", "path": "messages", "mode": "messages_role_text", "roles": ["system"]},
+                    {"id": "developer_messages", "label": "Developer messages", "path": "messages", "mode": "messages_role_text", "roles": ["developer"]},
+                    {"id": "user_messages", "label": "User messages", "path": "messages", "mode": "messages_role_text", "roles": ["user"]},
+                    {"id": "assistant_messages", "label": "Assistant messages", "path": "messages", "mode": "messages_role_text", "roles": ["assistant"]},
+                    {"id": "tool_outputs", "label": "Tool outputs", "path": "messages", "mode": "messages_role_text", "roles": ["tool", "function_call_output", "custom_tool_call_output"]},
+                    {"id": "available_tools", "label": "Available tools", "path": "tools", "mode": "tools_compact"},
+                ],
             },
             "response": {
                 "assistant_paths": ["choices[].message.content"],
@@ -54,6 +76,10 @@ def builtin_llm_api_schemas() -> list[dict[str, Any]]:
                     {"id": "tool_calls", "label": "Tool calls", "path": "choices[].message.tool_calls", "mode": "json"},
                     {"id": "finish_reason", "label": "Finish reason", "path": "choices[].finish_reason", "mode": "text"},
                     {"id": "usage", "label": "Usage", "path": "usage", "mode": "json"},
+                ],
+                "replay_action_sections": [
+                    {"id": "assistant_text", "label": "Assistant text", "path": "choices[].message.content", "mode": "text"},
+                    {"id": "tool_calls", "label": "Tool calls", "path": "choices[].message.tool_calls", "mode": "tool_calls_compact"},
                 ],
             },
         },
@@ -74,6 +100,16 @@ def builtin_llm_api_schemas() -> list[dict[str, Any]]:
                     {"id": "tool_inputs", "label": "Tool inputs", "path": "input[].arguments", "mode": "json"},
                     {"id": "available_tools", "label": "Available tools", "path": "tools", "mode": "json"},
                 ],
+                "replay_context_sections": [
+                    {"id": "system_prompt", "label": "System prompt", "path": "instructions", "mode": "text"},
+                    {"id": "system_messages", "label": "System messages", "path": "input", "mode": "messages_role_text", "roles": ["system"]},
+                    {"id": "developer_messages", "label": "Developer messages", "path": "input", "mode": "messages_role_text", "roles": ["developer"]},
+                    {"id": "user_messages", "label": "User messages", "path": "input", "mode": "messages_role_text", "roles": ["user"]},
+                    {"id": "assistant_messages", "label": "Assistant messages", "path": "input", "mode": "messages_role_text", "roles": ["assistant"]},
+                    {"id": "tool_calls_in_context", "label": "Tool calls in context", "path": "input", "mode": "messages_role_text", "roles": ["function_call", "custom_tool_call", "tool_call"]},
+                    {"id": "tool_outputs", "label": "Tool outputs", "path": "input", "mode": "messages_role_text", "roles": ["tool", "function_call_output", "custom_tool_call_output"]},
+                    {"id": "available_tools", "label": "Available tools", "path": "tools", "mode": "tools_compact"},
+                ],
             },
             "response": {
                 "assistant_paths": ["output[].content[].text", "output_text"],
@@ -83,6 +119,12 @@ def builtin_llm_api_schemas() -> list[dict[str, Any]]:
                     {"id": "tool_calls", "label": "Tool calls", "path": "tool_calls", "mode": "json"},
                     {"id": "output_items", "label": "Output items", "path": "output", "mode": "json"},
                     {"id": "usage", "label": "Usage", "path": "usage", "mode": "json"},
+                ],
+                "replay_action_sections": [
+                    {"id": "assistant_text", "label": "Assistant text", "path": "output_text", "mode": "text"},
+                    {"id": "assistant_messages", "label": "Assistant messages", "path": "output[].content[].text", "mode": "text"},
+                    {"id": "tool_calls", "label": "Tool calls", "path": "output", "mode": "tool_calls_compact"},
+                    {"id": "tool_calls", "label": "Tool calls", "path": "tool_calls", "mode": "tool_calls_compact"},
                 ],
             },
         },
@@ -117,10 +159,12 @@ def normalize_llm_schemas(schemas: list[dict[str, Any]]) -> list[dict[str, Any]]
                     "messages_path": str(req.get("messages_path") or "").strip(),
                     "instructions_path": str(req.get("instructions_path") or "").strip(),
                     "sections": _norm_sections(req_sections),
+                    "replay_context_sections": _norm_sections(req.get("replay_context_sections") if isinstance(req.get("replay_context_sections"), list) else []),
                 },
                 "response": {
                     "assistant_paths": [str(p) for p in (resp.get("assistant_paths") or []) if isinstance(p, str) and p.strip()],
                     "sections": _norm_sections(resp_sections),
+                    "replay_action_sections": _norm_sections(resp.get("replay_action_sections") if isinstance(resp.get("replay_action_sections"), list) else []),
                 },
             }
         )
@@ -144,6 +188,11 @@ def _norm_sections(items: list[Any]) -> list[dict[str, str]]:
                 "label": str(item.get("label") or item.get("id") or path).strip(),
                 "path": path,
                 "mode": str(item.get("mode") or "text").strip(),
+                "roles": [
+                    str(r).strip()
+                    for r in (item.get("roles") or ([] if item.get("role") is None else [item.get("role")]))
+                    if str(r).strip()
+                ],
             }
         )
     return out_sections
@@ -183,6 +232,40 @@ def extract_by_path(data: Any, path: str) -> list[Any]:
     return curs
 
 
+def _content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for c in content:
+            if isinstance(c, str):
+                if c.strip():
+                    parts.append(c.strip())
+                continue
+            if not isinstance(c, dict):
+                continue
+            for key in ("text", "output_text", "output", "input"):
+                value = c.get(key)
+                if isinstance(value, str) and value.strip():
+                    parts.append(value.strip())
+        return "\n".join([p for p in parts if p]).strip()
+    if isinstance(content, dict):
+        for key in ("text", "output_text", "output", "input"):
+            value = content.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _message_role(msg: dict[str, Any]) -> str:
+    if not isinstance(msg, dict):
+        return ""
+    role = str(msg.get("role") or "").strip()
+    if role:
+        return role
+    return str(msg.get("type") or "").strip()
+
+
 def extract_texts_from_messages(messages: Any) -> list[str]:
     """Extract textual content from chat-style message arrays.
 
@@ -193,34 +276,10 @@ def extract_texts_from_messages(messages: Any) -> list[str]:
     if not isinstance(messages, list):
         return out
 
-    def _content_to_text(content: Any) -> str:
-        if isinstance(content, str):
-            return content.strip()
-        if isinstance(content, list):
-            parts: list[str] = []
-            for c in content:
-                if isinstance(c, str):
-                    if c.strip():
-                        parts.append(c.strip())
-                    continue
-                if not isinstance(c, dict):
-                    continue
-                for key in ("text", "output_text", "output", "input"):
-                    value = c.get(key)
-                    if isinstance(value, str) and value.strip():
-                        parts.append(value.strip())
-            return "\n".join([p for p in parts if p]).strip()
-        if isinstance(content, dict):
-            for key in ("text", "output_text", "output", "input"):
-                value = content.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
-        return ""
-
     for msg in messages:
         if not isinstance(msg, dict):
             continue
-        role = str(msg.get("role") or msg.get("type") or "unknown")
+        role = _message_role(msg) or "unknown"
 
         content = msg.get("content")
         if content is None and msg.get("type") == "function_call_output":
@@ -246,6 +305,150 @@ def extract_texts_from_messages(messages: Any) -> list[str]:
     return out
 
 
+def extract_role_texts_from_messages(messages: Any, roles: list[str]) -> list[str]:
+    """Extract message texts matching target roles/types without synthetic prefixes."""
+    out: list[str] = []
+    if not isinstance(messages, list):
+        return out
+
+    want = {str(r).strip() for r in roles if str(r).strip()}
+    if not want:
+        return out
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = _message_role(msg)
+        if role not in want:
+            continue
+
+        # Responses API tool-call items often store name/arguments without
+        # a content field. Emit compact structured entries for replay context.
+        if role in {"function_call", "custom_tool_call", "tool_call"}:
+            tool_name = str(msg.get("name") or "unknown")
+            tool_call_id = str(msg.get("call_id") or msg.get("id") or "")
+            tool_args = msg.get("arguments")
+            if tool_args is None:
+                tool_args = msg.get("input")
+            if isinstance(tool_args, str):
+                txt = tool_args.strip()
+                if txt:
+                    try:
+                        tool_args = json.loads(txt)
+                    except json.JSONDecodeError:
+                        tool_args = {"_raw": txt}
+                else:
+                    tool_args = {}
+            elif tool_args is None:
+                tool_args = {}
+            out.append(
+                {
+                    "tool_call_id": tool_call_id or tool_name,
+                    "tool_name": tool_name,
+                    "call_type": role,
+                    "arguments": tool_args,
+                }
+            )
+            continue
+
+        content = msg.get("content")
+        if content is None and role in {"function_call_output", "custom_tool_call_output"}:
+            content = msg.get("output")
+        text = _content_to_text(content)
+        if not text:
+            raw_out = msg.get("output")
+            if isinstance(raw_out, str) and raw_out.strip():
+                text = raw_out.strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def extract_tools_compact(raw_tools: Any) -> list[dict[str, Any]]:
+    """Extract tool metadata as compact records for replay display."""
+    out: list[dict[str, Any]] = []
+    if not isinstance(raw_tools, list):
+        return out
+
+    for item in raw_tools:
+        if not isinstance(item, dict):
+            continue
+        tool_type = str(item.get("type") or "").strip()
+        name = ""
+        if isinstance(item.get("name"), str) and str(item.get("name")).strip():
+            name = str(item.get("name")).strip()
+        fn = item.get("function")
+        if not name and isinstance(fn, dict) and isinstance(fn.get("name"), str) and str(fn.get("name")).strip():
+            name = str(fn.get("name")).strip()
+        if not name:
+            name = tool_type or "tool"
+        out.append({"name": name, "type": tool_type or "tool"})
+    return out
+
+
+def extract_tool_calls_compact(raw_calls: Any) -> list[dict[str, Any]]:
+    """Extract normalized tool-call entries from chat/responses payload shapes."""
+    out: list[dict[str, Any]] = []
+
+    def _parse_arguments(val: Any) -> Any:
+        if isinstance(val, (dict, list)):
+            return val
+        if isinstance(val, str):
+            txt = val.strip()
+            if not txt:
+                return {}
+            try:
+                return json.loads(txt)
+            except json.JSONDecodeError:
+                return {"_raw": txt}
+        return {}
+
+    def _append_call(call_id: str, name: str, call_type: str, arguments: Any) -> None:
+        if not call_id and not name:
+            return
+        out.append(
+            {
+                "tool_call_id": call_id or name or "tool_call",
+                "tool_name": name or "unknown",
+                "call_type": call_type or "function_call",
+                "arguments": _parse_arguments(arguments),
+            }
+        )
+
+    if isinstance(raw_calls, list):
+        for call in raw_calls:
+            if not isinstance(call, dict):
+                continue
+            fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+            call_id = str(call.get("id") or call.get("call_id") or "")
+            name = str((fn.get("name") if isinstance(fn, dict) else "") or call.get("name") or "")
+            arguments = (fn.get("arguments") if isinstance(fn, dict) else None)
+            if arguments is None:
+                arguments = call.get("arguments")
+            if arguments is None:
+                arguments = call.get("input")
+            _append_call(call_id, name, str(call.get("type") or ""), arguments)
+        return out
+
+    if isinstance(raw_calls, dict):
+        output = raw_calls.get("output")
+        if not isinstance(output, list):
+            return out
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            t = str(item.get("type") or "")
+            if t not in {"function_call", "custom_tool_call", "tool_call"}:
+                continue
+            _append_call(
+                str(item.get("call_id") or item.get("id") or ""),
+                str(item.get("name") or ""),
+                t,
+                item.get("arguments") if t != "custom_tool_call" else item.get("input"),
+            )
+    return out
+
+
 def section_values(data: Any, specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Resolve schema section specs to concrete values from payload data."""
     sections: list[dict[str, Any]] = []
@@ -256,6 +459,7 @@ def section_values(data: Any, specs: list[dict[str, Any]]) -> list[dict[str, Any
         if not path:
             continue
         mode = str(spec.get("mode") or "text").strip()
+        roles = [str(r).strip() for r in (spec.get("roles") or []) if str(r).strip()]
         values: list[Any] = []
 
         for raw in extract_by_path(data, path):
@@ -263,6 +467,24 @@ def section_values(data: Any, specs: list[dict[str, Any]]) -> list[dict[str, Any
                 for text in extract_texts_from_messages(raw):
                     if text:
                         values.append(text)
+                continue
+
+            if mode == "messages_role_text":
+                for text in extract_role_texts_from_messages(raw, roles):
+                    if text:
+                        values.append(text)
+                continue
+
+            if mode == "tools_compact":
+                compact_tools = extract_tools_compact(raw)
+                if compact_tools:
+                    values.extend(compact_tools)
+                continue
+
+            if mode == "tool_calls_compact":
+                compact_calls = extract_tool_calls_compact(raw)
+                if compact_calls:
+                    values.extend(compact_calls)
                 continue
 
             if mode == "json":
@@ -629,8 +851,15 @@ def parse_llm_calls_from_mitm(trace: Any, llm_api_schemas: list[dict[str, Any]])
                         "schema_id": schema_match.get("id"),
                         "prompt_sections": prompt_sections,
                         "prompt_text": sections_to_text(prompt_sections),
+                        "replay_context_sections": section_values(
+                            req_body,
+                            req_cfg.get("replay_context_sections")
+                            if isinstance(req_cfg.get("replay_context_sections"), list)
+                            else req_sections,
+                        ),
                         "response_sections": [],
                         "response_text": "",
+                        "replay_action_sections": [],
                         "matched": False,
                     }
                 )
@@ -647,8 +876,23 @@ def parse_llm_calls_from_mitm(trace: Any, llm_api_schemas: list[dict[str, Any]])
 
                 normalized_resp_body = normalize_response_body_for_sections(resp_body)
                 response_sections = section_values(normalized_resp_body, resp_sections)
+                replay_action_sections = section_values(
+                    normalized_resp_body,
+                    resp_cfg.get("replay_action_sections")
+                    if isinstance(resp_cfg.get("replay_action_sections"), list)
+                    else resp_sections,
+                )
                 if normalized_resp_body is not resp_body:
                     response_sections = merge_sections(response_sections, section_values(resp_body, resp_sections))
+                    replay_action_sections = merge_sections(
+                        replay_action_sections,
+                        section_values(
+                            resp_body,
+                            resp_cfg.get("replay_action_sections")
+                            if isinstance(resp_cfg.get("replay_action_sections"), list)
+                            else resp_sections,
+                        ),
+                    )
                 response_text = sections_to_text(response_sections)
 
                 if not response_text:
@@ -695,6 +939,7 @@ def parse_llm_calls_from_mitm(trace: Any, llm_api_schemas: list[dict[str, Any]])
                     item["matched"] = True
                     item["response_sections"] = response_sections
                     item["response_text"] = response_text
+                    item["replay_action_sections"] = replay_action_sections
                     calls.append(item)
 
     for item in pending:

@@ -148,11 +148,29 @@ def turns_overview(trace_id: str) -> dict[str, Any]:
 		raise HTTPException(status_code=404, detail="Trace not found")
 
 
+@app.get("/api/traces/{trace_id}/replay-turns")
+def replay_turns_overview(trace_id: str) -> dict[str, Any]:
+	"""Return replay-oriented turn list for debugger-style trace playback."""
+	try:
+		return store.replay_turns_overview(trace_id)
+	except KeyError:
+		raise HTTPException(status_code=404, detail="Trace not found")
+
+
 @app.get("/api/traces/{trace_id}/turns/{turn_id}")
 def turn_detail(trace_id: str, turn_id: str) -> dict[str, Any]:
 	"""Return detailed timeline/context for a single turn."""
 	try:
 		return store.turn_detail(trace_id, turn_id)
+	except KeyError:
+		raise HTTPException(status_code=404, detail="Trace turn not found")
+
+
+@app.get("/api/traces/{trace_id}/replay-turns/{turn_id}")
+def replay_turn_detail(trace_id: str, turn_id: str) -> dict[str, Any]:
+	"""Return structured context/action panes for one replay turn."""
+	try:
+		return store.replay_turn_detail(trace_id, turn_id)
 	except KeyError:
 		raise HTTPException(status_code=404, detail="Trace turn not found")
 

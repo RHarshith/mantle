@@ -20,6 +20,10 @@ from mantle.dashboard.llm_utils import (
     parse_llm_calls_from_mitm,
 )
 from mantle.dashboard.logging_utils import log_exception
+from mantle.dashboard.replay_trace import (
+    build_replay_overview,
+    build_replay_turn_detail,
+)
 from mantle.dashboard.syscall_utils import (
     command_network_targets,
     extract_fd,
@@ -3497,6 +3501,8 @@ class TraceStore:
             response_texts: list[str] = []
             prompt_sections: list[dict[str, Any]] = []
             response_sections: list[dict[str, Any]] = []
+            replay_context_sections: list[dict[str, Any]] = []
+            replay_action_sections: list[dict[str, Any]] = []
             for ev in agent_slice:
                 if str(ev.get("event_type") or "") != "assistant_response":
                     continue
@@ -3516,11 +3522,19 @@ class TraceStore:
                         if ptxt:
                             prompt_texts.append(ptxt)
                         prompt_sections = self._merge_sections(prompt_sections, call.get("prompt_sections") or [])
+                        replay_context_sections = self._merge_sections(
+                            replay_context_sections,
+                            call.get("replay_context_sections") or [],
+                        )
                         rtxt = str(call.get("response_text") or "").strip()
                         if rtxt:
                             response_texts.append(rtxt)
                             has_response = True
                         response_sections = self._merge_sections(response_sections, call.get("response_sections") or [])
+                        replay_action_sections = self._merge_sections(
+                            replay_action_sections,
+                            call.get("replay_action_sections") or [],
+                        )
             else:
                 for ev in agent_slice:
                     et = str(ev.get("event_type") or "")
@@ -3594,6 +3608,8 @@ class TraceStore:
                     "response_text": "\n\n".join(response_texts),
                     "prompt_sections": prompt_sections,
                     "response_sections": response_sections,
+                    "replay_context_sections": replay_context_sections,
+                    "replay_action_sections": replay_action_sections,
                     "files_read_count": len(files_read),
                     "files_written_count": len(files_written),
                     "subprocess_direct_count": len(direct_children_pids),
@@ -3607,6 +3623,19 @@ class TraceStore:
             )
 
         return turns
+
+    def replay_turns_overview(self, trace_id: str) -> dict[str, Any]:
+        trace = self._get_trace(trace_id)
+        turns = self._turns_for_trace(trace)
+        return build_replay_overview(trace_id, turns)
+
+    def replay_turn_detail(self, trace_id: str, turn_id: str) -> dict[str, Any]:
+        trace = self._get_trace(trace_id)
+        turns = self._turns_for_trace(trace)
+        match = next((turn for turn in turns if str(turn.get("turn_id")) == turn_id), None)
+        if match is None:
+            raise KeyError(turn_id)
+        return build_replay_turn_detail(trace_id, match)
 
     def _file_tree(self, file_items: list[dict[str, Any]]) -> dict[str, Any]:
         root: dict[str, Any] = {"name": "/", "kind": "dir", "children": []}

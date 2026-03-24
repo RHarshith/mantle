@@ -4,6 +4,9 @@ let selectedTraceId = null;
 let cachedTraces = [];
 let latestVersion = -1;
 let activeTab = "trace";
+let replayOverview = null;
+let currentReplayTurnId = null;
+let currentReplayPaneTab = "context";
 
 let turnsOverview = null;
 let currentTurnId = null;
@@ -12,9 +15,11 @@ let viewStack = [];
 const $ = (id) => document.getElementById(id);
 const traceListEl = $("traceList");
 const breadcrumbsEl = $("breadcrumbs");
+const graphWrapper = $("graphWrapper");
 const graphCanvas = $("graphCanvas");
 const detailsEl = $("details");
 const traceTabBtn = $("traceTabBtn");
+const replayTabBtn = $("replayTabBtn");
 const taintTabBtn = $("taintTabBtn");
 const blastTabBtn = $("blastTabBtn");
 const settingsTabBtn = $("settingsTabBtn");
@@ -460,6 +465,129 @@ function renderTurnDetail(payload) {
   graphCanvas.appendChild(timeline);
 }
 
+function replayValueBlock(value) {
+  if (typeof value === "string") {
+    return `<pre class="replay-pre">${escapeHtml(value)}</pre>`;
+  }
+  return `<pre class="replay-pre">${escapeHtml(JSON.stringify(value ?? null, null, 2))}</pre>`;
+}
+
+function replaySectionCard(section) {
+  const values = Array.isArray(section.values) ? section.values : [];
+  const blocks = values.map((v) => replayValueBlock(v)).join("");
+  return `
+    <details class="replay-card replay-${escapeHtml(section.style || "generic")}">
+      <summary class="replay-band">
+        <span class="replay-band-title">${escapeHtml(section.label || "Section")} (${formatNumber(values.length)})</span>
+        <span class="replay-band-toggle" aria-hidden="true"></span>
+      </summary>
+      <div class="replay-card-body">${blocks || '<pre class="replay-pre">No content</pre>'}</div>
+    </details>`;
+}
+
+function renderReplayDetail(payload) {
+  const contextSections = (((payload || {}).context || {}).sections) || [];
+  const actionSections = (((payload || {}).action || {}).sections) || [];
+  const isContext = currentReplayPaneTab === "context";
+  const sections = isContext ? contextSections : actionSections;
+  const title = isContext ? "Context" : "Action";
+
+  const sectionsHtml = sections.length
+    ? sections.map((s) => replaySectionCard(s)).join("")
+    : '<div class="replay-empty">No structured sections for this tab.</div>';
+
+  const right = graphCanvas.querySelector("#replayRightPane");
+  if (!right) return;
+  right.innerHTML = `
+    <div class="replay-pane-head">
+      <div class="replay-turn-label">${escapeHtml(payload.label || payload.turn_id || "Turn")}</div>
+      <div class="replay-meta">${escapeHtml(title)} view</div>
+    </div>
+    <div class="replay-subtabs">
+      <button class="replay-subtab ${isContext ? "active" : ""}" id="replayContextTab">Context</button>
+      <button class="replay-subtab ${!isContext ? "active" : ""}" id="replayActionTab">Action</button>
+    </div>
+    <div class="replay-sections">${sectionsHtml}</div>`;
+
+  $("replayContextTab").addEventListener("click", () => {
+    if (currentReplayPaneTab === "context") return;
+    currentReplayPaneTab = "context";
+    renderReplayDetail(payload);
+  });
+  $("replayActionTab").addEventListener("click", () => {
+    if (currentReplayPaneTab === "action") return;
+    currentReplayPaneTab = "action";
+    renderReplayDetail(payload);
+  });
+}
+
+function renderReplayShell(overview) {
+  const turns = (overview || {}).turns || [];
+  const turnButtons = turns.map((turn) => {
+    const active = turn.turn_id === currentReplayTurnId;
+    return `
+      <button class="replay-turn-item ${active ? "active" : ""}" data-turn-id="${escapeHtml(turn.turn_id)}">
+        <div class="replay-turn-top">
+          <span class="replay-turn-name">${escapeHtml(turn.label || turn.turn_id)}</span>
+          <span class="replay-turn-tools">${formatNumber(turn.tool_call_count)} tools</span>
+        </div>
+        <div class="replay-turn-meta">ctx ${formatNumber(turn.context_section_count)} · act ${formatNumber(turn.action_section_count)}</div>
+      </button>`;
+  }).join("");
+
+  graphCanvas.innerHTML = `
+    <div class="replay-layout">
+      <aside class="replay-left">
+        <div class="replay-left-head">Turns</div>
+        <div class="replay-turn-list">${turnButtons || '<div class="replay-empty">No turns available</div>'}</div>
+      </aside>
+      <section class="replay-right" id="replayRightPane">
+        <div class="replay-empty">Select a turn to inspect context and action details.</div>
+      </section>
+    </div>`;
+
+  graphCanvas.querySelectorAll(".replay-turn-item").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const turnId = btn.getAttribute("data-turn-id");
+      if (!turnId) return;
+      currentReplayTurnId = turnId;
+      await loadReplayTurnDetail(turnId);
+    });
+  });
+}
+
+async function loadReplayTurnDetail(turnId) {
+  if (!selectedTraceId) return;
+  const payload = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/replay-turns/${encodeURIComponent(turnId)}`);
+  renderReplayShell(replayOverview || { turns: [] });
+  renderReplayDetail(payload);
+}
+
+async function loadReplayOverview() {
+  if (!selectedTraceId) return;
+  const payload = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/replay-turns`);
+  replayOverview = payload;
+
+  const turns = payload.turns || [];
+  const strip = $("summaryStrip");
+  strip.style.gridTemplateColumns = "repeat(4, 1fr)";
+  strip.innerHTML = `
+    <div class="summary-card"><div class="k">Turns</div><div class="v">${formatNumber(turns.length)}</div></div>
+    <div class="summary-card"><div class="k">Tool Calls</div><div class="v">${formatNumber(turns.reduce((a, t) => a + Number(t.tool_call_count || 0), 0))}</div></div>
+    <div class="summary-card"><div class="k">Context Sections</div><div class="v">${formatNumber(turns.reduce((a, t) => a + Number(t.context_section_count || 0), 0))}</div></div>
+    <div class="summary-card"><div class="k">Action Sections</div><div class="v">${formatNumber(turns.reduce((a, t) => a + Number(t.action_section_count || 0), 0))}</div></div>`;
+
+  currentReplayPaneTab = "context";
+  if (!currentReplayTurnId || !turns.some((t) => t.turn_id === currentReplayTurnId)) {
+    currentReplayTurnId = turns.length > 0 ? turns[0].turn_id : null;
+  }
+
+  renderReplayShell(payload);
+  if (currentReplayTurnId) {
+    await loadReplayTurnDetail(currentReplayTurnId);
+  }
+}
+
 function renderProcessSubtrace(payload) {
   graphCanvas.innerHTML = "";
   const s = payload.summary || {};
@@ -583,9 +711,11 @@ async function restoreFromStack() {
 function setActiveTab(tabName) {
   activeTab = tabName;
   traceTabBtn.classList.toggle("active", tabName === "trace");
+  replayTabBtn.classList.toggle("active", tabName === "replay");
   taintTabBtn.classList.toggle("active", tabName === "taint");
   blastTabBtn.classList.toggle("active", tabName === "blast");
   settingsTabBtn.classList.toggle("active", tabName === "settings");
+  graphWrapper.classList.toggle("replay-mode", tabName === "replay");
 }
 
 async function loadTaintAnalysis() {
@@ -735,6 +865,8 @@ async function selectTrace(traceId) {
 
   if (activeTab === "trace") {
     await loadTurnsOverview();
+  } else if (activeTab === "replay") {
+    await loadReplayOverview();
   } else if (activeTab === "taint") {
     await loadTaintAnalysis();
   } else if (activeTab === "settings") {
@@ -770,6 +902,8 @@ async function refreshTraces(force = false) {
 
   if (activeTab === "trace") {
     await loadTurnsOverview();
+  } else if (activeTab === "replay") {
+    await loadReplayOverview();
   } else if (activeTab === "taint") {
     await loadTaintAnalysis();
   } else if (activeTab === "settings") {
@@ -864,12 +998,60 @@ function installStyles() {
     .schema-textarea { border:1px solid var(--border); border-radius:6px; padding:7px 9px; min-height:96px; font-family:Consolas, Monaco, monospace; font-size:12px; }
     .settings-actions { display:flex; gap:8px; margin-top:6px; }
 
+    .replay-layout { display:grid; grid-template-columns: 280px 1fr; gap:12px; height:100%; min-height:0; }
+    .replay-left { border:1px solid var(--border); border-radius:10px; background:var(--surface); overflow:hidden; display:flex; flex-direction:column; min-height:0; }
+    .replay-left-head { padding:10px 12px; font-size:12px; font-weight:700; color:var(--text-secondary); border-bottom:1px solid var(--border); text-transform:uppercase; letter-spacing:0.04em; }
+    .replay-turn-list { overflow:auto; display:flex; flex-direction:column; flex:1; min-height:0; }
+    .replay-turn-item { border:0; border-bottom:1px solid var(--border-light); background:var(--surface); text-align:left; padding:10px; cursor:pointer; }
+    .replay-turn-item:hover { background:var(--slate-50); }
+    .replay-turn-item.active { background:var(--blue-50); box-shadow: inset 3px 0 0 var(--blue-500); }
+    .replay-turn-top { display:flex; justify-content:space-between; gap:6px; }
+    .replay-turn-name { font-size:12px; font-weight:700; color:var(--text-primary); }
+    .replay-turn-tools { font-size:10px; color:var(--text-muted); text-transform:uppercase; }
+    .replay-turn-meta { margin-top:4px; font-size:11px; color:var(--text-secondary); }
+
+    .replay-right { border:1px solid var(--border); border-radius:10px; background:var(--surface); display:flex; flex-direction:column; min-height:0; min-width:0; }
+    .replay-pane-head { display:flex; justify-content:space-between; align-items:center; padding:10px 12px; border-bottom:1px solid var(--border); }
+    .replay-turn-label { font-weight:700; font-size:13px; color:var(--text-primary); }
+    .replay-meta { font-size:11px; color:var(--text-muted); text-transform:uppercase; }
+    .replay-subtabs { display:flex; gap:8px; padding:10px 12px; border-bottom:1px solid var(--border); }
+    .replay-subtab { border:1px solid var(--border); border-radius:999px; padding:5px 10px; background:var(--slate-50); color:var(--text-secondary); font-size:12px; font-weight:700; cursor:pointer; }
+    .replay-subtab.active { background:var(--blue-50); color:var(--blue-600); border-color:var(--blue-100); }
+
+    .replay-sections { padding:10px 12px 14px; overflow-y:auto; overflow-x:hidden; display:flex; flex-direction:column; gap:10px; flex:1; }
+    .replay-card { border:1px solid var(--border); border-radius:8px; overflow:visible; }
+    .replay-card > summary { list-style: none; cursor: pointer; display:flex; align-items:center; justify-content:space-between; gap:8px; }
+    .replay-card > summary::-webkit-details-marker { display: none; }
+    .replay-band-title { min-width: 0; }
+    .replay-band-toggle { font-size: 10px; font-weight: 600; opacity: 0.8; white-space: nowrap; }
+    .replay-band-toggle::before { content: "Expand"; }
+    .replay-card[open] .replay-band-toggle::before { content: "Collapse"; }
+    .replay-band { padding:7px 10px; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.04em; }
+    .replay-card-body { padding:8px; display:grid; gap:8px; overflow:visible; }
+    .replay-pre { margin:0; white-space:pre-wrap; word-break:break-word; font-family:Consolas, Monaco, monospace; font-size:11px; background:var(--slate-50); border:1px solid var(--border); border-radius:6px; padding:8px; overflow:visible; }
+    .replay-empty { color:var(--text-muted); font-size:12px; padding:16px; text-align:center; }
+
+    .replay-system .replay-band { background:#dbeafe; color:#1e3a8a; }
+    .replay-developer .replay-band { background:#ede9fe; color:#5b21b6; }
+    .replay-user .replay-band { background:#d1fae5; color:#065f46; }
+    .replay-assistant .replay-band { background:#fee2e2; color:#991b1b; }
+    .replay-tool_output .replay-band { background:#fef3c7; color:#92400e; }
+    .replay-tool_call .replay-band { background:#cffafe; color:#155e75; }
+    .replay-tools .replay-band { background:#e2e8f0; color:#334155; }
+    .replay-generic .replay-band { background:#f1f5f9; color:#334155; }
+
+    .graph-wrapper.replay-mode { overflow: hidden; }
+    .graph-wrapper.replay-mode .graph-canvas { padding: 10px 12px 12px; height:100%; min-height:0; }
+
     @media (max-width: 1200px) {
       .turn-exec-summary { grid-template-columns: repeat(3, 1fr); }
       .pr-grid { grid-template-columns: 1fr; }
+      .replay-layout { grid-template-columns: 220px 1fr; }
     }
     @media (max-width: 820px) {
       .turn-exec-summary { grid-template-columns: repeat(2, 1fr); }
+      .replay-layout { grid-template-columns: 1fr; }
+      .replay-left { max-height: 240px; }
     }
   `;
   document.head.appendChild(style);
@@ -907,6 +1089,14 @@ async function init() {
     viewStack = [];
     renderBreadcrumbs();
     await loadTurnsOverview();
+  });
+
+  replayTabBtn.addEventListener("click", async () => {
+    if (activeTab === "replay") return;
+    setActiveTab("replay");
+    viewStack = [{ kind: "replay", label: "Replay Trace" }];
+    renderBreadcrumbs();
+    await loadReplayOverview();
   });
 
   taintTabBtn.addEventListener("click", async () => {
