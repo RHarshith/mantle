@@ -20,7 +20,7 @@ usage() {
     cat <<'EOF'
 Usage:
   mantle serve [--host <host>] [--port <port>] [--obs-root <path>]
-    mantle watch [--mode <proxy|transparent>] [--trace-id <id>] [--port <mitm_port>] [--interactive-ebpf] <executable> [exec] [prompt...]
+    mantle watch [--mode <proxy|transparent>] [--trace-id <id>] [--port <mitm_port>] [--interactive-ebpf] <executable> [args...]
 
 Commands:
     serve    Start the observability dashboard.
@@ -29,8 +29,8 @@ Commands:
 Examples:
   mantle serve --host 0.0.0.0 --port 8099
   mantle watch codex
-  mantle watch codex exec "inspect this repo and summarize"
-  mantle watch --mode transparent codex exec "trace network behavior"
+    mantle watch codex exec "inspect this repo and summarize"
+    mantle watch --mode transparent codex --sandbox danger-full-access exec "trace network behavior"
   mantle watch aider "fix failing tests"
 EOF
 }
@@ -183,19 +183,8 @@ watch_cmd() {
         resolved_executable="$executable"
     fi
 
-    task_args=()
-    if [[ $# -eq 0 ]]; then
-        :
-    elif [[ "$1" == "exec" ]]; then
-        shift
-        if [[ $# -eq 0 ]]; then
-            echo "Error: 'exec' requires a prompt." >&2
-            exit 1
-        fi
-        task_args+=("exec" "$*")
-    else
-        task_args=("$@")
-    fi
+    # Forward all arguments after <executable> exactly as provided.
+    task_args=("$@")
 
     runner_args=("${passthrough[@]}" --agent "$resolved_executable")
     if [[ ${#task_args[@]} -gt 0 ]]; then
