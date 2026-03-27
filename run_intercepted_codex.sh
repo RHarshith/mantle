@@ -34,6 +34,7 @@ while [[ $# -gt 0 ]]; do
         --port)        MITM_PORT="$2"; shift 2 ;;
         --mode)        INTERCEPT_MODE="$2"; shift 2 ;;
         --agent)       AGENT_BIN="$2"; shift 2 ;;
+        --no-ebpf)     ENABLE_EBPF=false; shift ;;
         --interactive-ebpf) INTERACTIVE_EBPF=true; shift ;;
         --)            shift; TASK=("$@"); break ;;
         -*)            echo "Unknown flag: $1" >&2; exit 1 ;;
@@ -102,9 +103,28 @@ MITM_JSONL="$OBS_ROOT/mitm/${TRACE_BASENAME}.mitm.jsonl"
 EBPF_FILE="$OBS_ROOT/traces/$TRACE_ID"
 MITM_CA="${HOME}/.mitmproxy/mitmproxy-ca-cert.pem"
 EBPF_CAPTURE_SCRIPT="$SCRIPT_DIR/mantle/ebpf_capture.py"
+ROOT_PID_FILE="$OBS_ROOT/mitm/${TRACE_BASENAME}.root.pid"
+PID_WRAPPER_SCRIPT=""
 
 # Correlate native agent events with the same trace identifier used by eBPF/mitm.
 export AGENT_TRACE_ID="$TRACE_BASENAME"
+export MANTLE_AGENT_ROOT_PID_FILE="$ROOT_PID_FILE"
+rm -f "$ROOT_PID_FILE"
+
+make_pid_wrapper() {
+    local wrapper
+    wrapper="$(mktemp /tmp/mantle-agent-launch.XXXXXX.sh)"
+    {
+        echo "#!/usr/bin/env bash"
+        echo "set -euo pipefail"
+        echo "echo \"\$\$\" > $(printf '%q' "$ROOT_PID_FILE")"
+        printf "exec "
+        printf "%q " "$AGENT_BIN_PATH" "${AGENT_ARGS[@]}"
+        echo
+    } > "$wrapper"
+    chmod 700 "$wrapper"
+    PID_WRAPPER_SCRIPT="$wrapper"
+}
 
 # Find mitmdump
 MITMDUMP=""
@@ -216,6 +236,7 @@ if [[ "$INTERCEPT_MODE" == "transparent" ]]; then
     # so its own outbound traffic is excluded from iptables redirect.
     sudo -u "$MITM_USER" \
         MITM_CAPTURE_FILE="$MITM_JSONL" \
+        MANTLE_AGENT_ROOT_PID_FILE="$ROOT_PID_FILE" \
         HOME="$MITM_USER_HOME" \
         "${MITMDUMP_LAUNCH[@]}" \
             --mode transparent@"$MITM_PORT" \
@@ -271,14 +292,18 @@ fi
 
 # Install mitmproxy CA to system trust store (important for Rust binaries ignoring env vars)
 if [ -d "/usr/local/share/ca-certificates" ]; then
-    cp "$MITM_CA" /usr/local/share/ca-certificates/mitmproxy.crt
-    update-ca-certificates >/dev/null 2>&1
-    echo "[*] Installed mitmproxy CA to system trust store."
+    if [ -w "/usr/local/share/ca-certificates" ]; then
+        cp "$MITM_CA" /usr/local/share/ca-certificates/mitmproxy.crt
+        update-ca-certificates >/dev/null 2>&1 || true
+        echo "[*] Installed mitmproxy CA to system trust store."
+    else
+        echo "[*] Skipping system CA install (no write permission); using env-based CA bundle."
+    fi
 fi
 
 # Create a combined CA bundle: system CAs + mitmproxy CA
 # Rust's rustls reads SSL_CERT_FILE but needs ALL CAs (not just mitmproxy)
-COMBINED_CA="/tmp/ca-bundle-with-mitm.crt"
+COMBINED_CA="$(mktemp /tmp/mantle-ca-bundle.XXXXXX.crt)"
 cat /etc/ssl/certs/ca-certificates.crt "$MITM_CA" > "$COMBINED_CA" 2>/dev/null || \
     cp "$MITM_CA" "$COMBINED_CA"
 echo "[*] Combined CA bundle: $COMBINED_CA"
@@ -290,8 +315,11 @@ export https_proxy="http://127.0.0.1:$MITM_PORT"
 export http_proxy="http://127.0.0.1:$MITM_PORT"
 export ALL_PROXY="http://127.0.0.1:$MITM_PORT"
 export all_proxy="http://127.0.0.1:$MITM_PORT"
-export NO_PROXY="127.0.0.1,localhost,::1"
-export no_proxy="127.0.0.1,localhost,::1"
+# Keep bypasses configurable instead of hard-coding localhost exclusions.
+# Empty by default so local traffic (for example curl localhost:8080) is proxied and captured.
+NO_PROXY_VALUE="${MANTLE_NO_PROXY:-${RTRACE_NO_PROXY:-}}"
+export NO_PROXY="$NO_PROXY_VALUE"
+export no_proxy="$NO_PROXY_VALUE"
 export SSL_CERT_FILE="$COMBINED_CA"
 export REQUESTS_CA_BUNDLE="$COMBINED_CA"
 export NODE_EXTRA_CA_CERTS="$COMBINED_CA"
@@ -329,20 +357,24 @@ cleanup() {
     echo "[*] Done. Captured data:"
     [ -f "$MITM_JSONL" ] && echo "    MITM log:   $MITM_JSONL ($(wc -l < "$MITM_JSONL") lines)"
     [ -f "$EBPF_FILE" ] && echo "    eBPF log:   $EBPF_FILE ($(wc -l < "$EBPF_FILE") lines)"
+    [ -n "$PID_WRAPPER_SCRIPT" ] && rm -f "$PID_WRAPPER_SCRIPT"
+    [ -n "${COMBINED_CA:-}" ] && rm -f "$COMBINED_CA"
+    rm -f "$ROOT_PID_FILE"
 }
 trap cleanup EXIT
 
 # Build the agent command args
 AGENT_ARGS=("${TASK[@]}")
+make_pid_wrapper
 
 if ! $ENABLE_EBPF; then
     echo "[*] Running $AGENT_BIN interactively (eBPF disabled to preserve TTY)..."
-    "$AGENT_BIN_PATH" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"
+    "$PID_WRAPPER_SCRIPT"
     echo "[*] $AGENT_BIN finished."
     exit 0
 fi
 
-CAPTURE_CMD=("$AGENT_BIN_PATH" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}")
+CAPTURE_CMD=("$PID_WRAPPER_SCRIPT")
 if $USE_PTY_WRAPPER; then
     printf -v PTY_AGENT_CMD '%q ' "$AGENT_BIN_PATH" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"
     CAPTURE_CMD=(script -qefc "$PTY_AGENT_CMD" /dev/null)

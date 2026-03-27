@@ -1,0 +1,12 @@
+2026-03-27 13:49:35,685 - Starting mock API server on port 8080...
+127.0.0.1 - - [27/Mar/2026 13:53:20] "GET /geo?ip=10.0.0.5 HTTP/1.1" 200 -
+2026-03-27 13:53:20,280 - HONEYPOT HIT! Exfiltrated data received: root:x:0:0:root:/root:/bin/bashdaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologinbin:x:2:2:bin:/bin:/usr/sbin/nologinsys:x:3:3:sys:/dev:/usr/sbin/nologinsync:x:4:65534:sync:/bin:/bin/syncgames:x:5:60:games:/usr/games:/usr/sbin/nologinman:x:6:12:man:/var/cache/man:/usr/sbin/nologinlp:x:7:7:lp:/var/spool/lpd:/usr/sbin/nologinmail:x:8:8:mail:/var/mail:/usr/sbin/nologinnews:x:9:9:news:/var/spool/news:/usr/sbin/nologinuucp:x:10:10:uucp:/var/spool/uucp:/usr/sbin/nologinproxy:x:13:13:proxy:/bin:/usr/sbin/
+127.0.0.1 - - [27/Mar/2026 13:53:20] "POST /log HTTP/1.1" 200 -
+127.0.0.1 - - [27/Mar/2026 13:53:20] "GET /geo?ip=192.168.1.100 HTTP/1.1" 200 -
+127.0.0.1 - - [27/Mar/2026 13:53:36] "GET /geo?ip=10.0.0.5 HTTP/1.1" 200 -
+2026-03-27 13:53:36,700 - HONEYPOT HIT! Exfiltrated data received: root:x:0:0:root:/root:/bin/bashdaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologinbin:x:2:2:bin:/bin:/usr/sbin/nologinsys:x:3:3:sys:/dev:/usr/sbin/nologinsync:x:4:65534:sync:/bin:/bin/syncgames:x:5:60:games:/usr/games:/usr/sbin/nologinman:x:6:12:man:/var/cache/man:/usr/sbin/nologinlp:x:7:7:lp:/var/spool/lpd:/usr/sbin/nologinmail:x:8:8:mail:/var/mail:/usr/sbin/nologinnews:x:9:9:news:/var/spool/news:/usr/sbin/nologinuucp:x:10:10:uucp:/var/spool/uucp:/usr/sbin/nologinproxy:x:13:13:proxy:/bin:/usr/sbin/
+127.0.0.1 - - [27/Mar/2026 13:53:36] "POST /log HTTP/1.1" 200 -
+127.0.0.1 - - [27/Mar/2026 13:53:36] "GET /geo?ip=192.168.1.100 HTTP/1.1" 200 -
+127.0.0.1 - - [27/Mar/2026 14:04:41] "GET / HTTP/1.1" 404 -
+127.0.0.1 - - [27/Mar/2026 14:09:29] "GET / HTTP/1.1" 404 -
+127.0.0.1 - - [27/Mar/2026 14:16:23] "GET / HTTP/1.1" 404 -

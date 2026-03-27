@@ -1469,7 +1469,7 @@ class TraceStore:
         # Map proxy-local traffic to known MITM upstream endpoints so users can
         # see where traffic really went (for example git clone -> github.com:443).
         proxy_dests = {"127.0.0.1:8899", "127.0.0.1:8898", "localhost:8899", "localhost:8898"}
-        if dest.startswith("fd=") or dest in proxy_dests:
+        if dest in proxy_dests:
             enriched["inferred_dest"] = _best_endpoint_for_event_ts(float(event.get("ts") or 0.0))
         return enriched
 
@@ -4402,11 +4402,14 @@ class TraceStore:
 
             if cat == "network":
                 calls: dict[str, dict[str, Any]] = {}
+                connect_count = 0
                 for e in events:
                     ne = self._with_inferred_net_dest(trace, e)
                     dest = self._network_display_label(ne)
                     bucket = calls.setdefault(dest, {"dest": dest, "bytes_sent": 0, "bytes_recv": 0, "count": 0, "full_capture": False})
                     et = str(ne.get("type") or "")
+                    if et == "net_connect":
+                        connect_count += 1
                     if et == "net_send":
                         bucket["bytes_sent"] += int(ne.get("bytes") or 0)
                     elif et == "net_recv":
@@ -4422,8 +4425,9 @@ class TraceStore:
                         "entry_type": "system_group",
                         "category": "network",
                         "standalone": len(events) == 1,
-                        "title": f"{len(calls)} network calls",
+                        "title": f"{connect_count} network calls",
                         "events_count": len(events),
+                        "connect_count": connect_count,
                         "destinations": sorted(calls.keys()),
                         "calls": [calls[k] for k in sorted(calls.keys())],
                     }

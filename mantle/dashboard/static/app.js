@@ -726,7 +726,6 @@ function renderProcessTracePopup(payload, turnId, toolName) {
         if (Number(cs.network_calls || 0) > 0) childPills.push(`network ${formatNumber(cs.network_calls)}`);
         pillsHost.innerHTML = childPills.map((label) => `<span class="op-pill op-rename">${escapeHtml(label)}</span>`).join("");
 
-        const children = extractChildren(childPayload.timeline || []);
         content.innerHTML = "";
         renderTimelineSequence(childPayload.timeline || [], content, depth + 1);
         if (!content.children.length) {
@@ -1518,7 +1517,9 @@ async function selectTrace(traceId) {
   }
 }
 
-async function refreshTraces(force = false) {
+async function refreshTraces(force = false, options = {}) {
+  const preserveView = options.preserveView !== false;
+  const prevSelectedTraceId = selectedTraceId;
   const payload = await api("/api/traces");
   const version = Number(payload.version || 0);
   if (!force && version === latestVersion) {
@@ -1535,10 +1536,17 @@ async function refreshTraces(force = false) {
     selectedTraceId = cachedTraces.length > 0 ? cachedTraces[0].trace_id : null;
   }
 
+  const selectedTraceChanged = prevSelectedTraceId !== selectedTraceId;
+  const needsMainPaneBootstrap = graphCanvas.childElementCount === 0;
+
   renderTraceList(cachedTraces);
 
   if (!selectedTraceId) {
     graphCanvas.innerHTML = '<div class="empty-state"><h3>No trace selected</h3><p>Select a trace to view timeline.</p></div>';
+    return;
+  }
+
+  if (preserveView && !selectedTraceChanged && !needsMainPaneBootstrap) {
     return;
   }
 
@@ -1781,11 +1789,11 @@ async function init() {
     await loadSettingsView();
   });
 
-  await refreshTraces(true);
+  await refreshTraces(true, { preserveView: false });
 
   setInterval(async () => {
     try {
-      await refreshTraces(false);
+      await refreshTraces(false, { preserveView: true });
     } catch (_) {
       // keep polling
     }
@@ -1797,7 +1805,7 @@ async function init() {
     ws.onmessage = async (event) => {
       const msg = JSON.parse(event.data);
       if (msg.type === "version" && Number(msg.version) !== latestVersion) {
-        await refreshTraces(true);
+        await refreshTraces(false, { preserveView: true });
       }
     };
     ws.onerror = () => ws.close();

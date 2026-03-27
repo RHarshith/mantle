@@ -141,9 +141,12 @@ def _socket_inode_for_fd(pid: int, fd: int) -> int | None:
         return None
 
 
-def _read_proc_net(protocol: str) -> list[dict[str, Any]]:
+def _read_proc_net(protocol: str, pid: int | None = None) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
-    path = Path(f"/proc/net/{protocol}")
+    if pid is not None and pid > 0:
+        path = Path(f"/proc/{pid}/net/{protocol}")
+    else:
+        path = Path(f"/proc/net/{protocol}")
     if not path.exists():
         return entries
 
@@ -201,29 +204,33 @@ def _read_proc_net(protocol: str) -> list[dict[str, Any]]:
     return entries
 
 
-def _resolve_socket_endpoint(pid: int, fd: int) -> dict[str, Any] | None:
+def _resolve_socket_endpoint(pid: int, fd: int, retries: int = 4, delay_s: float = 0.002) -> dict[str, Any] | None:
     inode = _socket_inode_for_fd(pid, fd)
     if inode is None:
         return None
 
-    for proto in ("tcp", "tcp6", "udp", "udp6"):
-        for entry in _read_proc_net(proto):
-            if entry["inode"] != inode:
-                continue
+    attempts = max(1, int(retries))
+    for attempt in range(attempts):
+        for proto in ("tcp", "tcp6", "udp", "udp6"):
+            # Prefer the traced process namespace view for socket tables.
+            entries = _read_proc_net(proto, pid=pid) or _read_proc_net(proto)
+            for entry in entries:
+                if entry["inode"] != inode:
+                    continue
 
-            remote_host = entry.get("remote_host", "unknown")
-            remote_port = int(entry.get("remote_port") or 0)
-            dest = (
-                f"{remote_host}:{remote_port}"
-                if remote_port > 0 and remote_host != "unknown"
-                else f"fd={fd}"
-            )
+                remote_host = entry.get("remote_host", "unknown")
+                remote_port = int(entry.get("remote_port") or 0)
+                if remote_port <= 0 or remote_host == "unknown":
+                    continue
 
-            return {
-                "dest": dest,
-                "transport": entry.get("transport", "other"),
-                "family": entry.get("family", "other"),
-            }
+                return {
+                    "dest": f"{remote_host}:{remote_port}",
+                    "transport": entry.get("transport", "other"),
+                    "family": entry.get("family", "other"),
+                }
+
+        if attempt < attempts - 1:
+            time.sleep(max(0.0, float(delay_s)))
 
     return None
 
@@ -319,7 +326,14 @@ def _event_from_line(
                 cmdline_cache[pid] = cmdline
 
         command = cmdline or exec_path or "exec"
-        argv = shlex.split(cmdline) if cmdline else [exec_path]
+        if cmdline:
+            try:
+                argv = shlex.split(cmdline)
+            except ValueError:
+                # Fallback if there are unmatched quotes in the command line
+                argv = [cmdline]
+        else:
+            argv = [exec_path]
 
         return {
             "ts": ts,
@@ -396,7 +410,7 @@ def _event_from_line(
             return None
         pid = _safe_int(parts[3])
         fd = _safe_int(parts[4], -1)
-        resolved = _resolve_socket_endpoint(pid, fd)
+        resolved = _resolve_socket_endpoint(pid, fd, retries=6, delay_s=0.002)
         if resolved is not None:
             socket_cache[(pid, fd)] = resolved
         cached = socket_cache.get((pid, fd), {})
@@ -421,7 +435,7 @@ def _event_from_line(
         size = _safe_int(parts[5], 0)
         cached = socket_cache.get((pid, fd))
         if cached is None:
-            resolved = _resolve_socket_endpoint(pid, fd)
+            resolved = _resolve_socket_endpoint(pid, fd, retries=4, delay_s=0.002)
             if resolved is not None:
                 socket_cache[(pid, fd)] = resolved
             cached = socket_cache.get((pid, fd), {})
@@ -447,7 +461,7 @@ def _event_from_line(
         size = _safe_int(parts[5], 0)
         cached = socket_cache.get((pid, fd))
         if cached is None:
-            resolved = _resolve_socket_endpoint(pid, fd)
+            resolved = _resolve_socket_endpoint(pid, fd, retries=4, delay_s=0.002)
             if resolved is not None:
                 socket_cache[(pid, fd)] = resolved
             cached = socket_cache.get((pid, fd), {})
