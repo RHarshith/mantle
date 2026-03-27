@@ -15,7 +15,7 @@ from .store import CliStore
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mantlecli",
-        description="CLI observability explorer for trace view and replay view.",
+        description="CLI observability explorer for replay traces and generic kernel objects.",
     )
     parser.add_argument(
         "path",
