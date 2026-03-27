@@ -108,8 +108,20 @@ function renderTraceList(traces) {
           <div class="trace-name">${escapeHtml(t.trace_id)}</div>
           <div class="trace-meta"><span class="trace-status ${statusClass}">${escapeHtml(t.status)}</span> agent: ${formatNumber(t.agent_event_count)} sys: ${formatNumber(t.sys_event_count)}</div>
         </div>
+        <button class="trace-delete-btn" title="Delete trace">×</button>
       </div>`;
     row.addEventListener("click", () => selectTrace(t.trace_id));
+    
+    const deleteBtn = row.querySelector(".trace-delete-btn");
+    deleteBtn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      try {
+        await fetch(`/api/traces/${encodeURIComponent(t.trace_id)}`, { method: "DELETE" });
+      } catch (err) {
+        console.error("Failed to delete trace", err);
+      }
+    });
+
     traceListEl.appendChild(row);
   }
 }
