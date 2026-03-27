@@ -39,6 +39,11 @@ from mantle.dashboard.syscall_utils import (
 from mantle.taint_engine import run_taint_analysis
 from mantle.taint_rules import TrustPolicy
 
+try:
+    import tiktoken
+except Exception:  # pragma: no cover - optional dependency fallback
+    tiktoken = None
+
 LINE_RE = re.compile(r"^(?P<pid>\d+)\s+(?P<syscall>[a-zA-Z0-9_]+)\((?P<args>.*)\)\s+=\s+(?P<ret>.+)$")
 UNFINISHED_RE = re.compile(r"^(?P<pid>\d+)\s+(?P<syscall>[a-zA-Z0-9_]+)\((?P<args>.*)\s+<unfinished \.\.\.>$")
 RESUMED_RE = re.compile(r"^(?P<pid>\d+)\s+<\.\.\.\s+(?P<syscall>[a-zA-Z0-9_]+)\s+resumed>(?P<tail>.*)$")
@@ -3925,7 +3930,172 @@ class TraceStore:
         match = next((turn for turn in turns if str(turn.get("turn_id")) == turn_id), None)
         if match is None:
             raise KeyError(turn_id)
-        return build_replay_turn_detail(trace_id, match)
+
+        sys_events = list(match.get("_sys_events", []))
+        tool_pairs = list(match.get("_tool_pairs", []))
+        paired_tool_calls = self._replay_tool_call_pairs(trace, sys_events, tool_pairs)
+        file_activity = self._replay_file_activity(sys_events)
+        subprocesses = self._replay_subprocesses(trace, sys_events)
+
+        replay_payload = build_replay_turn_detail(trace_id, match)
+        replay_payload["tool_call_response_pairs"] = paired_tool_calls
+        replay_payload["summary"] = {
+            "tool_calls": int(match.get("tool_call_count") or 0),
+            "context_tokens": self._count_text_tokens_tiktoken(replay_payload.get("context", {}).get("text") or ""),
+            "files_read": int(match.get("files_read_count") or 0),
+            "files_written": int(match.get("files_written_count") or 0),
+            "subprocesses_spawned": len(subprocesses),
+            "network_calls": int(match.get("network_call_count") or 0),
+            "context_sections": len((replay_payload.get("context") or {}).get("sections") or []),
+            "action_sections": len((replay_payload.get("action") or {}).get("sections") or []),
+            "tool_call_pairs": paired_tool_calls,
+            "file_activity": file_activity,
+            "subprocesses": subprocesses,
+        }
+        return replay_payload
+
+    def _count_text_tokens_tiktoken(self, text: str) -> int:
+        payload = str(text or "")
+        if not payload:
+            return 0
+
+        if tiktoken is not None:
+            try:
+                encoder = tiktoken.get_encoding("cl100k_base")
+                return len(encoder.encode(payload))
+            except Exception:
+                pass
+
+        return len(re.findall(r"\S+", payload))
+
+    def _replay_tool_call_pairs(
+        self,
+        trace: TraceState,
+        sys_events: list[dict[str, Any]],
+        tool_pairs: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for tp in sorted(tool_pairs, key=lambda item: float(item.get("started_ts") or 0.0)):
+            source = self._match_tool_source_for_turn(trace, sys_events, tp)
+            out.append(
+                {
+                    "tool_call_id": str(tp.get("tool_call_id") or ""),
+                    "tool_name": str(tp.get("tool_name") or "unknown"),
+                    "arguments": tp.get("arguments") or {},
+                    "response": tp.get("result"),
+                    "started_ts": tp.get("started_ts"),
+                    "finished_ts": tp.get("finished_ts"),
+                    "source": source,
+                }
+            )
+        return out
+
+    def _replay_file_activity(self, sys_events: list[dict[str, Any]]) -> dict[str, Any]:
+        items: dict[str, dict[str, Any]] = {}
+        for event in sys_events:
+            et = str(event.get("type") or "")
+            if et not in {"file_read", "file_write", "file_delete", "file_rename"}:
+                continue
+            path = str(event.get("path") or "")
+            if not path:
+                continue
+
+            bucket = items.setdefault(
+                path,
+                {
+                    "path": path,
+                    "read": False,
+                    "write": False,
+                    "rename": False,
+                    "read_count": 0,
+                    "write_count": 0,
+                    "rename_count": 0,
+                    "event_count": 0,
+                    "state": "read",
+                },
+            )
+
+            bucket["event_count"] = int(bucket.get("event_count") or 0) + 1
+            if et == "file_read":
+                bucket["read"] = True
+                bucket["read_count"] = int(bucket.get("read_count") or 0) + 1
+            elif et in {"file_write", "file_delete"}:
+                bucket["write"] = True
+                bucket["write_count"] = int(bucket.get("write_count") or 0) + 1
+            elif et == "file_rename":
+                bucket["rename"] = True
+                bucket["rename_count"] = int(bucket.get("rename_count") or 0) + 1
+
+        for item in items.values():
+            has_read = bool(item.get("read"))
+            has_write = bool(item.get("write") or item.get("rename"))
+            if has_read and has_write:
+                item["state"] = "read_write"
+            elif has_write:
+                item["state"] = "write"
+            else:
+                item["state"] = "read"
+
+        read_paths = sorted([path for path, info in items.items() if bool(info.get("read"))])
+        write_paths = sorted(
+            [
+                path
+                for path, info in items.items()
+                if bool(info.get("write")) or bool(info.get("rename"))
+            ]
+        )
+
+        return {
+            "read_paths": read_paths,
+            "write_paths": write_paths,
+            "tree": self._file_tree(list(items.values())) if items else {"name": "/", "kind": "dir", "children": []},
+        }
+
+    def _replay_subprocesses(self, trace: TraceState, sys_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        pid_to_commands: defaultdict[int, list[str]] = defaultdict(list)
+        ppid_hint: dict[int, int] = {}
+
+        for event in sorted(sys_events, key=lambda e: int(e.get("line_no") or 0)):
+            et = str(event.get("type") or "")
+            if et == "command_exec":
+                pid = int(event.get("pid") or 0)
+                if pid > 0:
+                    cmd = str(event.get("command") or event.get("exec_path") or "").strip()
+                    if cmd and cmd not in pid_to_commands[pid]:
+                        pid_to_commands[pid].append(cmd)
+                    ppid = int(event.get("ppid") or 0)
+                    if ppid > 0 and ppid != pid:
+                        ppid_hint[pid] = ppid
+            elif et == "process_spawn":
+                child_pid = int(event.get("child_pid") or 0)
+                parent_pid = int(event.get("pid") or 0)
+                if child_pid > 0 and parent_pid > 0:
+                    ppid_hint[child_pid] = parent_pid
+
+        spawned_pids: set[int] = set()
+        for event in sys_events:
+            et = str(event.get("type") or "")
+            if et == "process_spawn":
+                child_pid = int(event.get("child_pid") or 0)
+                if child_pid > 0:
+                    spawned_pids.add(child_pid)
+            elif et == "command_exec":
+                pid = int(event.get("pid") or 0)
+                ppid = int(event.get("ppid") or 0)
+                if pid > 0 and ppid > 0 and pid != ppid:
+                    spawned_pids.add(pid)
+
+        out: list[dict[str, Any]] = []
+        for pid in sorted(spawned_pids):
+            parent_pid = int(trace.process_parent.get(pid, 0)) if pid in trace.process_parent else int(ppid_hint.get(pid, 0))
+            out.append(
+                {
+                    "pid": pid,
+                    "parent_pid": parent_pid if parent_pid > 0 else None,
+                    "commands": pid_to_commands.get(pid, [])[:12],
+                }
+            )
+        return out
 
     def _file_tree(self, file_items: list[dict[str, Any]]) -> dict[str, Any]:
         root: dict[str, Any] = {"name": "/", "kind": "dir", "children": []}
@@ -4501,6 +4671,7 @@ class TraceStore:
             strict_anchor_children=True,
         )
         command = ""
+        exec_commands: list[str] = []
         start_ts: float | None = None
         end_ts: float | None = None
         exit_code: int | None = None
@@ -4508,7 +4679,11 @@ class TraceStore:
         for e in sys_events:
             et = str(e.get("type") or "")
             if et == "command_exec" and int(e.get("pid") or 0) == pid:
-                command = str(e.get("command") or e.get("exec_path") or command)
+                exec_cmd = str(e.get("command") or e.get("exec_path") or "").strip()
+                if exec_cmd and exec_cmd not in exec_commands:
+                    exec_commands.append(exec_cmd)
+                if not command and exec_cmd:
+                    command = exec_cmd
                 ts = self._event_ts(e)
                 start_ts = ts if start_ts is None else min(start_ts, ts)
             if et == "process_exit" and int(e.get("pid") or 0) == pid:
@@ -4565,6 +4740,7 @@ class TraceStore:
             "full_lifecycle": bool(full_lifecycle),
             "summary": {
                 "command": command,
+                "exec_commands": exec_commands,
                 "pid": pid,
                 "parent_pid": parent_pid,
                 "duration_ms": duration_ms,

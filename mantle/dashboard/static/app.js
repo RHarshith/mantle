@@ -679,6 +679,19 @@ function renderProcessTracePopup(payload, turnId, toolName) {
 
   const processTree = document.createElement("div");
   processTree.className = "proc-list";
+  const execCommands = Array.isArray(s.exec_commands) ? s.exec_commands : [];
+
+  if (execCommands.length) {
+    const cmds = document.createElement("div");
+    cmds.className = "timeline-row row-process";
+    cmds.innerHTML = `
+      <div class="timeline-head">
+        <span class="row-title">Exec Commands</span>
+        <span class="row-sub">pid ${escapeHtml(String(s.pid || payload.pid || "-"))}</span>
+      </div>
+      <div class="row-content"><pre class="mono-block">${escapeHtml(execCommands.join("\n"))}</pre></div>`;
+    processTree.appendChild(cmds);
+  }
 
   const renderProcessNode = (node, parentEl, depth = 0) => {
     const row = document.createElement("div");
@@ -880,6 +893,7 @@ function renderTurnDetail(payload) {
 }
 
 function replayValueBlock(value, options = {}) {
+  const sneakLines = Number(options.sneakLines || 0);
   const showSource = Boolean(options.showSource);
   const source = options.source && typeof options.source === "object" ? options.source : { status: "source_not_found" };
   const sourcePid = Number(source.pid || 0);
@@ -890,24 +904,34 @@ function replayValueBlock(value, options = {}) {
       : '<span class="replay-source-missing">source: not found</span>';
   }
 
-  if (typeof value === "string") {
-    return `<div class="replay-value-wrap">${showSource ? `<div class="replay-value-head">${sourceHtml}</div>` : ""}<pre class="replay-pre">${escapeHtml(value)}</pre></div>`;
-  }
-  return `<div class="replay-value-wrap">${showSource ? `<div class="replay-value-head">${sourceHtml}</div>` : ""}<pre class="replay-pre">${escapeHtml(JSON.stringify(value ?? null, null, 2))}</pre></div>`;
+  const text = typeof value === "string" ? value : JSON.stringify(value ?? null, null, 2);
+  const preview = sneakLines > 0 ? truncateLines(text, sneakLines) : { short: text, long: text, truncated: false };
+
+  return `
+    <div class="replay-value-wrap">
+      ${showSource ? `<div class="replay-value-head">${sourceHtml}</div>` : ""}
+      <div class="replay-value-body">
+        <pre class="replay-pre replay-pre-short">${escapeHtml(preview.short)}</pre>
+        <pre class="replay-pre replay-pre-full" style="display:none;">${escapeHtml(preview.long)}</pre>
+        ${preview.truncated ? '<button class="inline-btn replay-expand-btn">Expand</button>' : ""}
+      </div>
+    </div>`;
 }
 
-function replaySectionCard(section, turnId) {
+function replaySectionCard(section, turnId, options = {}) {
   const values = Array.isArray(section.values) ? section.values : [];
   const isToolOutput = String(section.style || "") === "tool_output";
+  const sneakLines = Number(options.sneakLines || 0);
+  const openByDefault = Boolean(options.openByDefault);
   const blocks = values.map((v) => {
     if (!isToolOutput) {
-      return replayValueBlock(v);
+      return replayValueBlock(v, { sneakLines });
     }
     const source = findReplaySourceForValue(v);
-    return replayValueBlock(v, { showSource: true, source, turnId });
+    return replayValueBlock(v, { sneakLines, showSource: true, source, turnId });
   }).join("");
   return `
-    <details class="replay-card replay-${escapeHtml(section.style || "generic")}">
+    <details class="replay-card replay-${escapeHtml(section.style || "generic")}" ${openByDefault ? "open" : ""}>
       <summary class="replay-band">
         <span class="replay-band-title">${escapeHtml(section.label || "Section")} (${formatNumber(values.length)})</span>
         <span class="replay-band-toggle" aria-hidden="true"></span>
@@ -916,16 +940,140 @@ function replaySectionCard(section, turnId) {
     </details>`;
 }
 
+function replayToolPairCard(pair, turnId) {
+  const source = pair && typeof pair.source === "object" ? pair.source : { status: "source_not_found" };
+  const sourcePid = Number(source.pid || 0);
+  const sourceHtml = sourcePid > 0
+    ? `<button class="replay-source-link" data-source-pid="${String(sourcePid)}">source: pid${String(sourcePid)}</button>`
+    : '<span class="replay-source-missing">source: not found</span>';
+
+  const responseText = typeof pair?.response === "string"
+    ? pair.response
+    : JSON.stringify(pair?.response ?? null, null, 2);
+  const response = truncateLines(responseText, 4);
+
+  return `
+    <details class="replay-card replay-tool_pair replay-tool-call-pair" open>
+      <summary class="replay-band">
+        <span class="replay-band-title">${escapeHtml(pair?.tool_name || "tool")} (${escapeHtml(pair?.tool_call_id || "")})</span>
+        <span class="replay-band-toggle" aria-hidden="true"></span>
+      </summary>
+      <div class="replay-card-body">
+        <div class="replay-pair-block">
+          <div class="mini-label">Tool call</div>
+          <pre class="replay-pre">${escapeHtml(JSON.stringify(pair?.arguments ?? {}, null, 2))}</pre>
+        </div>
+        <div class="replay-pair-block">
+          <div class="replay-value-head">${sourceHtml}</div>
+          <div class="mini-label">Tool response</div>
+          <pre class="replay-pre replay-pre-short">${escapeHtml(response.short)}</pre>
+          <pre class="replay-pre replay-pre-full" style="display:none;">${escapeHtml(response.long)}</pre>
+          ${response.truncated ? '<button class="inline-btn replay-expand-btn">Expand</button>' : ""}
+        </div>
+      </div>
+    </details>`;
+}
+
+function wireReplayExpanders(container) {
+  container.querySelectorAll(".replay-expand-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const body = btn.closest(".replay-value-body") || btn.closest(".replay-pair-block");
+      if (!body) return;
+      const shortPre = body.querySelector(".replay-pre-short");
+      const fullPre = body.querySelector(".replay-pre-full");
+      if (!shortPre || !fullPre) return;
+      const expanded = fullPre.style.display !== "none";
+      fullPre.style.display = expanded ? "none" : "block";
+      shortPre.style.display = expanded ? "block" : "none";
+      btn.textContent = expanded ? "Expand" : "Collapse";
+    });
+  });
+}
+
+function ensureReplayMetricsPopup() {
+  let overlay = document.getElementById("replayMetricsOverlay");
+  if (overlay) return overlay;
+
+  overlay = document.createElement("div");
+  overlay.id = "replayMetricsOverlay";
+  overlay.className = "replay-metrics-overlay";
+  overlay.innerHTML = `
+    <div class="replay-metrics-modal" role="dialog" aria-modal="true" aria-label="Replay metrics">
+      <div class="process-trace-head">
+        <div>
+          <div class="process-trace-title" id="replayMetricsTitle">Details</div>
+          <div class="process-trace-subtitle" id="replayMetricsSubtitle"></div>
+        </div>
+        <button class="btn" id="replayMetricsCloseBtn">Close</button>
+      </div>
+      <div class="process-trace-body" id="replayMetricsBody"></div>
+    </div>`;
+
+  document.body.appendChild(overlay);
+  overlay.querySelector("#replayMetricsCloseBtn").addEventListener("click", () => {
+    overlay.classList.remove("open");
+  });
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) {
+      overlay.classList.remove("open");
+    }
+  });
+  return overlay;
+}
+
+function openReplayMetricsPopup(title, subtitle, renderBody) {
+  const overlay = ensureReplayMetricsPopup();
+  overlay.querySelector("#replayMetricsTitle").textContent = title || "Details";
+  overlay.querySelector("#replayMetricsSubtitle").textContent = subtitle || "";
+  const body = overlay.querySelector("#replayMetricsBody");
+  body.innerHTML = "";
+  renderBody(body);
+  overlay.classList.add("open");
+}
+
 function renderReplayDetail(payload) {
   const contextSections = (((payload || {}).context || {}).sections) || [];
   const actionSections = (((payload || {}).action || {}).sections) || [];
+  const replaySummary = (payload || {}).summary || {};
   const isContext = currentReplayPaneTab === "context";
-  const sections = isContext ? contextSections : actionSections;
-  const title = isContext ? "Context" : "Action";
+  const isAction = currentReplayPaneTab === "action";
+  const isSummary = currentReplayPaneTab === "summary";
 
-  const sectionsHtml = sections.length
-    ? sections.map((s) => replaySectionCard(s, payload.turn_id)).join("")
-    : '<div class="replay-empty">No structured sections for this tab.</div>';
+  let title = "Summary";
+  let contentHtml = "";
+
+  if (isContext) {
+    title = "Context";
+    contentHtml = contextSections.length
+      ? contextSections.map((s) => replaySectionCard(s, payload.turn_id, { sneakLines: 4, openByDefault: true })).join("")
+      : '<div class="replay-empty">No structured sections for this tab.</div>';
+  } else if (isAction) {
+    title = "Action";
+    const filteredAction = actionSections.filter((s) => String(s?.id || "") !== "tool_calls");
+    const actionCards = filteredAction.map((s) => replaySectionCard(s, payload.turn_id)).join("");
+    const pairs = Array.isArray(payload.tool_call_response_pairs) ? payload.tool_call_response_pairs : [];
+    const pairCards = pairs.length
+      ? pairs.map((pair) => replayToolPairCard(pair, payload.turn_id)).join("")
+      : '<div class="replay-empty">No tool calls captured for this turn.</div>';
+    contentHtml = `${actionCards}<div class="replay-tool-pairs">${pairCards}</div>`;
+  } else if (isSummary) {
+    title = "Summary";
+    contentHtml = `
+      <div class="replay-summary-grid">
+        <button class="replay-summary-metric replay-summary-link" data-metric="tool_calls">
+          <div class="k">Tool Calls</div><div class="v">${formatNumber(replaySummary.tool_calls)}</div>
+        </button>
+        <div class="replay-summary-metric"><div class="k">Context Tokens</div><div class="v">${formatNumber(replaySummary.context_tokens)}</div></div>
+        <button class="replay-summary-metric replay-summary-link" data-metric="files_rw">
+          <div class="k">Files Read/Written</div><div class="v">${formatNumber(replaySummary.files_read)} / ${formatNumber(replaySummary.files_written)}</div>
+        </button>
+        <button class="replay-summary-metric replay-summary-link" data-metric="subprocesses">
+          <div class="k">Subprocesses Spawned</div><div class="v">${formatNumber(replaySummary.subprocesses_spawned)}</div>
+        </button>
+        <div class="replay-summary-metric"><div class="k">Network Calls</div><div class="v">${formatNumber(replaySummary.network_calls)}</div></div>
+        <div class="replay-summary-metric"><div class="k">Context/Action Sections</div><div class="v">${formatNumber(replaySummary.context_sections)} / ${formatNumber(replaySummary.action_sections)}</div></div>
+      </div>`;
+  }
 
   const right = graphCanvas.querySelector("#replayRightPane");
   if (!right) return;
@@ -936,9 +1084,12 @@ function renderReplayDetail(payload) {
     </div>
     <div class="replay-subtabs">
       <button class="replay-subtab ${isContext ? "active" : ""}" id="replayContextTab">Context</button>
-      <button class="replay-subtab ${!isContext ? "active" : ""}" id="replayActionTab">Action</button>
+      <button class="replay-subtab ${isAction ? "active" : ""}" id="replayActionTab">Action</button>
+      <button class="replay-subtab ${isSummary ? "active" : ""}" id="replaySummaryTab">Summary</button>
     </div>
-    <div class="replay-sections">${sectionsHtml}</div>`;
+    <div class="replay-sections">${contentHtml}</div>`;
+
+  wireReplayExpanders(right);
 
   right.querySelectorAll(".replay-source-link").forEach((btn) => {
     btn.addEventListener("click", async () => {
@@ -957,6 +1108,96 @@ function renderReplayDetail(payload) {
     if (currentReplayPaneTab === "action") return;
     currentReplayPaneTab = "action";
     renderReplayDetail(payload);
+  });
+  $("replaySummaryTab").addEventListener("click", () => {
+    if (currentReplayPaneTab === "summary") return;
+    currentReplayPaneTab = "summary";
+    renderReplayDetail(payload);
+  });
+
+  right.querySelectorAll(".replay-summary-link").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const metric = btn.getAttribute("data-metric") || "";
+
+      if (metric === "tool_calls") {
+        openReplayMetricsPopup("Tool Calls", `Turn ${payload.label || payload.turn_id || ""}`, (body) => {
+          const rows = Array.isArray(replaySummary.tool_call_pairs) ? replaySummary.tool_call_pairs : [];
+          if (!rows.length) {
+            body.innerHTML = '<div class="replay-empty">No tool calls captured in this turn.</div>';
+            return;
+          }
+          body.innerHTML = rows.map((pair) => replayToolPairCard(pair, payload.turn_id)).join("");
+          wireReplayExpanders(body);
+          body.querySelectorAll(".replay-source-link").forEach((sourceBtn) => {
+            sourceBtn.addEventListener("click", async () => {
+              const pid = Number(sourceBtn.getAttribute("data-source-pid") || "0");
+              if (!pid || !payload.turn_id) return;
+              await openSourceTracePopup(payload.turn_id, pid, "tool output");
+            });
+          });
+        });
+        return;
+      }
+
+      if (metric === "files_rw") {
+        openReplayMetricsPopup("Files Read/Written", `Turn ${payload.label || payload.turn_id || ""}`, (body) => {
+          const activity = replaySummary.file_activity || {};
+          const tree = activity.tree || null;
+          const readPaths = Array.isArray(activity.read_paths) ? activity.read_paths : [];
+          const writePaths = Array.isArray(activity.write_paths) ? activity.write_paths : [];
+
+          const summary = document.createElement("div");
+          summary.className = "mono-text";
+          summary.textContent = `read=${formatNumber(readPaths.length)} write=${formatNumber(writePaths.length)}`;
+          body.appendChild(summary);
+
+          if (!tree) {
+            body.innerHTML += '<div class="replay-empty">No file activity captured for this turn.</div>';
+            return;
+          }
+          const wrap = document.createElement("div");
+          wrap.className = "replay-file-tree-wrap";
+          wrap.appendChild(createFileTreeNode(tree, null, { disableResourceDrilldown: true }));
+          body.appendChild(wrap);
+        });
+        return;
+      }
+
+      if (metric === "subprocesses") {
+        openReplayMetricsPopup("Subprocesses", `Turn ${payload.label || payload.turn_id || ""}`, (body) => {
+          const rows = Array.isArray(replaySummary.subprocesses) ? replaySummary.subprocesses : [];
+          if (!rows.length) {
+            body.innerHTML = '<div class="replay-empty">No subprocesses captured in this turn.</div>';
+            return;
+          }
+
+          for (const row of rows) {
+            const commands = Array.isArray(row.commands) ? row.commands : [];
+            const block = document.createElement("div");
+            block.className = "timeline-row row-process";
+            block.innerHTML = `
+              <div class="timeline-head">
+                <span class="row-title">PID ${escapeHtml(String(row.pid || "-"))}</span>
+                <span class="row-sub">ppid ${escapeHtml(String(row.parent_pid || "-"))}</span>
+                <button class="inline-btn replay-subprocess-tree-link" data-pid="${escapeHtml(String(row.pid || "0"))}">View process tree</button>
+              </div>
+              <div class="row-content">
+                <div class="mini-label">Exec commands</div>
+                <pre class="mono-block">${escapeHtml(commands.join("\n") || "No command strings captured")}</pre>
+              </div>`;
+            body.appendChild(block);
+          }
+
+          body.querySelectorAll(".replay-subprocess-tree-link").forEach((treeBtn) => {
+            treeBtn.addEventListener("click", async () => {
+              const pid = Number(treeBtn.getAttribute("data-pid") || "0");
+              if (!pid || !payload.turn_id) return;
+              await openSourceTracePopup(payload.turn_id, pid, "subprocess");
+            });
+          });
+        });
+      }
+    });
   });
 }
 
@@ -1480,12 +1721,25 @@ function installStyles() {
     .replay-band { padding:7px 10px; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.04em; }
     .replay-card-body { padding:8px; display:grid; gap:8px; overflow:visible; }
     .replay-value-wrap { display:grid; gap:4px; }
+    .replay-value-body { display:grid; gap:6px; }
     .replay-value-head { display:flex; justify-content:flex-end; }
     .replay-source-link { border:1px solid var(--blue-100); background:var(--blue-50); color:var(--blue-600); border-radius:999px; padding:2px 8px; font-size:10px; font-weight:700; cursor:pointer; }
     .replay-source-link:hover { background:var(--blue-100); }
     .replay-source-missing { font-size:10px; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.03em; }
     .replay-pre { margin:0; white-space:pre-wrap; word-break:break-word; font-family:Consolas, Monaco, monospace; font-size:11px; background:var(--slate-50); border:1px solid var(--border); border-radius:6px; padding:8px; overflow:visible; }
     .replay-empty { color:var(--text-muted); font-size:12px; padding:16px; text-align:center; }
+    .replay-tool-pairs { display:grid; gap:10px; }
+    .replay-tool-call-pair .replay-band { background:#dcfce7; color:#065f46; }
+    .replay-pair-block { display:grid; gap:4px; }
+
+    .replay-summary-grid { display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; }
+    .replay-summary-metric { border:1px solid var(--border); border-radius:8px; background:var(--slate-50); padding:10px; text-align:left; }
+    .replay-summary-metric .k { font-size:10px; text-transform:uppercase; color:var(--text-muted); font-weight:700; letter-spacing:0.04em; }
+    .replay-summary-metric .v { font-size:16px; font-weight:700; color:var(--text-primary); margin-top:3px; word-break:break-word; }
+    .replay-summary-link { cursor:pointer; }
+    .replay-summary-link:hover { border-color:var(--blue-100); background:var(--blue-50); }
+
+    .replay-file-tree-wrap { border:1px solid var(--border); border-radius:8px; padding:8px; margin-top:8px; max-height:56vh; overflow:auto; }
 
     .replay-system .replay-band { background:#dbeafe; color:#1e3a8a; }
     .replay-developer .replay-band { background:#ede9fe; color:#5b21b6; }
@@ -1508,15 +1762,21 @@ function installStyles() {
     .process-trace-body { padding:12px; overflow:auto; }
     .process-trace-content { display:grid; gap:10px; }
 
+    .replay-metrics-overlay { position:fixed; inset:0; background:rgba(15,23,42,0.38); display:none; align-items:center; justify-content:center; padding:18px; z-index:1100; }
+    .replay-metrics-overlay.open { display:flex; }
+    .replay-metrics-modal { width:min(980px, 96vw); max-height:88vh; background:var(--surface); border:1px solid var(--border); border-radius:12px; box-shadow:0 20px 42px rgba(15,23,42,0.2); display:flex; flex-direction:column; overflow:hidden; }
+
     @media (max-width: 1200px) {
       .turn-exec-summary { grid-template-columns: repeat(3, 1fr); }
       .pr-grid { grid-template-columns: 1fr; }
       .replay-layout { grid-template-columns: 220px 1fr; }
+      .replay-summary-grid { grid-template-columns: repeat(2, 1fr); }
     }
     @media (max-width: 820px) {
       .turn-exec-summary { grid-template-columns: repeat(2, 1fr); }
       .replay-layout { grid-template-columns: 1fr; }
       .replay-left { max-height: 240px; }
+      .replay-summary-grid { grid-template-columns: 1fr; }
     }
   `;
   document.head.appendChild(style);
