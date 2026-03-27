@@ -21,10 +21,12 @@ usage() {
 Usage:
   mantle serve [--host <host>] [--port <port>] [--obs-root <path>]
     mantle watch [--mode <proxy|transparent>] [--trace-id <id>] [--port <mitm_port>] [--interactive-ebpf] <executable> [args...]
+    mantle cli [-i|--interactive] [--obs-root <path>] [<route>]
 
 Commands:
     serve    Start the observability dashboard.
     watch    Run an executable under MITM + eBPF capture.
+    cli      Explore traces from the terminal (interactive or URL-like mode).
 
 Examples:
   mantle serve --host 0.0.0.0 --port 8099
@@ -32,7 +34,21 @@ Examples:
     mantle watch codex exec "inspect this repo and summarize"
     mantle watch --mode transparent codex --sandbox danger-full-access exec "trace network behavior"
   mantle watch aider "fix failing tests"
+    mantle cli --interactive
+    mantle cli trace_001.ebpf.jsonl/replay/turn_2/summary
 EOF
+}
+
+cli_cmd() {
+        local python_bin
+
+        python_bin="$VENV_PATH/bin/python"
+        if [[ ! -x "$python_bin" ]]; then
+                echo "Error: $python_bin not found. Run scripts/install_mantle.sh first." >&2
+                exit 1
+        fi
+
+        exec "$python_bin" -m mantle.cli.main "$@"
 }
 
 serve_cmd() {
@@ -212,6 +228,10 @@ case "$1" in
     watch)
         shift
         watch_cmd "$@"
+        ;;
+    cli)
+        shift
+        cli_cmd "$@"
         ;;
     -h|--help|help)
         usage

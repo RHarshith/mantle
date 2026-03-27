@@ -24,8 +24,6 @@ const graphCanvas = $("graphCanvas");
 const detailsEl = $("details");
 const traceTabBtn = $("traceTabBtn");
 const replayTabBtn = $("replayTabBtn");
-const taintTabBtn = $("taintTabBtn");
-const blastTabBtn = $("blastTabBtn");
 const settingsTabBtn = $("settingsTabBtn");
 const fileToggle = $("fileToggle");
 const toolsToggle = $("toolsToggle");
@@ -1401,49 +1399,8 @@ function setActiveTab(tabName) {
   activeTab = tabName;
   traceTabBtn.classList.toggle("active", tabName === "trace");
   replayTabBtn.classList.toggle("active", tabName === "replay");
-  taintTabBtn.classList.toggle("active", tabName === "taint");
-  blastTabBtn.classList.toggle("active", tabName === "blast");
   settingsTabBtn.classList.toggle("active", tabName === "settings");
   graphWrapper.classList.toggle("replay-mode", tabName === "replay");
-}
-
-async function loadTaintAnalysis() {
-  if (!selectedTraceId) return;
-  const report = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/taint-analysis`);
-  const counts = report.finding_counts || {};
-  const strip = $("summaryStrip");
-  strip.style.gridTemplateColumns = "repeat(4, 1fr)";
-  strip.innerHTML = `
-    <div class="summary-card"><div class="k">Critical</div><div class="v">${formatNumber(counts.critical)}</div></div>
-    <div class="summary-card"><div class="k">Warning</div><div class="v">${formatNumber(counts.warning)}</div></div>
-    <div class="summary-card"><div class="k">Info</div><div class="v">${formatNumber(counts.info)}</div></div>
-    <div class="summary-card"><div class="k">Policy</div><div class="v" style="font-size:14px">${escapeHtml(report.trust_policy || "-")}</div></div>`;
-
-  graphCanvas.innerHTML = `<div class="raw-json">${jsonBlock(report)}</div>`;
-}
-
-async function loadBlastAnalysis() {
-  if (!selectedTraceId) return;
-  const traces = cachedTraces.map((t) => t.trace_id).filter((id) => id !== selectedTraceId);
-  if (traces.length === 0) {
-    graphCanvas.innerHTML = '<div class="empty-state"><h3>No baselines</h3><p>Need at least one additional trace.</p></div>';
-    return;
-  }
-  const params = new URLSearchParams({
-    candidate_id: selectedTraceId,
-    baseline_ids: traces.join(","),
-  });
-  const report = await api(`/api/blast-radius/compare?${params.toString()}`);
-  const s = report.summary || {};
-  const strip = $("summaryStrip");
-  strip.style.gridTemplateColumns = "repeat(4, 1fr)";
-  strip.innerHTML = `
-    <div class="summary-card"><div class="k">Checkpoints</div><div class="v">${formatNumber(s.checkpoints)}</div></div>
-    <div class="summary-card"><div class="k">Deviations</div><div class="v">${formatNumber(s.deviations)}</div></div>
-    <div class="summary-card"><div class="k">Score</div><div class="v">${formatNumber(s.deviation_score)}</div></div>
-    <div class="summary-card"><div class="k">Consistency</div><div class="v" style="font-size:14px">${s.eventual_consistency ? "yes" : "no"}</div></div>`;
-
-  graphCanvas.innerHTML = `<div class="raw-json">${jsonBlock(report)}</div>`;
 }
 
 function getStoredCustomSchemas() {
@@ -1556,12 +1513,8 @@ async function selectTrace(traceId) {
     await loadTurnsOverview();
   } else if (activeTab === "replay") {
     await loadReplayOverview();
-  } else if (activeTab === "taint") {
-    await loadTaintAnalysis();
   } else if (activeTab === "settings") {
     await loadSettingsView();
-  } else {
-    await loadBlastAnalysis();
   }
 }
 
@@ -1593,12 +1546,8 @@ async function refreshTraces(force = false) {
     await loadTurnsOverview();
   } else if (activeTab === "replay") {
     await loadReplayOverview();
-  } else if (activeTab === "taint") {
-    await loadTaintAnalysis();
   } else if (activeTab === "settings") {
     await loadSettingsView();
-  } else {
-    await loadBlastAnalysis();
   }
 }
 
@@ -1822,22 +1771,6 @@ async function init() {
     viewStack = [{ kind: "replay", label: "Replay Trace" }];
     renderBreadcrumbs();
     await loadReplayOverview();
-  });
-
-  taintTabBtn.addEventListener("click", async () => {
-    if (activeTab === "taint") return;
-    setActiveTab("taint");
-    viewStack = [{ kind: "taint", label: "Taint Analysis" }];
-    renderBreadcrumbs();
-    await loadTaintAnalysis();
-  });
-
-  blastTabBtn.addEventListener("click", async () => {
-    if (activeTab === "blast") return;
-    setActiveTab("blast");
-    viewStack = [{ kind: "blast", label: "Blast Radius" }];
-    renderBreadcrumbs();
-    await loadBlastAnalysis();
   });
 
   settingsTabBtn.addEventListener("click", async () => {

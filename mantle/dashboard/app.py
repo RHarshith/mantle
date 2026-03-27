@@ -244,45 +244,6 @@ def tool_summary(trace_id: str, tool_call_id: str) -> dict[str, Any]:
 		raise HTTPException(status_code=404, detail="Trace or tool call not found")
 
 
-@app.get("/api/traces/{trace_id}/taint-analysis")
-def taint_analysis(trace_id: str, trust_policy: str = "nondeterministic") -> dict[str, Any]:
-	"""Run taint analysis for a trace under the selected trust policy."""
-	try:
-		return store.taint_analysis(trace_id, trust_policy=trust_policy)
-	except KeyError:
-		raise HTTPException(status_code=404, detail="Trace not found")
-
-
-@app.get("/api/blast-radius/template")
-def blast_radius_template(trace_ids: str, min_coverage: float = 0.6) -> dict[str, Any]:
-	"""Generate baseline blast-radius template from one or more traces."""
-	ids = [t.strip() for t in trace_ids.split(",") if t.strip()]
-	if not ids:
-		raise HTTPException(status_code=400, detail="trace_ids is required")
-	try:
-		return store.blast_radius_template(ids, min_coverage=min_coverage)
-	except KeyError as exc:
-		raise HTTPException(status_code=404, detail=f"Trace not found: {exc.args[0] if exc.args else 'unknown'}")
-	except ValueError as exc:
-		raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.get("/api/blast-radius/compare")
-def blast_radius_compare(candidate_id: str, baseline_ids: str, min_coverage: float = 0.6) -> dict[str, Any]:
-	"""Compare candidate trace behavior against baseline blast-radius template."""
-	baseline = [t.strip() for t in baseline_ids.split(",") if t.strip()]
-	if not candidate_id.strip():
-		raise HTTPException(status_code=400, detail="candidate_id is required")
-	if not baseline:
-		raise HTTPException(status_code=400, detail="baseline_ids is required")
-	try:
-		return store.blast_radius_compare(baseline, candidate_id.strip(), min_coverage=min_coverage)
-	except KeyError as exc:
-		raise HTTPException(status_code=404, detail=f"Trace not found: {exc.args[0] if exc.args else 'unknown'}")
-	except ValueError as exc:
-		raise HTTPException(status_code=400, detail=str(exc))
-
-
 @app.websocket("/ws")
 async def ws_updates(websocket: WebSocket) -> None:
 	"""Push store version updates to connected websocket clients."""

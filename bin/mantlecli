@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -h "$SOURCE" ]]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    TARGET="$(readlink "$SOURCE")"
+    if [[ "$TARGET" != /* ]]; then
+        SOURCE="$DIR/$TARGET"
+    else
+        SOURCE="$TARGET"
+    fi
+done
+
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+REPO_ROOT="${MANTLE_REPO_ROOT:-${RTRACE_REPO_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}}"
+VENV_PATH="${MANTLE_VENV:-${RTRACE_VENV:-$REPO_ROOT/.venv}}"
+PYTHON_BIN="$VENV_PATH/bin/python"
+
+if [[ ! -x "$PYTHON_BIN" ]]; then
+    echo "Error: $PYTHON_BIN not found. Run scripts/install_mantle.sh first." >&2
+    exit 1
+fi
+
+exec "$PYTHON_BIN" -m mantle.cli.main "$@"

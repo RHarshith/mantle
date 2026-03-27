@@ -1,8 +1,8 @@
 # Mantle
 
-An observability and safety-analysis platform for coding agents.
+An observability platform for coding agents.
 
-Mantle captures how an AI coding agent reasons, calls tools, touches files, and talks to networks, then reconstructs that execution into a live drilldown dashboard and taint analysis report.
+Mantle captures how an AI coding agent reasons, calls tools, touches files, and talks to networks, then reconstructs that execution into a live drilldown dashboard and a URL-driven CLI explorer.
 
 ## Why This Project Exists
 
@@ -11,7 +11,6 @@ AI coding agents are powerful, but most teams still treat their behavior as a bl
 - What exactly did the agent do over time?
 - Which tools and files were involved in each step?
 - Which network endpoints were contacted?
-- Did untrusted data flow into dangerous sinks (shell/python execution, sensitive writes)?
 
 The goal is to make agent behavior inspectable, testable, and reviewable.
 
@@ -26,10 +25,10 @@ The goal is to make agent behavior inspectable, testable, and reviewable.
 	- tool and process drilldowns
 	- file/network activity panels
 	- websocket-driven updates
-- Taint analysis engine:
-	- forward propagation of trust labels
-	- source to sink findings with severity
-	- policy-aware checks for command/python execution and sensitive writes
+- Observability CLI (`mantle cli` / `mantlecli`):
+	- non-interactive URL-like routes for traces, turns, replay context/action, and summaries
+	- interactive arrow-key navigation across traces and turns
+	- pager-based drilldowns for long process trees and message bodies
 - Scenario-based validation:
 	- reproducible suites under `trace_scenarios/`
 	- setup, verify, and cleanup lifecycle
@@ -51,7 +50,11 @@ Captured data (obs/)
 mantle serve
 	-> FastAPI backend
 	-> static UI + websocket updates
-	-> timeline, drilldowns, and analysis views
+	-> timeline and drilldown views
+
+mantle cli / mantlecli
+	-> trace/replay route explorer
+	-> interactive and non-interactive terminal navigation
 ```
 
 ## Quickstart
@@ -72,6 +75,7 @@ Verify installation:
 mantle --help
 mantle serve --help
 mantle watch --help
+mantle cli --help
 ```
 
 ### Run A Live Trace
@@ -136,6 +140,21 @@ mantle watch --mode transparent codex exec "trace outbound API calls"
 mantle watch aider "fix failing tests"
 ```
 
+`mantle cli`
+
+- Explore trace and replay data from terminal without opening the dashboard.
+- Usage: `mantle cli [-i|--interactive] [--obs-root <path>] [<route>]`
+
+Examples:
+
+```bash
+mantle cli --interactive
+mantle cli traces
+mantle cli trace_001.ebpf.jsonl/trace
+mantle cli trace_001.ebpf.jsonl/replay/turn_2/summary
+mantlecli trace_001.ebpf.jsonl/replay/turn_2/context/system_prompt/0
+```
+
 ## Data Artifacts
 
 Mantle writes trace outputs to `obs/`:
@@ -157,10 +176,9 @@ These files are the source of truth for replay, debugging, and analysis.
 │   ├── dashboard/
 │   │   ├── app.py
 │   │   └── static/
+│   ├── cli/
 │   ├── ebpf_capture.py
-│   ├── mitm_capture.py
-│   ├── taint_engine.py
-│   └── taint_rules.py
+│   └── mitm_capture.py
 ├── mantle_agent/
 │   ├── agent_observability.py
 │   └── cli_agent.py
@@ -174,7 +192,6 @@ These files are the source of truth for replay, debugging, and analysis.
 
 - End-to-end instrumentation design spanning agent-level and OS-level telemetry
 - Real-time UX with backend polling and websocket update flow
-- Security-focused dataflow modeling with explicit trust policy semantics
 - Reproducible scenario harness for validation and regression checks
 
 ## Environment Variables
@@ -211,6 +228,6 @@ For recruiter or hiring panel review, include:
 
 - a short architecture diagram screenshot from the dashboard
 - one end-to-end trace walkthrough (input -> tool calls -> outputs)
-- one taint finding example with remediation steps
+- one replay-turn drilldown walkthrough from terminal (`mantle cli`) and dashboard
 
 This makes both product thinking and systems engineering depth obvious in a quick review.

@@ -3,11 +3,11 @@
 # mantle_test — Run a mantle trace scenario end-to-end.
 #
 # Usage:
-#   mantle_test <scenario_name> [--agent <agent>] [--policy <trust|nondeterministic>]
+#   mantle_test <scenario_name> [--agent <agent>]
 #
 # Example:
-#   mantle_test taint_analysis_test
-#   mantle_test taint_analysis_test --agent codex --policy nondeterministic
+#   mantle_test sys_admin_test
+#   mantle_test sys_admin_test --agent codex
 # ─────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -30,25 +30,23 @@ SCENARIOS_DIR="$REPO_ROOT/trace_scenarios"
 # ── Defaults ──────────────────────────────────────────────────────────
 
 AGENT="mantle"
-POLICY="nondeterministic"
 
 # ── Parse arguments ───────────────────────────────────────────────────
 
 usage() {
     cat <<'EOF'
 Usage:
-  mantle_test <scenario_name> [--agent <agent>] [--policy <trust|nondeterministic>]
+    mantle_test <scenario_name> [--agent <agent>]
 
 Arguments:
-  scenario_name   Name of the directory under trace_scenarios/ (e.g. taint_analysis_test)
+    scenario_name   Name of the directory under trace_scenarios/ (e.g. sys_admin_test)
 
 Options:
-  --agent <name>  Agent to use: mantle (default) or codex
-  --policy <p>    Trust policy for taint analysis: trust or nondeterministic (default)
+    --agent <name>  Agent to use: mantle (default) or codex
 
 Examples:
-  mantle_test taint_analysis_test
-  mantle_test taint_analysis_test --agent codex --policy trust
+    mantle_test sys_admin_test
+    mantle_test sys_admin_test --agent codex
 EOF
     exit 1
 }
@@ -63,7 +61,6 @@ shift
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --agent)   AGENT="$2"; shift 2 ;;
-        --policy)  POLICY="$2"; shift 2 ;;
         *)         echo "Unknown option: $1" >&2; usage ;;
     esac
 done
@@ -128,68 +125,6 @@ fi
 echo ""
 echo "  Trace ID: $TRACE_ID"
 echo ""
-
-# 4. Run taint analysis on the captured trace.
-echo "▶ Phase 4: Taint analysis"
-echo "  Policy: $POLICY"
-
-PYTHON_BIN="$VENV_PATH/bin/python"
-if [[ ! -f "$PYTHON_BIN" ]]; then
-    PYTHON_BIN="$(which python3)"
-fi
-
-"$PYTHON_BIN" -c "
-import json, sys, pathlib
-
-# Find the trace files.
-obs_root = pathlib.Path('${AGENT_OBS_ROOT:-$REPO_ROOT/obs}')
-trace_files = sorted(obs_root.glob('traces/*${TRACE_ID}*.ebpf.jsonl'))
-event_files = sorted(obs_root.glob('events/*${TRACE_ID}*.events.jsonl'))
-
-sys_events = []
-agent_events = []
-
-for f in trace_files:
-    for line in f.read_text().splitlines():
-        if line.strip():
-            try:
-                sys_events.append(json.loads(line))
-            except json.JSONDecodeError:
-                pass
-
-for f in event_files:
-    for line in f.read_text().splitlines():
-        if line.strip():
-            try:
-                agent_events.append(json.loads(line))
-            except json.JSONDecodeError:
-                pass
-
-print(f'  Loaded {len(sys_events)} BPF events, {len(agent_events)} agent events')
-
-from mantle.taint_engine import run_taint_analysis
-from mantle.taint_rules import TrustPolicy
-
-policy = TrustPolicy.TRUST_EXTERNAL_FILES if '$POLICY' == 'trust' else TrustPolicy.NONDETERMINISTIC_EXTERNAL_FILES
-report = run_taint_analysis(sys_events, agent_events, policy)
-
-print()
-print('  ' + report.summary.replace('\n', '\n  '))
-print()
-
-if report.findings:
-    for f in report.findings:
-        icon = {'critical': '🚨', 'warning': '⚠️', 'info': 'ℹ️'}.get(f.severity.value, '•')
-        print(f'  {icon} [{f.severity.value.upper()}] {f.title}')
-        print(f'    {f.description[:200]}')
-        print()
-
-# Write report JSON.
-report_path = obs_root / 'taint_reports' / '${TRACE_ID}.taint.json'
-report_path.parent.mkdir(parents=True, exist_ok=True)
-report_path.write_text(json.dumps(report.to_dict(), indent=2))
-print(f'  Report saved to: {report_path}')
-"
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"

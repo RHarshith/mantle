@@ -5,7 +5,7 @@ This service monitors low-level eBPF JSONL trace logs + agent instrumentation ev
 ## Code Layout
 
 - `mantle/dashboard/app.py`: FastAPI wiring only (routes, startup/shutdown, path resolution).
-- `mantle/dashboard/store.py`: trace ingestion, parsing, graph building, taint-analysis orchestration.
+- `mantle/dashboard/store.py`: trace ingestion, parsing, graph building, replay/turn orchestration.
 - `mantle/dashboard/config.py`: observability path/environment resolution.
 - `mantle/dashboard/llm_utils.py`: schema normalization and MITM LLM payload parsing.
 - `mantle/dashboard/syscall_utils.py`: syscall parsing and endpoint/path classification helpers.
@@ -14,6 +14,8 @@ This service monitors low-level eBPF JSONL trace logs + agent instrumentation ev
 Use this split when debugging:
 - API/runtime issues (HTTP status, route behavior, websocket updates): start in `app.py`.
 - Data/parsing/graph issues (missing nodes, bad turn mapping, MITM correlation): start in `store.py`.
+
+For terminal-first workflows, use `mantle cli` / `mantlecli` for replay and trace drilldowns without UI dependencies.
 
 ## Folder Convention
 
