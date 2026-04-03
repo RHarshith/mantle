@@ -7,6 +7,11 @@ let activeTab = "correctness";
 let replayOverview = null;
 let currentReplayTurnId = null;
 let currentReplayPaneTab = "context";
+let replayViewMode = "turn";
+let replayStateDiffData = null;
+let replayStateDiffFilePath = "";
+let replayStateDiffFromTurnId = null;
+let replayStateDiffToTurnId = null;
 let currentReplayToolSourceIndex = [];
 let replaySourceByToolCallId = new Map();
 let replaySourceByResultText = new Map();
@@ -1489,7 +1494,167 @@ function renderReplayDetail(payload) {
   });
 }
 
+function stateDiffTreeNode(node, onSelectFile, depth = 0) {
+  if (!node) return "";
+  const kind = String(node.kind || "");
+  if (kind === "file") {
+    const path = String(node.path || "");
+    const active = replayStateDiffFilePath === path ? " active" : "";
+    const added = Number(node.lines_added || 0);
+    const removed = Number(node.lines_removed || 0);
+    const total = Number(node.total_changed || 0);
+    const warn = node.binary || node.truncated ? " state-diff-warn" : "";
+    return `<button class="state-diff-file${active}${warn}" data-path="${escapeHtml(path)}" style="padding-left:${12 + depth * 16}px;">
+      <span class="state-diff-file-name">${escapeHtml(node.name || path)}</span>
+      <span class="state-diff-file-stats">+${formatNumber(added)} -${formatNumber(removed)} (${formatNumber(total)})</span>
+    </button>`;
+  }
+
+  const children = Array.isArray(node.children) ? node.children : [];
+  const counts = node.counts || {};
+  const label = node.name === "/" ? "workspace" : String(node.name || "folder");
+  const body = children.map((child) => stateDiffTreeNode(child, onSelectFile, depth + 1)).join("");
+  return `<details class="state-diff-folder" open>
+    <summary style="padding-left:${4 + depth * 16}px;">
+      <span>${escapeHtml(label)}</span>
+      <span class="state-diff-folder-stats">${formatNumber(Number(counts.files || 0))} files · +${formatNumber(Number(counts.added || 0))} -${formatNumber(Number(counts.removed || 0))}</span>
+    </summary>
+    <div class="state-diff-folder-body">${body}</div>
+  </details>`;
+}
+
+function wireStateDiffTreeEvents(container) {
+  if (!container) return;
+  container.querySelectorAll(".state-diff-file").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const path = btn.getAttribute("data-path") || "";
+      if (!path) return;
+      replayStateDiffFilePath = path;
+      await loadReplayStateDiffFile(path);
+    });
+  });
+}
+
+function renderReplayStateDiffFilePane(payload) {
+  const right = graphCanvas.querySelector("#replayRightPane");
+  if (!right) return;
+
+  if (!payload) {
+    right.innerHTML = '<div class="replay-empty">Select a file to inspect the state diff.</div>';
+    return;
+  }
+
+  const stats = payload.stats || {};
+  right.innerHTML = `
+    <div class="replay-pane-head">
+      <div class="replay-turn-label">${escapeHtml(payload.path || "file")}</div>
+      <div class="replay-meta">Git-style unified diff</div>
+    </div>
+    <div class="state-diff-metrics">
+      <span class="op-pill op-read">+${formatNumber(Number(stats.lines_added || 0))}</span>
+      <span class="op-pill op-write">-${formatNumber(Number(stats.lines_removed || 0))}</span>
+      <span class="op-pill op-rename">Δ ${formatNumber(Number(stats.total_changed || 0))}</span>
+    </div>
+    <pre class="state-diff-pre">${escapeHtml(payload.diff || "No textual diff available")}</pre>`;
+}
+
+function renderReplayStateDiffLayout(payload) {
+  replayStateDiffData = payload;
+  const turns = Array.isArray(payload.turns) ? payload.turns : [];
+  const selected = payload.selected || {};
+  replayStateDiffFromTurnId = selected.from_turn_id || replayStateDiffFromTurnId;
+  replayStateDiffToTurnId = selected.to_turn_id || replayStateDiffToTurnId;
+
+  const turnOptions = turns
+    .map((turn) => `<option value="${escapeHtml(String(turn.turn_id || ""))}">${escapeHtml(String(turn.label || turn.turn_id || ""))}</option>`)
+    .join("");
+
+  const treeHtml = stateDiffTreeNode(payload.tree || { name: "/", kind: "folder", children: [] }, () => {});
+  const summary = payload.summary || {};
+
+  graphCanvas.innerHTML = `
+    <div class="replay-layout state-diff-layout">
+      <aside class="replay-left">
+        <div class="replay-left-head">State Diff Explorer</div>
+        <div class="state-diff-controls">
+          <label>Previous turn</label>
+          <select id="stateDiffFromSelect">${turnOptions}</select>
+          <label>Current turn</label>
+          <select id="stateDiffToSelect">${turnOptions}</select>
+          <button class="btn" id="stateDiffApplyBtn">Apply range</button>
+          <div class="state-diff-summary">${formatNumber(Number(summary.files_changed || 0))} files · +${formatNumber(Number(summary.lines_added || 0))} -${formatNumber(Number(summary.lines_removed || 0))}</div>
+        </div>
+        <div class="state-diff-tree" id="stateDiffTree">${treeHtml}</div>
+      </aside>
+      <section class="replay-right" id="replayRightPane">
+        <div class="replay-empty">Select a file to inspect the state diff.</div>
+      </section>
+    </div>`;
+
+  const fromSel = $("stateDiffFromSelect");
+  const toSel = $("stateDiffToSelect");
+  if (fromSel && replayStateDiffFromTurnId) fromSel.value = replayStateDiffFromTurnId;
+  if (toSel && replayStateDiffToTurnId) toSel.value = replayStateDiffToTurnId;
+
+  const applyBtn = $("stateDiffApplyBtn");
+  if (applyBtn) {
+    applyBtn.addEventListener("click", async () => {
+      replayStateDiffFromTurnId = fromSel ? fromSel.value : replayStateDiffFromTurnId;
+      replayStateDiffToTurnId = toSel ? toSel.value : replayStateDiffToTurnId;
+      replayStateDiffFilePath = "";
+      await loadReplayStateDiff();
+    });
+  }
+
+  wireStateDiffTreeEvents($("stateDiffTree"));
+}
+
+async function loadReplayStateDiff() {
+  if (!selectedTraceId) return;
+  replayViewMode = "state_diff";
+
+  const params = new URLSearchParams();
+  if (replayStateDiffFromTurnId) params.set("from_turn_id", replayStateDiffFromTurnId);
+  if (replayStateDiffToTurnId) params.set("to_turn_id", replayStateDiffToTurnId);
+  const payload = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/replay-state-diff?${params.toString()}`);
+  replayStateDiffFromTurnId = (payload.selected || {}).from_turn_id || replayStateDiffFromTurnId;
+  replayStateDiffToTurnId = (payload.selected || {}).to_turn_id || replayStateDiffToTurnId;
+  renderReplayStateDiffLayout(payload);
+
+  const files = Array.isArray(payload.files) ? payload.files : [];
+  if (!replayStateDiffFilePath || !files.some((f) => String(f.path || "") === replayStateDiffFilePath)) {
+    replayStateDiffFilePath = files.length ? String(files[0].path || "") : "";
+  }
+  if (replayStateDiffFilePath) {
+    await loadReplayStateDiffFile(replayStateDiffFilePath);
+  }
+}
+
+async function loadReplayStateDiffFile(path) {
+  if (!selectedTraceId || !path) return;
+  replayStateDiffFilePath = path;
+  const params = new URLSearchParams({ path });
+  if (replayStateDiffFromTurnId) params.set("from_turn_id", replayStateDiffFromTurnId);
+  if (replayStateDiffToTurnId) params.set("to_turn_id", replayStateDiffToTurnId);
+
+  const payload = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/replay-state-diff/file?${params.toString()}`);
+  renderReplayStateDiffLayout(replayStateDiffData || {
+    turns: [],
+    selected: { from_turn_id: replayStateDiffFromTurnId, to_turn_id: replayStateDiffToTurnId },
+    tree: { name: "/", kind: "folder", children: [] },
+    summary: {},
+  });
+  renderReplayStateDiffFilePane(payload);
+}
+
 function renderReplayShell(overview) {
+  if (replayViewMode === "state_diff") {
+    if (replayStateDiffData) {
+      renderReplayStateDiffLayout(replayStateDiffData);
+      return;
+    }
+  }
+
   const turns = (overview || {}).turns || [];
   const turnButtons = turns.map((turn) => {
     const active = turn.turn_id === currentReplayTurnId;
@@ -1506,7 +1671,10 @@ function renderReplayShell(overview) {
   graphCanvas.innerHTML = `
     <div class="replay-layout">
       <aside class="replay-left">
-        <div class="replay-left-head">Turns</div>
+        <div class="replay-left-head replay-left-head-row">
+          <span>Turns</span>
+          <button class="btn" id="viewStateDiffBtn">View state diff</button>
+        </div>
         <div class="replay-turn-list">${turnButtons || '<div class="replay-empty">No turns available</div>'}</div>
       </aside>
       <section class="replay-right" id="replayRightPane">
@@ -1518,14 +1686,23 @@ function renderReplayShell(overview) {
     btn.addEventListener("click", async () => {
       const turnId = btn.getAttribute("data-turn-id");
       if (!turnId) return;
+      replayViewMode = "turn";
       currentReplayTurnId = turnId;
       await loadReplayTurnDetail(turnId);
     });
   });
+
+  const stateDiffBtn = $("viewStateDiffBtn");
+  if (stateDiffBtn) {
+    stateDiffBtn.addEventListener("click", async () => {
+      await loadReplayStateDiff();
+    });
+  }
 }
 
 async function loadReplayTurnDetail(turnId) {
   if (!selectedTraceId) return;
+  replayViewMode = "turn";
   await primeReplaySourceMaps();
   const [payload, turnDetail] = await Promise.all([
     api(`/api/traces/${encodeURIComponent(selectedTraceId)}/replay-turns/${encodeURIComponent(turnId)}`),
@@ -1544,8 +1721,18 @@ async function loadReplayOverview() {
   const payload = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/replay-turns`);
   replayOverview = payload;
   replaySourceMapTraceId = null;
+  replayViewMode = "turn";
+  replayStateDiffData = null;
+  replayStateDiffFilePath = "";
 
   const turns = payload.turns || [];
+  if (turns.length > 0) {
+    replayStateDiffFromTurnId = String(turns[0].turn_id || "");
+    replayStateDiffToTurnId = String(turns[turns.length - 1].turn_id || replayStateDiffFromTurnId);
+  } else {
+    replayStateDiffFromTurnId = null;
+    replayStateDiffToTurnId = null;
+  }
   const strip = $("summaryStrip");
   strip.style.gridTemplateColumns = "repeat(4, 1fr)";
   strip.innerHTML = `
@@ -1938,6 +2125,7 @@ function installStyles() {
     .replay-layout { display:grid; grid-template-columns: 280px 1fr; gap:12px; height:100%; min-height:0; }
     .replay-left { border:1px solid var(--border); border-radius:10px; background:var(--surface); overflow:hidden; display:flex; flex-direction:column; min-height:0; }
     .replay-left-head { padding:10px 12px; font-size:12px; font-weight:700; color:var(--text-secondary); border-bottom:1px solid var(--border); text-transform:uppercase; letter-spacing:0.04em; }
+    .replay-left-head-row { display:flex; align-items:center; justify-content:space-between; gap:8px; }
     .replay-turn-list { overflow:auto; display:flex; flex-direction:column; flex:1; min-height:0; }
     .replay-turn-item { border:0; border-bottom:1px solid var(--border-light); background:var(--surface); text-align:left; padding:10px; cursor:pointer; }
     .replay-turn-item:hover { background:var(--slate-50); }
@@ -1985,6 +2173,26 @@ function installStyles() {
     .replay-summary-link:hover { border-color:var(--blue-100); background:var(--blue-50); }
 
     .replay-file-tree-wrap { border:1px solid var(--border); border-radius:8px; padding:8px; margin-top:8px; max-height:56vh; overflow:auto; }
+
+    .state-diff-layout .replay-left { min-width: 300px; }
+    .state-diff-controls { display:grid; gap:6px; padding:10px; border-bottom:1px solid var(--border); }
+    .state-diff-controls label { font-size:11px; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.03em; }
+    .state-diff-controls select { border:1px solid var(--border); border-radius:6px; padding:6px 8px; font-size:12px; background:var(--surface); }
+    .state-diff-summary { font-size:11px; color:var(--text-secondary); }
+    .state-diff-tree { overflow:auto; padding:8px; display:grid; gap:4px; }
+    .state-diff-folder { border:1px solid var(--border-light); border-radius:6px; background:var(--surface); }
+    .state-diff-folder > summary { list-style:none; cursor:pointer; display:flex; align-items:center; justify-content:space-between; gap:8px; padding:6px 8px; font-size:12px; font-weight:600; }
+    .state-diff-folder > summary::-webkit-details-marker { display:none; }
+    .state-diff-folder-stats { color:var(--text-muted); font-size:10px; font-weight:500; }
+    .state-diff-folder-body { display:grid; gap:3px; padding-bottom:4px; }
+    .state-diff-file { border:0; background:transparent; text-align:left; width:100%; cursor:pointer; display:flex; align-items:center; justify-content:space-between; gap:6px; padding:4px 8px; font-size:12px; color:var(--text-primary); }
+    .state-diff-file:hover { background:var(--slate-50); }
+    .state-diff-file.active { background:var(--blue-50); box-shadow: inset 3px 0 0 var(--blue-500); }
+    .state-diff-file-name { font-family:Consolas, Monaco, monospace; }
+    .state-diff-file-stats { font-size:10px; color:var(--text-muted); white-space:nowrap; }
+    .state-diff-warn .state-diff-file-stats { color:var(--amber-600); }
+    .state-diff-metrics { display:flex; gap:6px; padding:10px 12px; border-bottom:1px solid var(--border); }
+    .state-diff-pre { margin:0; border:0; border-radius:0; padding:12px; flex:1; overflow:auto; white-space:pre; word-break:normal; font-family:Consolas, Monaco, monospace; font-size:12px; background:#0b1320; color:#dbe7ff; }
 
     .replay-system .replay-band { background:#dbeafe; color:#1e3a8a; }
     .replay-developer .replay-band { background:#ede9fe; color:#5b21b6; }

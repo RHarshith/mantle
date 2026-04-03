@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import bisect
+import difflib
 import heapq
 import json
 import os
@@ -3953,6 +3954,338 @@ class TraceStore:
         }
         return replay_payload
 
+    def _turn_cutoff_ts(
+        self,
+        trace: TraceState,
+        turns: list[dict[str, Any]],
+        index: int,
+        *,
+        boundary: str = "end",
+    ) -> float:
+        if index < 0:
+            return 0.0
+        if index >= len(turns):
+            return float("inf")
+
+        turn = turns[index]
+        prefer_start = boundary == "start"
+
+        start_ts = turn.get("start_ts")
+        end_ts = turn.get("end_ts")
+
+        if prefer_start and start_ts is not None:
+            try:
+                return float(start_ts)
+            except Exception:
+                pass
+
+        if not prefer_start and end_ts is not None:
+            try:
+                return float(end_ts)
+            except Exception:
+                pass
+
+        # Fallback to whichever boundary exists.
+        if start_ts is not None:
+            try:
+                return float(start_ts)
+            except Exception:
+                pass
+        if end_ts is not None:
+            try:
+                return float(end_ts)
+            except Exception:
+                pass
+
+        if trace.sys_events:
+            if prefer_start:
+                return min(self._event_ts(e) for e in trace.sys_events)
+            return max(self._event_ts(e) for e in trace.sys_events)
+        return 0.0
+
+    def _snapshot_events_by_path(self, trace: TraceState) -> dict[str, list[dict[str, Any]]]:
+        out: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for event in sorted(trace.sys_events, key=lambda e: (self._event_ts(e), int(e.get("line_no") or 0))):
+            if str(event.get("type") or "") != "file_snapshot":
+                continue
+            path = str(event.get("path") or "").strip()
+            if not path:
+                continue
+            out[path].append(event)
+        return out
+
+    def _latest_snapshot_before(self, snapshots: list[dict[str, Any]], cutoff_ts: float) -> dict[str, Any] | None:
+        best: dict[str, Any] | None = None
+        for event in snapshots:
+            ets = self._event_ts(event)
+            if ets <= cutoff_ts:
+                best = event
+            else:
+                break
+        return best
+
+    def _snapshot_text(self, snapshot: dict[str, Any] | None) -> str:
+        if not snapshot:
+            return ""
+        if bool(snapshot.get("binary")):
+            return ""
+        return str(snapshot.get("content") or "")
+
+    def _line_change_stats(self, before_text: str, after_text: str) -> dict[str, int]:
+        before_lines = before_text.splitlines()
+        after_lines = after_text.splitlines()
+
+        matcher = difflib.SequenceMatcher(a=before_lines, b=after_lines)
+        added = 0
+        removed = 0
+        changed = 0
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == "insert":
+                added += (j2 - j1)
+            elif tag == "delete":
+                removed += (i2 - i1)
+            elif tag == "replace":
+                removed += (i2 - i1)
+                added += (j2 - j1)
+                changed += max(i2 - i1, j2 - j1)
+
+        return {
+            "added": int(added),
+            "removed": int(removed),
+            "changed": int(changed),
+            "total": int(added + removed),
+        }
+
+    def _build_state_diff_tree(self, files: list[dict[str, Any]]) -> dict[str, Any]:
+        root: dict[str, Any] = {"name": "/", "kind": "folder", "children": []}
+        child_map: dict[tuple[int, str], dict[str, Any]] = {}
+
+        def _child(parent: dict[str, Any], name: str, kind: str) -> dict[str, Any]:
+            key = (id(parent), f"{kind}:{name}")
+            existing = child_map.get(key)
+            if existing is not None:
+                return existing
+            node = {"name": name, "kind": kind, "children": [] if kind == "folder" else None}
+            parent.setdefault("children", []).append(node)
+            child_map[key] = node
+            return node
+
+        for item in sorted(files, key=lambda x: str(x.get("path") or "")):
+            path = str(item.get("path") or "")
+            if not path:
+                continue
+            parts = [p for p in Path(path).parts if p not in {"/", ""}]
+            cur = root
+            for part in parts[:-1]:
+                cur = _child(cur, part, "folder")
+            leaf = _child(cur, parts[-1] if parts else path, "file")
+            for key in ("path", "lines_added", "lines_removed", "lines_changed", "total_changed", "binary", "truncated"):
+                if key in item:
+                    leaf[key] = item[key]
+
+        def _annotate(node: dict[str, Any]) -> dict[str, int]:
+            if str(node.get("kind") or "") == "file":
+                counts = {
+                    "files": 1,
+                    "added": int(node.get("lines_added") or 0),
+                    "removed": int(node.get("lines_removed") or 0),
+                    "total": int(node.get("total_changed") or 0),
+                }
+                node["counts"] = counts
+                return counts
+
+            total = {"files": 0, "added": 0, "removed": 0, "total": 0}
+            for child in node.get("children") or []:
+                c = _annotate(child)
+                total["files"] += int(c.get("files") or 0)
+                total["added"] += int(c.get("added") or 0)
+                total["removed"] += int(c.get("removed") or 0)
+                total["total"] += int(c.get("total") or 0)
+            node["counts"] = total
+            return total
+
+        _annotate(root)
+        return root
+
+    def replay_state_diff(self, trace_id: str, from_turn_id: str | None = None, to_turn_id: str | None = None) -> dict[str, Any]:
+        trace = self._get_trace(trace_id)
+        turns = self._turns_for_trace(trace)
+        if not turns:
+            return {
+                "trace_id": trace_id,
+                "turns": [],
+                "selected": {"from_turn_id": None, "to_turn_id": None},
+                "summary": {"files_changed": 0, "lines_added": 0, "lines_removed": 0, "total_changed": 0},
+                "tree": {"name": "/", "kind": "folder", "children": [], "counts": {"files": 0, "added": 0, "removed": 0, "total": 0}},
+                "files": [],
+            }
+
+        by_id = {str(turn.get("turn_id") or ""): idx for idx, turn in enumerate(turns)}
+        resolved_from = from_turn_id if from_turn_id in by_id else str(turns[0].get("turn_id") or "")
+        resolved_to = to_turn_id if to_turn_id in by_id else str(turns[-1].get("turn_id") or "")
+
+        from_idx = by_id.get(str(resolved_from), 0)
+        to_idx = by_id.get(str(resolved_to), len(turns) - 1)
+        if from_idx > to_idx:
+            from_idx, to_idx = to_idx, from_idx
+            resolved_from, resolved_to = resolved_to, resolved_from
+
+        from_cutoff = self._turn_cutoff_ts(trace, turns, from_idx, boundary="start")
+        to_cutoff = self._turn_cutoff_ts(trace, turns, to_idx, boundary="end")
+
+        snapshot_by_path = self._snapshot_events_by_path(trace)
+        files: list[dict[str, Any]] = []
+        lines_added = 0
+        lines_removed = 0
+
+        for path, snapshots in snapshot_by_path.items():
+            before_snap = self._latest_snapshot_before(snapshots, from_cutoff)
+            after_snap = self._latest_snapshot_before(snapshots, to_cutoff)
+            if before_snap is None and after_snap is None:
+                continue
+
+            before_text = self._snapshot_text(before_snap)
+            after_text = self._snapshot_text(after_snap)
+
+            # If one side has no snapshot event, treat that side as empty for diff purposes.
+            if before_snap is None:
+                before_text = ""
+            if after_snap is None:
+                after_text = ""
+
+            if before_text == after_text and bool(before_snap) == bool(after_snap):
+                continue
+
+            stats = self._line_change_stats(before_text, after_text)
+            lines_added += int(stats.get("added") or 0)
+            lines_removed += int(stats.get("removed") or 0)
+
+            files.append(
+                {
+                    "path": path,
+                    "lines_added": int(stats.get("added") or 0),
+                    "lines_removed": int(stats.get("removed") or 0),
+                    "lines_changed": int(stats.get("changed") or 0),
+                    "total_changed": int(stats.get("total") or 0),
+                    "binary": bool((before_snap or {}).get("binary")) or bool((after_snap or {}).get("binary")),
+                    "truncated": bool((before_snap or {}).get("truncated")) or bool((after_snap or {}).get("truncated")),
+                }
+            )
+
+        files.sort(key=lambda x: str(x.get("path") or ""))
+        tree = self._build_state_diff_tree(files)
+
+        return {
+            "trace_id": trace_id,
+            "turns": [
+                {
+                    "turn_id": str(turn.get("turn_id") or ""),
+                    "label": str(turn.get("label") or turn.get("turn_id") or ""),
+                    "index": int(turn.get("index") or 0),
+                }
+                for turn in turns
+            ],
+            "selected": {
+                "from_turn_id": resolved_from,
+                "to_turn_id": resolved_to,
+            },
+            "summary": {
+                "files_changed": len(files),
+                "lines_added": int(lines_added),
+                "lines_removed": int(lines_removed),
+                "total_changed": int(lines_added + lines_removed),
+            },
+            "tree": tree,
+            "files": files,
+        }
+
+    def replay_state_diff_file(
+        self,
+        trace_id: str,
+        *,
+        path: str,
+        from_turn_id: str | None = None,
+        to_turn_id: str | None = None,
+    ) -> dict[str, Any]:
+        trace = self._get_trace(trace_id)
+        turns = self._turns_for_trace(trace)
+        if not turns:
+            raise KeyError(path)
+
+        by_id = {str(turn.get("turn_id") or ""): idx for idx, turn in enumerate(turns)}
+        resolved_from = from_turn_id if from_turn_id in by_id else str(turns[0].get("turn_id") or "")
+        resolved_to = to_turn_id if to_turn_id in by_id else str(turns[-1].get("turn_id") or "")
+
+        from_idx = by_id.get(str(resolved_from), 0)
+        to_idx = by_id.get(str(resolved_to), len(turns) - 1)
+        if from_idx > to_idx:
+            from_idx, to_idx = to_idx, from_idx
+            resolved_from, resolved_to = resolved_to, resolved_from
+
+        from_cutoff = self._turn_cutoff_ts(trace, turns, from_idx, boundary="start")
+        to_cutoff = self._turn_cutoff_ts(trace, turns, to_idx, boundary="end")
+
+        snapshots = self._snapshot_events_by_path(trace).get(path) or []
+        if not snapshots:
+            raise KeyError(path)
+
+        before_snap = self._latest_snapshot_before(snapshots, from_cutoff)
+        after_snap = self._latest_snapshot_before(snapshots, to_cutoff)
+
+        before_text = self._snapshot_text(before_snap)
+        after_text = self._snapshot_text(after_snap)
+        if before_snap is None:
+            before_text = ""
+        if after_snap is None:
+            after_text = ""
+
+        binary = bool((before_snap or {}).get("binary")) or bool((after_snap or {}).get("binary"))
+        truncated = bool((before_snap or {}).get("truncated")) or bool((after_snap or {}).get("truncated"))
+
+        stats = self._line_change_stats(before_text, after_text)
+
+        if binary:
+            diff_text = "Binary file snapshot detected; textual diff is unavailable."
+        elif truncated:
+            diff_text = "One or both snapshots were truncated during capture; diff may be incomplete.\n\n"
+            diff_text += "\n".join(
+                difflib.unified_diff(
+                    before_text.splitlines(),
+                    after_text.splitlines(),
+                    fromfile=f"a/{path}",
+                    tofile=f"b/{path}",
+                    lineterm="",
+                )
+            )
+        else:
+            diff_text = "\n".join(
+                difflib.unified_diff(
+                    before_text.splitlines(),
+                    after_text.splitlines(),
+                    fromfile=f"a/{path}",
+                    tofile=f"b/{path}",
+                    lineterm="",
+                )
+            )
+
+        return {
+            "trace_id": trace_id,
+            "path": path,
+            "selected": {
+                "from_turn_id": resolved_from,
+                "to_turn_id": resolved_to,
+            },
+            "stats": {
+                "lines_added": int(stats.get("added") or 0),
+                "lines_removed": int(stats.get("removed") or 0),
+                "lines_changed": int(stats.get("changed") or 0),
+                "total_changed": int(stats.get("total") or 0),
+            },
+            "binary": binary,
+            "truncated": truncated,
+            "diff": diff_text,
+        }
+
     def _count_text_tokens_tiktoken(self, text: str) -> int:
         payload = str(text or "")
         if not payload:
@@ -4241,6 +4574,8 @@ class TraceStore:
         for tp in tool_pairs:
             merged.append({"kind": "tool", "ts": float(tp.get("started_ts") or 0.0), "tool": tp})
         for ev in sys_events:
+            if str(ev.get("type") or "") == "file_snapshot":
+                continue
             if not _should_keep_at_current_level(ev):
                 continue
             merged.append({"kind": "sys", "ts": self._event_ts(ev), "event": ev, "category": _sys_cat(ev)})

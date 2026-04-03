@@ -175,6 +175,26 @@ def replay_turn_detail(trace_id: str, turn_id: str) -> dict[str, Any]:
 		raise HTTPException(status_code=404, detail="Trace turn not found")
 
 
+@app.get("/api/traces/{trace_id}/replay-state-diff")
+def replay_state_diff(trace_id: str, from_turn_id: str | None = None, to_turn_id: str | None = None) -> dict[str, Any]:
+	"""Return folder-tree state diff summary between two selected replay turns."""
+	try:
+		return store.replay_state_diff(trace_id, from_turn_id=from_turn_id, to_turn_id=to_turn_id)
+	except KeyError:
+		raise HTTPException(status_code=404, detail="Trace not found")
+
+
+@app.get("/api/traces/{trace_id}/replay-state-diff/file")
+def replay_state_diff_file(trace_id: str, path: str, from_turn_id: str | None = None, to_turn_id: str | None = None) -> dict[str, Any]:
+	"""Return unified diff for one file between two selected replay turns."""
+	if not path:
+		raise HTTPException(status_code=400, detail="path is required")
+	try:
+		return store.replay_state_diff_file(trace_id, path=path, from_turn_id=from_turn_id, to_turn_id=to_turn_id)
+	except KeyError:
+		raise HTTPException(status_code=404, detail="Trace or file diff not found")
+
+
 @app.get("/api/traces/{trace_id}/process-subtrace/{turn_id}/{pid}")
 def process_subtrace(trace_id: str, turn_id: str, pid: int, full_lifecycle: bool = False) -> dict[str, Any]:
 	"""Return a focused sub-trace for one process within a turn."""

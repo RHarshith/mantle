@@ -14,6 +14,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+
+MAX_SNAPSHOT_BYTES = 512 * 1024
+
 BPFTRACE_PROGRAM = r'''
 BEGIN
 {
@@ -52,6 +55,12 @@ tracepoint:syscalls:sys_enter_openat
   printf("EVT|%llu|openat|%d|%s|%d\n", nsecs, pid, str(args->filename), args->flags);
 }
 
+tracepoint:syscalls:sys_exit_openat
+/@tracked[pid]/
+{
+    printf("EVT|%llu|openat_ret|%d|%d\n", nsecs, pid, args->ret);
+}
+
 tracepoint:syscalls:sys_enter_unlinkat
 /@tracked[pid]/
 {
@@ -64,10 +73,22 @@ tracepoint:syscalls:sys_enter_renameat
   printf("EVT|%llu|renameat|%d|%s|%s\n", nsecs, pid, str(args->oldname), str(args->newname));
 }
 
+tracepoint:syscalls:sys_exit_renameat
+/@tracked[pid]/
+{
+    printf("EVT|%llu|renameat_ret|%d|%d\n", nsecs, pid, args->ret);
+}
+
 tracepoint:syscalls:sys_enter_renameat2
 /@tracked[pid]/
 {
   printf("EVT|%llu|renameat2|%d|%s|%s\n", nsecs, pid, str(args->oldname), str(args->newname));
+}
+
+tracepoint:syscalls:sys_exit_renameat2
+/@tracked[pid]/
+{
+    printf("EVT|%llu|renameat2_ret|%d|%d\n", nsecs, pid, args->ret);
 }
 
 tracepoint:syscalls:sys_enter_connect
@@ -86,6 +107,24 @@ tracepoint:syscalls:sys_enter_recvfrom
 /@tracked[pid]/
 {
   printf("EVT|%llu|recvfrom|%d|%d|%d\n", nsecs, pid, args->fd, args->size);
+}
+
+tracepoint:syscalls:sys_enter_write
+/@tracked[pid]/
+{
+    printf("EVT|%llu|write|%d|%d|%d\n", nsecs, pid, args->fd, args->count);
+}
+
+tracepoint:syscalls:sys_exit_write
+/@tracked[pid]/
+{
+    printf("EVT|%llu|write_ret|%d|%d\n", nsecs, pid, args->ret);
+}
+
+tracepoint:syscalls:sys_enter_close
+/@tracked[pid]/
+{
+    printf("EVT|%llu|close|%d|%d\n", nsecs, pid, args->fd);
 }
 '''
 
@@ -372,7 +411,22 @@ def _event_from_line(
             "type": action_type,
             "pid": pid,
             "path": path,
+            "flags": flags,
             "label": f"{action_type.replace('_', ' ')} {path}",
+        }
+
+    if kind == "openat_ret":
+        if len(parts) < 5:
+            return None
+        pid = _safe_int(parts[3])
+        fd = _safe_int(parts[4], -1)
+        return {
+            "ts": ts,
+            "line_no": seq,
+            "type": "fd_open",
+            "pid": pid,
+            "fd": fd,
+            "label": f"fd open {fd}",
         }
 
     if kind == "unlinkat":
@@ -403,6 +457,21 @@ def _event_from_line(
             "path": dst,
             "src": src,
             "label": f"rename {src} -> {dst}",
+        }
+
+    if kind in {"renameat_ret", "renameat2_ret"}:
+        if len(parts) < 5:
+            return None
+        pid = _safe_int(parts[3])
+        ret = _safe_int(parts[4], -1)
+        return {
+            "ts": ts,
+            "line_no": seq,
+            "type": "file_rename_ret",
+            "pid": pid,
+            "ok": ret == 0,
+            "ret": ret,
+            "label": f"rename ret={ret}",
         }
 
     if kind == "connect":
@@ -479,6 +548,51 @@ def _event_from_line(
             "label": f"recv {size}B <- {cached.get('dest', f'fd={fd}')}",
         }
 
+    if kind == "write":
+        if len(parts) < 6:
+            return None
+        pid = _safe_int(parts[3])
+        fd = _safe_int(parts[4], -1)
+        req = _safe_int(parts[5], 0)
+        return {
+            "ts": ts,
+            "line_no": seq,
+            "type": "fd_write",
+            "pid": pid,
+            "fd": fd,
+            "requested_bytes": req,
+            "label": f"write fd={fd} req={req}",
+        }
+
+    if kind == "write_ret":
+        if len(parts) < 5:
+            return None
+        pid = _safe_int(parts[3])
+        ret = _safe_int(parts[4], -1)
+        return {
+            "ts": ts,
+            "line_no": seq,
+            "type": "fd_write_ret",
+            "pid": pid,
+            "written_bytes": ret,
+            "ok": ret >= 0,
+            "label": f"write ret={ret}",
+        }
+
+    if kind == "close":
+        if len(parts) < 5:
+            return None
+        pid = _safe_int(parts[3])
+        fd = _safe_int(parts[4], -1)
+        return {
+            "ts": ts,
+            "line_no": seq,
+            "type": "fd_close",
+            "pid": pid,
+            "fd": fd,
+            "label": f"close fd={fd}",
+        }
+
     return None
 
 
@@ -505,6 +619,11 @@ def run_capture(output_file: Path, command: list[str]) -> int:
 
     cmdline_cache: dict[int, str] = {}
     socket_cache: dict[tuple[int, int], dict[str, Any]] = {}
+    pending_open: dict[int, dict[str, Any]] = {}
+    fd_paths: dict[tuple[int, int], dict[str, Any]] = {}
+    pending_write_fd: dict[int, int] = {}
+    path_before_snapshot: dict[str, dict[str, Any]] = {}
+    pending_rename: dict[int, dict[str, str]] = {}
     seq = 0
     expected_exec_basename = Path(launch_argv[0]).name
     capture_started = False
@@ -524,6 +643,82 @@ def run_capture(output_file: Path, command: list[str]) -> int:
     )
 
     try:
+        def _resolve_path_for_pid(pid: int, raw_path: str) -> str:
+            path_txt = str(raw_path or "").strip()
+            if not path_txt:
+                return ""
+            if path_txt.startswith("/"):
+                return path_txt
+            try:
+                cwd = os.readlink(f"/proc/{pid}/cwd")
+                return str((Path(cwd) / path_txt).resolve())
+            except OSError:
+                return path_txt
+
+        def _capture_snapshot(path: str) -> dict[str, Any]:
+            out: dict[str, Any] = {
+                "path": path,
+                "exists": False,
+                "size": 0,
+                "truncated": False,
+                "binary": False,
+                "content": "",
+            }
+            if not path:
+                return out
+
+            p = Path(path)
+            if not p.exists() or not p.is_file():
+                return out
+
+            try:
+                size = p.stat().st_size
+                out["exists"] = True
+                out["size"] = int(size)
+                read_size = min(int(size), MAX_SNAPSHOT_BYTES)
+                data = p.read_bytes()[:read_size]
+            except OSError:
+                return out
+
+            if b"\x00" in data:
+                out["binary"] = True
+                return out
+
+            out["content"] = data.decode("utf-8", errors="replace")
+            out["truncated"] = int(out["size"]) > MAX_SNAPSHOT_BYTES
+            return out
+
+        def _emit_snapshot(
+            out_fh: Any,
+            *,
+            ts: float,
+            pid: int,
+            path: str,
+            phase: str,
+            trigger: str,
+        ) -> None:
+            nonlocal seq
+            if not path:
+                return
+            snap = _capture_snapshot(path)
+            seq += 1
+            event = {
+                "ts": ts,
+                "line_no": seq,
+                "type": "file_snapshot",
+                "pid": int(pid),
+                "path": path,
+                "snapshot_phase": phase,
+                "trigger": trigger,
+                "exists": bool(snap.get("exists")),
+                "size": int(snap.get("size") or 0),
+                "truncated": bool(snap.get("truncated")),
+                "binary": bool(snap.get("binary")),
+                "content": snap.get("content") or "",
+                "label": f"snapshot {phase} {path}",
+            }
+            out_fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+
         with output_file.open("w", encoding="utf-8") as out_fh:
             assert proc.stdout is not None
             for line in proc.stdout:
@@ -547,6 +742,125 @@ def run_capture(output_file: Path, command: list[str]) -> int:
                             capture_started = True
                     if not capture_started:
                         continue
+
+                et = str(event.get("type") or "")
+                pid = int(event.get("pid") or 0)
+
+                if et == "file_write":
+                    path = _resolve_path_for_pid(pid, str(event.get("path") or ""))
+                    event["path"] = path
+                    flags = int(event.get("flags") or 0)
+                    if pid > 0 and path:
+                        pending_open[pid] = {"path": path, "flags": flags, "ts": float(event.get("ts") or 0.0)}
+                        # Fallback: capture an immediate baseline snapshot from
+                        # openat(write) path even if later fd correlation fails.
+                        if path not in path_before_snapshot:
+                            path_before_snapshot[path] = _capture_snapshot(path)
+                            _emit_snapshot(
+                                out_fh,
+                                ts=float(event.get("ts") or 0.0),
+                                pid=pid,
+                                path=path,
+                                phase="before",
+                                trigger="file_write_open",
+                            )
+
+                elif et == "fd_open":
+                    fd = int(event.get("fd") or -1)
+                    open_info = pending_open.pop(pid, None)
+                    if fd >= 0 and open_info:
+                        fd_paths[(pid, fd)] = {
+                            "path": str(open_info.get("path") or ""),
+                            "flags": int(open_info.get("flags") or 0),
+                        }
+                        event["path"] = str(open_info.get("path") or "")
+
+                elif et == "fd_write":
+                    fd = int(event.get("fd") or -1)
+                    pending_write_fd[pid] = fd
+                    info = fd_paths.get((pid, fd))
+                    if info:
+                        path = str(info.get("path") or "")
+                        if path:
+                            event["path"] = path
+                            if path not in path_before_snapshot:
+                                pre = _capture_snapshot(path)
+                                path_before_snapshot[path] = pre
+                                _emit_snapshot(
+                                    out_fh,
+                                    ts=float(event.get("ts") or 0.0),
+                                    pid=pid,
+                                    path=path,
+                                    phase="before",
+                                    trigger="fd_write",
+                                )
+
+                elif et == "fd_write_ret":
+                    fd = int(pending_write_fd.pop(pid, -1))
+                    written = int(event.get("written_bytes") or -1)
+                    info = fd_paths.get((pid, fd)) if fd >= 0 else None
+                    if info:
+                        path = str(info.get("path") or "")
+                        if path:
+                            event["path"] = path
+                            if written > 0:
+                                _emit_snapshot(
+                                    out_fh,
+                                    ts=float(event.get("ts") or 0.0),
+                                    pid=pid,
+                                    path=path,
+                                    phase="after",
+                                    trigger="fd_write_ret",
+                                )
+                    elif written > 0:
+                        # Fallback: if fd mapping is unavailable, try the most
+                        # recent openat(write) path for this pid.
+                        open_info = pending_open.get(pid)
+                        fallback_path = str((open_info or {}).get("path") or "")
+                        if fallback_path:
+                            _emit_snapshot(
+                                out_fh,
+                                ts=float(event.get("ts") or 0.0),
+                                pid=pid,
+                                path=fallback_path,
+                                phase="after",
+                                trigger="fd_write_ret_fallback",
+                            )
+
+                elif et == "fd_close":
+                    fd = int(event.get("fd") or -1)
+                    if fd >= 0:
+                        fd_paths.pop((pid, fd), None)
+
+                elif et == "file_rename":
+                    src = _resolve_path_for_pid(pid, str(event.get("src") or ""))
+                    dst = _resolve_path_for_pid(pid, str(event.get("path") or ""))
+                    event["src"] = src
+                    event["path"] = dst
+                    if pid > 0 and dst:
+                        pending_rename[pid] = {"src": src, "dst": dst}
+                        _emit_snapshot(
+                            out_fh,
+                            ts=float(event.get("ts") or 0.0),
+                            pid=pid,
+                            path=dst,
+                            phase="before",
+                            trigger="file_rename",
+                        )
+
+                elif et == "file_rename_ret":
+                    info = pending_rename.pop(pid, None)
+                    if info and bool(event.get("ok")):
+                        dst = str(info.get("dst") or "")
+                        if dst:
+                            _emit_snapshot(
+                                out_fh,
+                                ts=float(event.get("ts") or 0.0),
+                                pid=pid,
+                                path=dst,
+                                phase="after",
+                                trigger="file_rename_ret",
+                            )
 
                 out_fh.write(json.dumps(event, ensure_ascii=False) + "\n")
     finally:
