@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Agent Trace Observatory</title>
+  <title>Mantle Trustworthiness Dashboard</title>
   <script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
   <style>
     :root {
@@ -295,8 +295,9 @@
     <!-- Left Sidebar -->
     <aside class="sidebar">
       <div class="sidebar-header">
-        <h2>Agent Traces</h2>
-        <div class="subtitle">System-call observability</div>
+        <h2>Processes and Traces</h2>
+        <div class="subtitle">Group traces by process and replay any trace</div>
+        <button class="btn" id="addProcessBtn" style="margin-top:8px;">+ New Process</button>
       </div>
       <div id="traceList"></div>
     </aside>
@@ -315,9 +316,9 @@
         </div>
       </div>
       <div class="view-tabs">
-        <button class="view-tab active" id="traceTabBtn">Trace View</button>
-        <button class="view-tab" id="replayTabBtn">Replay Trace</button>
-        <button class="view-tab" id="settingsTabBtn">Settings</button>
+        <button class="view-tab active" id="traceTabBtn">Correctness</button>
+        <button class="view-tab" id="replayTabBtn">Safety</button>
+        <button class="view-tab" id="settingsTabBtn">Efficiency</button>
       </div>
       <div class="summary-strip" id="summaryStrip">
         <div class="summary-card"><div class="k">Turns</div><div class="v" id="sumTurns">0</div></div>
@@ -330,8 +331,8 @@
       <div class="graph-wrapper" id="graphWrapper">
         <div class="graph-canvas" id="graphCanvas">
           <div class="empty-state" id="emptyState">
-            <h3>No trace selected</h3>
-            <p>Select a trace from the sidebar, or run an agent with eBPF capture to begin.</p>
+            <h3>Correctness Overview</h3>
+            <p>Select a trace to open replay, or keep no selection to see process-level correctness metrics.</p>
           </div>
         </div>
       </div>

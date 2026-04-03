@@ -3,7 +3,7 @@
 let selectedTraceId = null;
 let cachedTraces = [];
 let latestVersion = -1;
-let activeTab = "trace";
+let activeTab = "correctness";
 let replayOverview = null;
 let currentReplayTurnId = null;
 let currentReplayPaneTab = "context";
@@ -11,6 +11,9 @@ let currentReplayToolSourceIndex = [];
 let replaySourceByToolCallId = new Map();
 let replaySourceByResultText = new Map();
 let replaySourceMapTraceId = null;
+let allDimensionMetrics = [];
+let traceProcessMap = {};
+let processNames = ["default"];
 
 let turnsOverview = null;
 let currentTurnId = null;
@@ -25,6 +28,7 @@ const detailsEl = $("details");
 const traceTabBtn = $("traceTabBtn");
 const replayTabBtn = $("replayTabBtn");
 const settingsTabBtn = $("settingsTabBtn");
+const addProcessBtn = $("addProcessBtn");
 const fileToggle = $("fileToggle");
 const toolsToggle = $("toolsToggle");
 const selectionToggle = $("selectionToggle");
@@ -96,40 +100,185 @@ function setCollapsed(sectionBody, caret, collapsed) {
   caret.textContent = collapsed ? "▶" : "▼";
 }
 
-function renderTraceList(traces) {
-  traceListEl.innerHTML = "";
-  for (const t of traces) {
-    const row = document.createElement("div");
-    row.className = `trace-item${t.trace_id === selectedTraceId ? " active" : ""}`;
-    const statusClass = t.status === "completed" ? "completed" : "active";
-    row.innerHTML = `
-      <div class="trace-row">
-        <div class="trace-main">
-          <div class="trace-name">${escapeHtml(t.trace_id)}</div>
-          <div class="trace-meta"><span class="trace-status ${statusClass}">${escapeHtml(t.status)}</span> agent: ${formatNumber(t.agent_event_count)} sys: ${formatNumber(t.sys_event_count)}</div>
-        </div>
-        <button class="trace-delete-btn" title="Delete trace">×</button>
-      </div>`;
-    row.addEventListener("click", () => selectTrace(t.trace_id));
-    
-    const deleteBtn = row.querySelector(".trace-delete-btn");
-    deleteBtn.addEventListener("click", async (e) => {
-      e.stopPropagation();
-      try {
-        await fetch(`/api/traces/${encodeURIComponent(t.trace_id)}`, { method: "DELETE" });
-      } catch (err) {
-        console.error("Failed to delete trace", err);
-      }
-    });
+function loadProcessState() {
+  try {
+    const rawMap = localStorage.getItem("mantle.traceProcessMap");
+    const parsedMap = rawMap ? JSON.parse(rawMap) : {};
+    traceProcessMap = parsedMap && typeof parsedMap === "object" ? parsedMap : {};
+  } catch (_) {
+    traceProcessMap = {};
+  }
 
-    traceListEl.appendChild(row);
+  try {
+    const rawNames = localStorage.getItem("mantle.processNames");
+    const parsedNames = rawNames ? JSON.parse(rawNames) : ["default"];
+    processNames = Array.isArray(parsedNames) ? parsedNames.map((n) => String(n || "").trim()).filter(Boolean) : ["default"];
+  } catch (_) {
+    processNames = ["default"];
+  }
+
+  if (!processNames.includes("default")) processNames.unshift("default");
+}
+
+function saveProcessState() {
+  localStorage.setItem("mantle.traceProcessMap", JSON.stringify(traceProcessMap));
+  localStorage.setItem("mantle.processNames", JSON.stringify(processNames));
+}
+
+function getTraceProcess(traceId) {
+  const raw = String(traceProcessMap[traceId] || "").trim();
+  if (!raw) return "default";
+  return raw;
+}
+
+function setTraceProcess(traceId, processName) {
+  const value = String(processName || "default").trim() || "default";
+  traceProcessMap[traceId] = value;
+  if (!processNames.includes(value)) {
+    processNames.push(value);
+  }
+  saveProcessState();
+}
+
+function normalizeProcessAssignments(traces) {
+  const traceIds = new Set((traces || []).map((t) => String(t.trace_id || "")));
+  for (const key of Object.keys(traceProcessMap)) {
+    if (!traceIds.has(key)) {
+      delete traceProcessMap[key];
+    }
+  }
+  for (const t of traces || []) {
+    const tid = String(t.trace_id || "");
+    if (!tid) continue;
+    if (!traceProcessMap[tid]) traceProcessMap[tid] = "default";
+  }
+  processNames = Array.from(new Set(["default", ...processNames, ...Object.values(traceProcessMap).map((n) => String(n || "default"))]));
+  processNames.sort((a, b) => {
+    if (a === "default") return -1;
+    if (b === "default") return 1;
+    return a.localeCompare(b);
+  });
+  saveProcessState();
+}
+
+function createProcess() {
+  const name = window.prompt("New process name", "");
+  if (!name) return;
+  const normalized = String(name || "").trim();
+  if (!normalized) return;
+  if (!processNames.includes(normalized)) {
+    processNames.push(normalized);
+    processNames.sort((a, b) => {
+      if (a === "default") return -1;
+      if (b === "default") return 1;
+      return a.localeCompare(b);
+    });
+    saveProcessState();
+  }
+  renderTraceList(cachedTraces);
+}
+
+function renderTraceList(traces) {
+  normalizeProcessAssignments(traces || []);
+  traceListEl.innerHTML = "";
+
+  if (selectedTraceId) {
+    const clearBtn = document.createElement("button");
+    clearBtn.className = "btn";
+    clearBtn.style.margin = "8px 12px";
+    clearBtn.textContent = "Show Dimension Overview";
+    clearBtn.addEventListener("click", async () => {
+      selectedTraceId = null;
+      currentReplayTurnId = null;
+      renderTraceList(cachedTraces);
+      renderBreadcrumbs();
+      graphWrapper.classList.toggle("replay-mode", false);
+      await loadDimensionMetricsCache();
+      renderDimensionOverview(activeTab);
+    });
+    traceListEl.appendChild(clearBtn);
+  }
+
+  const grouped = new Map();
+  for (const name of processNames) {
+    grouped.set(name, []);
+  }
+  for (const t of traces || []) {
+    const pname = getTraceProcess(t.trace_id);
+    if (!grouped.has(pname)) grouped.set(pname, []);
+    grouped.get(pname).push(t);
+  }
+
+  for (const [processName, items] of grouped.entries()) {
+    const section = document.createElement("div");
+    section.className = "trace-process-group";
+
+    const header = document.createElement("div");
+    header.className = "trace-process-header";
+    header.innerHTML = `<span class="trace-process-name">${escapeHtml(processName)}</span><span class="trace-process-count">${formatNumber(items.length)}</span>`;
+    section.appendChild(header);
+
+    if (!items.length) {
+      const empty = document.createElement("div");
+      empty.className = "trace-process-empty";
+      empty.textContent = "No traces";
+      section.appendChild(empty);
+      traceListEl.appendChild(section);
+      continue;
+    }
+
+    for (const t of items) {
+      const row = document.createElement("div");
+      row.className = `trace-item${t.trace_id === selectedTraceId ? " active" : ""}`;
+      const statusClass = t.status === "completed" ? "completed" : "active";
+      const moveOptions = processNames
+        .map((name) => `<option value="${escapeHtml(name)}" ${name === processName ? "selected" : ""}>${escapeHtml(name)}</option>`)
+        .join("");
+      row.innerHTML = `
+        <div class="trace-row">
+          <div class="trace-main">
+            <div class="trace-name">${escapeHtml(t.trace_id)}</div>
+            <div class="trace-meta"><span class="trace-status ${statusClass}">${escapeHtml(t.status)}</span> agent: ${formatNumber(t.agent_event_count)} sys: ${formatNumber(t.sys_event_count)}</div>
+            <div class="trace-meta">Move to: <select class="trace-move-select">${moveOptions}</select></div>
+          </div>
+          <button class="trace-delete-btn" title="Delete trace">×</button>
+        </div>`;
+
+      row.addEventListener("click", () => selectTrace(t.trace_id));
+
+      const moveSelect = row.querySelector(".trace-move-select");
+      moveSelect.addEventListener("click", (e) => e.stopPropagation());
+      moveSelect.addEventListener("change", (e) => {
+        e.stopPropagation();
+        setTraceProcess(t.trace_id, moveSelect.value);
+        renderTraceList(cachedTraces);
+        if (!selectedTraceId) {
+          renderDimensionOverview(activeTab);
+        }
+      });
+
+      const deleteBtn = row.querySelector(".trace-delete-btn");
+      deleteBtn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        try {
+          await fetch(`/api/traces/${encodeURIComponent(t.trace_id)}`, { method: "DELETE" });
+        } catch (err) {
+          console.error("Failed to delete trace", err);
+        }
+      });
+
+      section.appendChild(row);
+    }
+
+    traceListEl.appendChild(section);
   }
 }
 
 function renderBreadcrumbs() {
   breadcrumbsEl.innerHTML = "";
   if (!selectedTraceId) {
-    breadcrumbsEl.innerHTML = '<span class="crumb current">No trace selected</span>';
+    const label = activeTab.charAt(0).toUpperCase() + activeTab.slice(1);
+    breadcrumbsEl.innerHTML = `<span class="crumb current">${escapeHtml(label)} Overview</span>`;
     return;
   }
 
@@ -138,7 +287,7 @@ function renderBreadcrumbs() {
   root.textContent = selectedTraceId;
   root.addEventListener("click", async () => {
     viewStack = [];
-    await loadTurnsOverview();
+    await loadReplayOverview();
   });
   breadcrumbsEl.appendChild(root);
 
@@ -146,7 +295,7 @@ function renderBreadcrumbs() {
   if (full.length === 0) {
     const cur = document.createElement("span");
     cur.className = "crumb current";
-    cur.textContent = "Turns";
+    cur.textContent = "Replay";
     const sep = document.createElement("span");
     sep.className = "sep";
     sep.textContent = "›";
@@ -173,6 +322,136 @@ function renderBreadcrumbs() {
     }
     breadcrumbsEl.appendChild(crumb);
   }
+}
+
+function mean(values) {
+  if (!values.length) return 0;
+  return values.reduce((a, b) => a + Number(b || 0), 0) / values.length;
+}
+
+function variance(values) {
+  if (!values.length) return 0;
+  const m = mean(values);
+  return mean(values.map((v) => (Number(v || 0) - m) ** 2));
+}
+
+function pct(numerator, denominator) {
+  if (!denominator) return 0;
+  return (Number(numerator || 0) / Number(denominator || 1)) * 100;
+}
+
+function loadDimensionMetricsCache() {
+  return api("/api/dimensions/metrics").then((payload) => {
+    allDimensionMetrics = payload.traces || [];
+    return allDimensionMetrics;
+  });
+}
+
+function aggregateByProcess() {
+  const out = new Map();
+  for (const row of allDimensionMetrics || []) {
+    const traceId = String(row.trace_id || "");
+    if (!traceId) continue;
+    const processName = getTraceProcess(traceId);
+    if (!out.has(processName)) out.set(processName, []);
+    out.get(processName).push(row);
+  }
+  return out;
+}
+
+function renderDimensionOverview(dimension) {
+  const strip = $("summaryStrip");
+  const grouped = aggregateByProcess();
+  const rows = Array.from(grouped.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+
+  if (!rows.length) {
+    strip.style.gridTemplateColumns = "repeat(3, 1fr)";
+    strip.innerHTML = `
+      <div class="summary-card"><div class="k">Dimension</div><div class="v">${escapeHtml(dimension)}</div></div>
+      <div class="summary-card"><div class="k">Processes</div><div class="v">0</div></div>
+      <div class="summary-card"><div class="k">Traces</div><div class="v">0</div></div>`;
+    graphCanvas.innerHTML = `<div class="empty-state"><h3>No traces available</h3><p>Run a trace, then process-level ${escapeHtml(dimension)} metrics will appear here.</p></div>`;
+    return;
+  }
+
+  const totalTraces = rows.reduce((acc, [, traces]) => acc + traces.length, 0);
+  strip.style.gridTemplateColumns = "repeat(3, 1fr)";
+  strip.innerHTML = `
+    <div class="summary-card"><div class="k">Dimension</div><div class="v">${escapeHtml(dimension)}</div></div>
+    <div class="summary-card"><div class="k">Processes</div><div class="v">${formatNumber(rows.length)}</div></div>
+    <div class="summary-card"><div class="k">Traces</div><div class="v">${formatNumber(totalTraces)}</div></div>`;
+
+  const cards = [];
+  for (const [processName, traces] of rows) {
+    if (dimension === "correctness") {
+      const success = traces.filter((t) => (t.correctness || {}).task_completion_state === "success").length;
+      const goalScores = traces.map((t) => Number((t.correctness || {}).goal_adherence_score || 0));
+      const turns = traces.map((t) => Number((t.correctness || {}).turns_to_completion || 0));
+      const recovery = traces.map((t) => Number((t.correctness || {}).error_recovery_rate || 0));
+      const redundant = traces.map((t) => Number((t.correctness || {}).redundant_tool_call_ratio || 0));
+      cards.push(`
+        <div class="timeline-row">
+          <div class="timeline-head"><span class="row-title">Process: ${escapeHtml(processName)}</span><span class="row-sub">correctness</span></div>
+          <div class="row-content">
+            <div class="replay-summary-grid">
+              <div class="replay-summary-metric"><div class="k">Task completion rate</div><div class="v">${pct(success, traces.length).toFixed(1)}%</div></div>
+              <div class="replay-summary-metric"><div class="k">Goal adherence score</div><div class="v">${mean(goalScores).toFixed(2)}</div></div>
+              <div class="replay-summary-metric"><div class="k">Turns mean/variance</div><div class="v">${mean(turns).toFixed(2)} / ${variance(turns).toFixed(2)}</div></div>
+              <div class="replay-summary-metric"><div class="k">Error recovery rate</div><div class="v">${(mean(recovery) * 100).toFixed(1)}%</div></div>
+              <div class="replay-summary-metric"><div class="k">Redundant tool calls</div><div class="v">${(mean(redundant) * 100).toFixed(1)}%</div></div>
+            </div>
+          </div>
+        </div>`);
+      continue;
+    }
+
+    if (dimension === "safety") {
+      const scopeViol = traces.filter((t) => Boolean((t.safety || {}).scope_violation)).length;
+      const sensitive = traces.map((t) => Number((t.safety || {}).sensitive_path_access_count || 0));
+      const external = traces.filter((t) => Boolean((t.safety || {}).external_network_call)).length;
+      const creds = traces.filter((t) => Boolean((t.safety || {}).credential_pattern_detected)).length;
+      const blast = traces.map((t) => Number((t.safety || {}).blast_radius_files_written || 0));
+      const irreversible = traces.map((t) => Number((t.safety || {}).irreversible_action_rate || 0));
+      cards.push(`
+        <div class="timeline-row">
+          <div class="timeline-head"><span class="row-title">Process: ${escapeHtml(processName)}</span><span class="row-sub">safety</span></div>
+          <div class="row-content">
+            <div class="replay-summary-grid">
+              <div class="replay-summary-metric"><div class="k">Scope violation rate</div><div class="v">${pct(scopeViol, traces.length).toFixed(1)}%</div></div>
+              <div class="replay-summary-metric"><div class="k">Sensitive path access</div><div class="v">${mean(sensitive).toFixed(2)} / trace</div></div>
+              <div class="replay-summary-metric"><div class="k">External network call rate</div><div class="v">${pct(external, traces.length).toFixed(1)}%</div></div>
+              <div class="replay-summary-metric"><div class="k">Credential pattern detection</div><div class="v">${pct(creds, traces.length).toFixed(1)}%</div></div>
+              <div class="replay-summary-metric"><div class="k">Blast radius (files written)</div><div class="v">${mean(blast).toFixed(2)}</div></div>
+              <div class="replay-summary-metric"><div class="k">Irreversible action rate</div><div class="v">${(mean(irreversible) * 100).toFixed(1)}%</div></div>
+            </div>
+          </div>
+        </div>`);
+      continue;
+    }
+
+    const tokenEff = traces.map((t) => Number((t.efficiency || {}).token_efficiency || 0));
+    const toolEff = traces.map((t) => Number((t.efficiency || {}).tool_call_efficiency || 0));
+    const contextUtil = traces.map((t) => Number((t.efficiency || {}).context_utilization || 0));
+    const turnTime = traces.map((t) => Number((t.efficiency || {}).avg_turn_time_ms || 0));
+    const retryRate = traces.map((t) => Number((t.efficiency || {}).retry_rate || 0));
+    const firstSuccess = traces.map((t) => Number((t.efficiency || {}).first_attempt_success_rate || 0));
+    cards.push(`
+      <div class="timeline-row">
+        <div class="timeline-head"><span class="row-title">Process: ${escapeHtml(processName)}</span><span class="row-sub">efficiency</span></div>
+        <div class="row-content">
+          <div class="replay-summary-grid">
+            <div class="replay-summary-metric"><div class="k">Token efficiency</div><div class="v">${mean(tokenEff).toFixed(2)}</div></div>
+            <div class="replay-summary-metric"><div class="k">Tool call efficiency</div><div class="v">${mean(toolEff).toFixed(2)}x</div></div>
+            <div class="replay-summary-metric"><div class="k">Context utilization</div><div class="v">${(mean(contextUtil) * 100).toFixed(1)}%</div></div>
+            <div class="replay-summary-metric"><div class="k">Time per turn</div><div class="v">${formatMs(mean(turnTime))}</div></div>
+            <div class="replay-summary-metric"><div class="k">Retry rate</div><div class="v">${(mean(retryRate) * 100).toFixed(1)}%</div></div>
+            <div class="replay-summary-metric"><div class="k">First-attempt success</div><div class="v">${(mean(firstSuccess) * 100).toFixed(1)}%</div></div>
+          </div>
+        </div>
+      </div>`);
+  }
+
+  graphCanvas.innerHTML = `<div class="timeline-wrap">${cards.join("")}</div>`;
 }
 
 function updateExecutiveSummary(summary) {
@@ -1408,10 +1687,10 @@ async function restoreFromStack() {
 
 function setActiveTab(tabName) {
   activeTab = tabName;
-  traceTabBtn.classList.toggle("active", tabName === "trace");
-  replayTabBtn.classList.toggle("active", tabName === "replay");
-  settingsTabBtn.classList.toggle("active", tabName === "settings");
-  graphWrapper.classList.toggle("replay-mode", tabName === "replay");
+  traceTabBtn.classList.toggle("active", tabName === "correctness");
+  replayTabBtn.classList.toggle("active", tabName === "safety");
+  settingsTabBtn.classList.toggle("active", tabName === "efficiency");
+  graphWrapper.classList.toggle("replay-mode", Boolean(selectedTraceId));
 }
 
 function getStoredCustomSchemas() {
@@ -1516,17 +1795,12 @@ async function loadSettingsView() {
 async function selectTrace(traceId) {
   selectedTraceId = traceId;
   currentTurnId = null;
+  currentReplayTurnId = null;
   viewStack = [];
   renderTraceList(cachedTraces);
   renderBreadcrumbs();
-
-  if (activeTab === "trace") {
-    await loadTurnsOverview();
-  } else if (activeTab === "replay") {
-    await loadReplayOverview();
-  } else if (activeTab === "settings") {
-    await loadSettingsView();
-  }
+  graphWrapper.classList.toggle("replay-mode", true);
+  await loadReplayOverview();
 }
 
 async function refreshTraces(force = false, options = {}) {
@@ -1541,11 +1815,8 @@ async function refreshTraces(force = false, options = {}) {
   latestVersion = version;
   cachedTraces = payload.traces || [];
 
-  if (!selectedTraceId && cachedTraces.length > 0) {
-    selectedTraceId = cachedTraces[0].trace_id;
-  }
   if (selectedTraceId && !cachedTraces.some((t) => t.trace_id === selectedTraceId)) {
-    selectedTraceId = cachedTraces.length > 0 ? cachedTraces[0].trace_id : null;
+    selectedTraceId = null;
   }
 
   const selectedTraceChanged = prevSelectedTraceId !== selectedTraceId;
@@ -1554,7 +1825,10 @@ async function refreshTraces(force = false, options = {}) {
   renderTraceList(cachedTraces);
 
   if (!selectedTraceId) {
-    graphCanvas.innerHTML = '<div class="empty-state"><h3>No trace selected</h3><p>Select a trace to view timeline.</p></div>';
+    graphWrapper.classList.toggle("replay-mode", false);
+    await loadDimensionMetricsCache();
+    renderBreadcrumbs();
+    renderDimensionOverview(activeTab);
     return;
   }
 
@@ -1562,13 +1836,8 @@ async function refreshTraces(force = false, options = {}) {
     return;
   }
 
-  if (activeTab === "trace") {
-    await loadTurnsOverview();
-  } else if (activeTab === "replay") {
-    await loadReplayOverview();
-  } else if (activeTab === "settings") {
-    await loadSettingsView();
-  }
+  graphWrapper.classList.toggle("replay-mode", true);
+  await loadReplayOverview();
 }
 
 function installStyles() {
@@ -1588,6 +1857,13 @@ function installStyles() {
     .pill-blue { background:#dbeafe; color:#1d4ed8; }
     .pill-teal { background:#ccfbf1; color:#0f766e; }
     .turn-summary { margin-top:7px; font-size:11px; color:var(--text-secondary); }
+
+    .trace-process-group { border-bottom:1px solid var(--border-light); padding-bottom:4px; }
+    .trace-process-header { display:flex; justify-content:space-between; align-items:center; padding:8px 12px 6px; background:var(--slate-50); border-top:1px solid var(--border-light); }
+    .trace-process-name { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.04em; color:var(--text-secondary); }
+    .trace-process-count { font-size:10px; color:var(--text-muted); }
+    .trace-process-empty { padding:8px 12px; font-size:11px; color:var(--text-muted); }
+    .trace-move-select { border:1px solid var(--border); border-radius:6px; font-size:11px; padding:2px 5px; margin-left:4px; }
 
     .turn-exec-summary { display:grid; grid-template-columns: repeat(5, 1fr); gap:10px; margin: 8px 0 12px; }
     .mini-card { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:10px; }
@@ -1753,6 +2029,7 @@ function installStyles() {
 
 async function init() {
   installStyles();
+  loadProcessState();
 
   setCollapsed(fileSectionBody, fileCaret, true);
   setCollapsed(toolsSectionBody, toolsCaret, true);
@@ -1777,30 +2054,50 @@ async function init() {
   fitBtn.style.display = "none";
   $("zoomDisplay").style.display = "none";
 
+  if (addProcessBtn) {
+    addProcessBtn.addEventListener("click", createProcess);
+  }
+
   traceTabBtn.addEventListener("click", async () => {
-    if (activeTab === "trace") return;
-    setActiveTab("trace");
+    if (activeTab === "correctness") return;
+    setActiveTab("correctness");
     viewStack = [];
     renderBreadcrumbs();
-    await loadTurnsOverview();
+    if (selectedTraceId) {
+      await loadReplayOverview();
+      return;
+    }
+    await loadDimensionMetricsCache();
+    renderDimensionOverview("correctness");
   });
 
   replayTabBtn.addEventListener("click", async () => {
-    if (activeTab === "replay") return;
-    setActiveTab("replay");
-    viewStack = [{ kind: "replay", label: "Replay Trace" }];
+    if (activeTab === "safety") return;
+    setActiveTab("safety");
+    viewStack = [];
     renderBreadcrumbs();
-    await loadReplayOverview();
+    if (selectedTraceId) {
+      await loadReplayOverview();
+      return;
+    }
+    await loadDimensionMetricsCache();
+    renderDimensionOverview("safety");
   });
 
   settingsTabBtn.addEventListener("click", async () => {
-    if (activeTab === "settings") return;
-    setActiveTab("settings");
-    viewStack = [{ kind: "settings", label: "Settings" }];
+    if (activeTab === "efficiency") return;
+    setActiveTab("efficiency");
+    viewStack = [];
     renderBreadcrumbs();
-    await loadSettingsView();
+    if (selectedTraceId) {
+      await loadReplayOverview();
+      return;
+    }
+    await loadDimensionMetricsCache();
+    renderDimensionOverview("efficiency");
   });
 
+  setActiveTab("correctness");
   await refreshTraces(true, { preserveView: false });
 
   setInterval(async () => {
