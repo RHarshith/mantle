@@ -17,17 +17,17 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from mantle.dashboard.llm_utils import (
+from mantle.analysis.llm_parser import (
     builtin_llm_api_schemas,
     normalize_llm_schemas,
     parse_llm_calls_from_mitm,
 )
-from mantle.dashboard.logging_utils import log_exception
-from mantle.dashboard.replay_trace import (
+from mantle.errors import log_exception
+from mantle.analysis.replay import (
     build_replay_overview,
     build_replay_turn_detail,
 )
-from mantle.dashboard.syscall_utils import (
+from mantle.analysis.syscall_parser import (
     command_network_targets,
     extract_fd,
     extract_quoted,
@@ -945,13 +945,24 @@ class TraceStore:
             except json.JSONDecodeError:
                 continue
 
+            # MITM logs can contain non-object JSON values from partial writes
+            # or external producers; skip anything that's not a mapping.
+            if not isinstance(record, dict):
+                continue
+
             # We only care about 'response' records — they contain both
             # request (in request_body) and response (in response_body)
             if record.get("direction") != "response":
                 continue
 
-            req_body = record.get("request_body") or {}
-            resp_body = record.get("response_body") or {}
+            req_body = record.get("request_body")
+            if not isinstance(req_body, dict):
+                req_body = {}
+
+            resp_body = record.get("response_body")
+            if not isinstance(resp_body, dict):
+                resp_body = {}
+
             ts = record.get("ts", 0)
             duration_ms = record.get("duration_ms")
             model = record.get("model") or req_body.get("model") or ""

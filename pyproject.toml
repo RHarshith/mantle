@@ -1,0 +1,33 @@
+[project]
+name = "mantle"
+version = "0.1.0"
+description = "AI agent observability toolkit"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "unit: Pure unit tests, no external dependencies",
+    "integration: Tests that compose multiple modules or use filesystem",
+    "e2e: End-to-end tests requiring network, agent, or browser",
+]
+addopts = "-ra --strict-markers"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = "mantle.interfaces.*"
+strict = true
+disallow_untyped_defs = true
+disallow_any_generics = true
+
+[tool.coverage.run]
+source = ["mantle"]
+omit = ["mantle/dashboard/static/*", "tests/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true

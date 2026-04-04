@@ -10,9 +10,9 @@ from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketD
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from .config import resolve_observability_paths
-from .logging_utils import log_exception
-from .store import TraceStore
+from mantle.ingest.config import resolve_observability_paths
+from mantle.errors import log_exception
+from mantle.ingest.store import TraceStore
 
 
 app = FastAPI(title="Agent System Observability Dashboard")

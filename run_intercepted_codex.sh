@@ -102,7 +102,22 @@ TRACE_BASENAME="${TRACE_BASENAME%.ebpf.jsonl}"
 MITM_JSONL="$OBS_ROOT/mitm/${TRACE_BASENAME}.mitm.jsonl"
 EBPF_FILE="$OBS_ROOT/traces/$TRACE_ID"
 MITM_CA="${HOME}/.mitmproxy/mitmproxy-ca-cert.pem"
-EBPF_CAPTURE_SCRIPT="$SCRIPT_DIR/mantle/ebpf_capture.py"
+EBPF_CAPTURE_SCRIPT="$SCRIPT_DIR/mantle/capture/ebpf.py"
+if [[ ! -f "$EBPF_CAPTURE_SCRIPT" ]]; then
+    EBPF_CAPTURE_SCRIPT="$SCRIPT_DIR/mantle/ebpf_capture.py"
+fi
+if [[ ! -f "$EBPF_CAPTURE_SCRIPT" ]]; then
+    echo "Error: eBPF capture wrapper script not found" >&2
+    exit 1
+fi
+MITM_CAPTURE_SCRIPT="$SCRIPT_DIR/mantle/capture/mitm.py"
+if [[ ! -f "$MITM_CAPTURE_SCRIPT" ]]; then
+    MITM_CAPTURE_SCRIPT="$SCRIPT_DIR/mantle/mitm_capture.py"
+fi
+if [[ ! -f "$MITM_CAPTURE_SCRIPT" ]]; then
+    echo "Error: mitm capture addon script not found" >&2
+    exit 1
+fi
 ROOT_PID_FILE="$OBS_ROOT/mitm/${TRACE_BASENAME}.root.pid"
 PID_WRAPPER_SCRIPT=""
 
@@ -243,7 +258,7 @@ if [[ "$INTERCEPT_MODE" == "transparent" ]]; then
             --mode reverse:https://api.openai.com@"$MITM_REV_PORT" \
             --ssl-insecure \
             --set connection_strategy=lazy \
-            -s "$SCRIPT_DIR/mantle/mitm_capture.py" \
+            -s "$MITM_CAPTURE_SCRIPT" \
             --set capture_file="$MITM_JSONL" \
             -q &
     MITM_PID=$!
@@ -255,7 +270,7 @@ else
     "${MITMDUMP_LAUNCH[@]}" \
         -p "$MITM_PORT" \
         --ssl-insecure \
-        -s "$SCRIPT_DIR/mantle/mitm_capture.py" \
+        -s "$MITM_CAPTURE_SCRIPT" \
         --set capture_file="$MITM_JSONL" \
         -q &
     MITM_PID=$!

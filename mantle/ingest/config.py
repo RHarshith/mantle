@@ -1,4 +1,4 @@
-"""Configuration helpers for the dashboard runtime.
+"""Configuration helpers for the Mantle runtime.
 
 This module centralizes environment/path resolution for observability files.
 """
@@ -16,7 +16,7 @@ def resolve_observability_paths() -> tuple[Path, Path]:
     if env_trace and env_events:
         return Path(env_trace).expanduser(), Path(env_events).expanduser()
 
-    # app.py lives at <repo>/mantle/dashboard/app.py, so repo root is 3 levels up.
+    # config.py lives at <repo>/mantle/ingest/config.py, so repo root is 3 levels up.
     repo_root = Path(__file__).resolve().parents[2]
     obs_root_env = os.getenv("AGENT_OBS_ROOT", "").strip()
     obs_root = Path(obs_root_env).expanduser() if obs_root_env else (repo_root / "obs")

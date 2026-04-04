@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .llm_utils import merge_sections, sections_to_text
+from mantle.analysis.llm_parser import merge_sections, sections_to_text
 
 
 CONTEXT_BAND_STYLE: dict[str, str] = {

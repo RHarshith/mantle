@@ -11,6 +11,7 @@ from typing import Any, Protocol
 
 
 class EventSink(Protocol):
+    """Contract for emitting structured agent observability events."""
     trace_id: str
     session_id: str
 
