@@ -9,6 +9,7 @@ import heapq
 import json
 import os
 import re
+import subprocess
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -4024,12 +4025,99 @@ class TraceStore:
                 break
         return best
 
+    def _first_snapshot_in_range(
+        self,
+        snapshots: list[dict[str, Any]],
+        start_ts: float,
+        end_ts: float,
+        *,
+        phase: str | None = None,
+    ) -> dict[str, Any] | None:
+        for event in snapshots:
+            ets = self._event_ts(event)
+            if ets < start_ts:
+                continue
+            if ets > end_ts:
+                break
+            if phase is not None and str(event.get("snapshot_phase") or "") != phase:
+                continue
+            return event
+        return None
+
+    def _baseline_snapshot_for_window(
+        self,
+        snapshots: list[dict[str, Any]],
+        start_ts: float,
+        end_ts: float,
+    ) -> dict[str, Any] | None:
+        # Preferred baseline is the latest snapshot at/before the window start.
+        prior = self._latest_snapshot_before(snapshots, start_ts)
+        if prior is not None:
+            return prior
+
+        # If none exists (common in setup-only traces), use the earliest
+        # in-window "before" snapshot emitted before first write/rename.
+        in_window_before = self._first_snapshot_in_range(
+            snapshots,
+            start_ts,
+            end_ts,
+            phase="before",
+        )
+        if in_window_before is not None:
+            return in_window_before
+
+        # Last fallback: earliest snapshot in window.
+        return self._first_snapshot_in_range(snapshots, start_ts, end_ts)
+
     def _snapshot_text(self, snapshot: dict[str, Any] | None) -> str:
         if not snapshot:
             return ""
         if bool(snapshot.get("binary")):
             return ""
         return str(snapshot.get("content") or "")
+
+    def _trace_repo_root(self, trace: TraceState) -> Path | None:
+        # Trace layout is typically <repo>/obs/traces/<trace_id>.ebpf.jsonl.
+        try:
+            if len(trace.trace_path.parents) >= 3:
+                root = trace.trace_path.parents[2]
+                if (root / ".git").exists():
+                    return root
+        except Exception:
+            return None
+        return None
+
+    def _git_head_file_content(self, trace: TraceState, path: str) -> str | None:
+        repo_root = self._trace_repo_root(trace)
+        if repo_root is None:
+            return None
+
+        p = Path(path)
+        if p.is_absolute():
+            try:
+                rel = p.relative_to(repo_root)
+            except ValueError:
+                return None
+        else:
+            rel = p
+
+        rel_path = str(rel)
+        if not rel_path or rel_path.startswith("../"):
+            return None
+
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(repo_root), "show", f"HEAD:{rel_path}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception:
+            return None
+
+        if proc.returncode != 0:
+            return None
+        return proc.stdout
 
     def _line_change_stats(self, before_text: str, after_text: str) -> dict[str, int]:
         before_lines = before_text.splitlines()
@@ -4139,7 +4227,7 @@ class TraceStore:
         lines_removed = 0
 
         for path, snapshots in snapshot_by_path.items():
-            before_snap = self._latest_snapshot_before(snapshots, from_cutoff)
+            before_snap = self._baseline_snapshot_for_window(snapshots, from_cutoff, to_cutoff)
             after_snap = self._latest_snapshot_before(snapshots, to_cutoff)
             if before_snap is None and after_snap is None:
                 continue
@@ -4152,6 +4240,13 @@ class TraceStore:
                 before_text = ""
             if after_snap is None:
                 after_text = ""
+
+            # Fallback to repository HEAD baseline for tracked files when
+            # snapshot baseline is missing or degenerate.
+            if before_snap is None or before_text == after_text:
+                git_before = self._git_head_file_content(trace, path)
+                if git_before is not None:
+                    before_text = git_before
 
             if before_text == after_text and bool(before_snap) == bool(after_snap):
                 continue
@@ -4229,7 +4324,7 @@ class TraceStore:
         if not snapshots:
             raise KeyError(path)
 
-        before_snap = self._latest_snapshot_before(snapshots, from_cutoff)
+        before_snap = self._baseline_snapshot_for_window(snapshots, from_cutoff, to_cutoff)
         after_snap = self._latest_snapshot_before(snapshots, to_cutoff)
 
         before_text = self._snapshot_text(before_snap)
@@ -4238,6 +4333,11 @@ class TraceStore:
             before_text = ""
         if after_snap is None:
             after_text = ""
+
+        if before_snap is None or before_text == after_text:
+            git_before = self._git_head_file_content(trace, path)
+            if git_before is not None:
+                before_text = git_before
 
         binary = bool((before_snap or {}).get("binary")) or bool((after_snap or {}).get("binary"))
         truncated = bool((before_snap or {}).get("truncated")) or bool((after_snap or {}).get("truncated"))
