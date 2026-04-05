@@ -1,0 +1,28 @@
+[package]
+name = "capture-userspace"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow.workspace = true
+aya.workspace = true
+aya-log.workspace = true
+bytemuck.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tempfile = "3.13"
+shell-words = "1.1"
+libc = "0.2"
+axum = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+futures-util = "0.3"
+
+[[bin]]
+name = "mantle_capture_ebpf"
+path = "src/bin/mantle_capture_ebpf.rs"
+
+[[bin]]
+name = "mantle_capture_mitm_proxy"
+path = "src/bin/mantle_capture_mitm_proxy.rs"

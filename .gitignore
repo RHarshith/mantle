@@ -5,3 +5,12 @@ __pycache__/
 .env.local
 trace_scenarios/*/.runtime/
 .venv/
+
+# Rust/Cargo generated files
+**/target/
+**/*.dSYM/
+**/*.pdb
+
+# Local validation and rust workspace lock noise
+temp_test.txt
+mantle/capture/rust/Cargo.lock

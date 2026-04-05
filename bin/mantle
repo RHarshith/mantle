@@ -123,7 +123,7 @@ watch_cmd() {
     local runner executable resolved_executable preserve_env
     local -a runner_args passthrough task_args
 
-    runner="$REPO_ROOT/run_intercepted_codex.sh"
+    runner="$REPO_ROOT/run_intercepted_agent.sh"
     if [[ ! -x "$runner" ]]; then
         echo "Error: $runner not found or not executable." >&2
         exit 1

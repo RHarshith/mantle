@@ -102,12 +102,10 @@ TRACE_BASENAME="${TRACE_BASENAME%.ebpf.jsonl}"
 MITM_JSONL="$OBS_ROOT/mitm/${TRACE_BASENAME}.mitm.jsonl"
 EBPF_FILE="$OBS_ROOT/traces/$TRACE_ID"
 MITM_CA="${HOME}/.mitmproxy/mitmproxy-ca-cert.pem"
-EBPF_CAPTURE_SCRIPT="$SCRIPT_DIR/mantle/capture/ebpf.py"
-if [[ ! -f "$EBPF_CAPTURE_SCRIPT" ]]; then
-    EBPF_CAPTURE_SCRIPT="$SCRIPT_DIR/mantle/ebpf_capture.py"
-fi
-if [[ ! -f "$EBPF_CAPTURE_SCRIPT" ]]; then
-    echo "Error: eBPF capture wrapper script not found" >&2
+EBPF_CAPTURE_BIN="${MANTLE_CAPTURE_EBPF_BIN:-$SCRIPT_DIR/mantle/capture/rust/target/release/mantle_capture_ebpf}"
+if [[ ! -x "$EBPF_CAPTURE_BIN" ]]; then
+    echo "Error: eBPF Rust binary not found or not executable: $EBPF_CAPTURE_BIN" >&2
+    echo "Build it first: mantle/capture/rust/scripts/build_capture_rust.sh" >&2
     exit 1
 fi
 MITM_CAPTURE_SCRIPT="$SCRIPT_DIR/mantle/capture/mitm.py"
@@ -400,12 +398,8 @@ if ! command -v bpftrace >/dev/null 2>&1; then
     echo "Error: bpftrace is required for BPF tracing but was not found in PATH." >&2
     exit 1
 fi
-if [ ! -f "$EBPF_CAPTURE_SCRIPT" ]; then
-    echo "Error: eBPF capture wrapper not found at $EBPF_CAPTURE_SCRIPT" >&2
-    exit 1
-fi
 
 echo "[*] Running $AGENT_BIN with eBPF capture..."
-python3 "$EBPF_CAPTURE_SCRIPT" --output "$EBPF_FILE" -- "${CAPTURE_CMD[@]}"
+"$EBPF_CAPTURE_BIN" --output "$EBPF_FILE" -- "${CAPTURE_CMD[@]}"
 
 echo "[*] $AGENT_BIN finished."

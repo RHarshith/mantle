@@ -1,42 +1,5 @@
 # Mantle Development Guide
 
-## Project Structure
-
-```
-mantle/
-├── interfaces/       # Protocol definitions (NEVER import from implementation)
-│   ├── trace_store.py
-│   ├── capture.py
-│   └── llm_parser.py
-├── errors.py         # Canonical exceptions (use these, not bare KeyError)
-├── capture/          # System-level capture backends
-│   ├── ebpf.py       # eBPF syscall tracing
-│   └── mitm.py       # MITM HTTP interception
-├── ingest/           # Trace storage and ingestion
-│   ├── store.py      # TraceStore (implements ITraceStore)
-│   └── config.py     # Path/env resolution
-├── analysis/         # Trace analysis and parsing
-│   ├── llm_parser.py # LLM payload parsing
-│   ├── syscall_parser.py # Syscall argument parsing
-│   └── replay.py     # Replay view logic
-└── server/           # Web server
-    ├── app.py        # FastAPI routes
-    ├── logging.py    # Server logging
-    └── static/       # SPA frontend
-mantle_agent/         # Agent implementation (isolated, no mantle imports)
-tests/                # unit/ integration/ e2e/
-```
-
-## Where to Add New Files
-
-| Question | Package |
-|----------|---------|
-| New capture backend? | `capture/` |
-| New storage/ingestion logic? | `ingest/` |
-| New parser or analysis? | `analysis/` |
-| New API endpoint or UI? | `server/` |
-| New contract between components? | `interfaces/` |
-
 ## Rules for AI Agents
 
 ### 1. Test Before Ship

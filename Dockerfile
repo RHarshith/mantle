@@ -40,7 +40,7 @@ RUN chmod +x \
     /workspace/mantle/scripts/install_mantle.sh \
     /workspace/mantle/scripts/install_rtrace.sh \
     /workspace/mantle/docker/entrypoint.sh \
-    /workspace/mantle/run_intercepted_codex.sh
+    /workspace/mantle/run_intercepted_agent.sh
 
 RUN ln -sf /workspace/mantle/bin/mantle /usr/local/bin/mantle
 

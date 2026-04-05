@@ -184,7 +184,7 @@ These files are the source of truth for replay, debugging, and analysis.
 │   └── cli_agent.py
 ├── trace_scenarios/
 ├── scripts/
-├── run_intercepted_codex.sh
+├── run_intercepted_agent.sh
 └── obs/
 ```
 
