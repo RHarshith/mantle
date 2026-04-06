@@ -449,12 +449,13 @@ fn eval_process(policy: &Policy, command: &str) -> Action {
 }
 
 fn eval_network(policy: &Policy, destination: &str) -> Action {
+    let mut matched: Option<Action> = None;
     for rule in &policy.network {
         if wildcard_match(&rule.destination, destination) {
-            return rule.action;
+            matched = Some(rule.action);
         }
     }
-    policy.defaults.unmatched
+    matched.unwrap_or(policy.defaults.unmatched)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1007,4 +1008,37 @@ fn main() -> Result<()> {
 
     let _ = emitter.emit("intercept_monitor_stopped", json!({"exit_code": exit_code}));
     std::process::exit(exit_code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{eval_network, Action, Defaults, Policy, NetworkRule};
+
+    fn policy_with_network(network: Vec<NetworkRule>) -> Policy {
+        Policy {
+            defaults: Defaults {
+                unmatched: Action::Notify,
+            },
+            filesystem: vec![],
+            process: vec![],
+            network,
+        }
+    }
+
+    #[test]
+    fn network_specific_rule_overrides_catch_all_when_appended() {
+        let policy = policy_with_network(vec![
+            NetworkRule {
+                destination: "*".to_string(),
+                action: Action::Notify,
+            },
+            NetworkRule {
+                destination: "*github.com*".to_string(),
+                action: Action::Ask,
+            },
+        ]);
+
+        assert_eq!(eval_network(&policy, "github.com:443"), Action::Ask);
+        assert_eq!(eval_network(&policy, "140.82.113.3:443"), Action::Notify);
+    }
 }

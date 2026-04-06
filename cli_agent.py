@@ -203,26 +203,125 @@ def run_python_exec(code: str, shared_globals: dict) -> str:
     return json.dumps(result)
 
 
+def _find_recent_intercept_violation_for_pid(pid: int) -> dict[str, Any] | None:
+    """Return the latest intercept_violation payload for this PID in the active trace."""
+    if pid <= 0:
+        return None
+
+    trace_id = os.getenv("AGENT_TRACE_ID", "").strip()
+    if not trace_id:
+        return None
+
+    obs_root = os.getenv("AGENT_OBS_ROOT", "obs").strip() or "obs"
+    events_file = Path(obs_root).expanduser() / "events" / f"{trace_id}.events.jsonl"
+    if not events_file.exists():
+        return None
+
+    latest: dict[str, Any] | None = None
+    latest_seq = -1
+    try:
+        with events_file.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    row = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                if str(row.get("event_type") or "") != "intercept_violation":
+                    continue
+
+                payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+                row_pid = payload.get("pid")
+                try:
+                    if int(row_pid) != int(pid):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+
+                seq = int(row.get("seq") or 0)
+                if seq >= latest_seq:
+                    latest_seq = seq
+                    latest = payload
+    except OSError:
+        return None
+
+    return latest
+
+
+def _format_intercept_deny_hint(violation_payload: dict[str, Any]) -> str:
+    details = violation_payload.get("details") if isinstance(violation_payload.get("details"), dict) else {}
+    category = str(details.get("category") or "policy").lower()
+
+    if category == "filesystem":
+        op = str(details.get("op") or "access")
+        path = str(details.get("path") or "<unknown path>")
+        action = f"filesystem {op} blocked for {path}"
+    elif category == "network":
+        dest = str(details.get("destination") or "<unknown destination>")
+        action = f"network access blocked for {dest}"
+    elif category == "process":
+        command = str(details.get("command") or "<unknown command>")
+        action = f"command blocked: {command}"
+    else:
+        action = "operation blocked"
+
+    reason = str(violation_payload.get("reason") or "")
+    reason_note = ""
+    if reason == "ask_decision_deny":
+        reason_note = " (permission request denied or timed out)"
+
+    return f"Denied by Mantle intercept policy: {action}{reason_note}."
+
+
+def _append_intercept_deny_hint(stderr: str, returncode: int, pid: int) -> str:
+    if returncode == 0:
+        return stderr
+    violation = _find_recent_intercept_violation_for_pid(pid)
+    if not violation:
+        return stderr
+
+    hint = _format_intercept_deny_hint(violation)
+    if hint in (stderr or ""):
+        return stderr
+
+    base = stderr or ""
+    if base and not base.endswith("\n"):
+        base = f"{base}\n"
+    return f"{base}{hint}\n"
+
+
 def run_command_exec(command: str, timeout: int = 60) -> str:
     """Execute a shell command and return structured JSON result."""
+    proc: subprocess.Popen[str] | None = None
     try:
-        completed = subprocess.run(
+        proc = subprocess.Popen(
             command,
             shell=True,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
         )
+        stdout, stderr = proc.communicate(timeout=timeout)
+        stderr = _append_intercept_deny_hint(stderr or "", int(proc.returncode or 0), int(proc.pid or 0))
         result = {
-            "ok": completed.returncode == 0,
-            "returncode": completed.returncode,
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
         }
     except subprocess.TimeoutExpired:
+        if proc is not None:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+        else:
+            stdout, stderr = "", ""
         result = {
             "ok": False,
             "error": f"Command timed out after {timeout} seconds.",
+            "stdout": stdout,
+            "stderr": stderr,
         }
     except Exception:
         result = {

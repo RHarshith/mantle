@@ -102,3 +102,26 @@ class TestDashboardUI:
             assert resp.status == 200
 
             browser.close()
+
+    def test_intercept_notifications_use_toggle_button(self, dashboard_server):
+        """Intercept notifications should be collapsed behind a floating toggle button."""
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+
+            page.goto(dashboard_server)
+            page.wait_for_load_state("networkidle")
+
+            # A compact floating toggle button should always be present.
+            toggle = page.locator("#interceptToggleButton")
+            assert toggle.count() == 1
+
+            # Panel should be collapsed by default and not block the dashboard.
+            panel = page.locator("#interceptPanelHost")
+            assert panel.count() == 1
+            assert panel.get_attribute("data-expanded") == "false"
+
+            # No toast host should be rendered; notifications live only in panel.
+            assert page.locator("#interceptToastHost").count() == 0
+
+            browser.close()

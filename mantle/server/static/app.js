@@ -19,13 +19,13 @@ let replaySourceMapTraceId = null;
 let allDimensionMetrics = [];
 let traceProcessMap = {};
 let processNames = ["default"];
-let interceptToastHost = null;
-const interceptSeenKeys = new Set();
 const interceptLatestSeqByTrace = new Map();
 const interceptPanelStateByTrace = new Map();
 const interceptDismissedKeysByTrace = new Map();
 const interceptDecisionPendingByKey = new Set();
 let interceptPanelHost = null;
+let interceptToggleButton = null;
+let interceptPanelExpanded = false;
 
 let turnsOverview = null;
 let currentTurnId = null;
@@ -107,19 +107,6 @@ function api(path) {
   });
 }
 
-function ensureInterceptToastHost() {
-  if (interceptToastHost) return interceptToastHost;
-  let host = $("interceptToastHost");
-  if (!host) {
-    host = document.createElement("div");
-    host.id = "interceptToastHost";
-    host.className = "intercept-toast-host";
-    document.body.appendChild(host);
-  }
-  interceptToastHost = host;
-  return host;
-}
-
 function ensureInterceptPanelHost() {
   if (interceptPanelHost) return interceptPanelHost;
   let panel = $("interceptPanelHost");
@@ -131,6 +118,33 @@ function ensureInterceptPanelHost() {
   }
   interceptPanelHost = panel;
   return panel;
+}
+
+function ensureInterceptToggleButton() {
+  if (interceptToggleButton) return interceptToggleButton;
+  let btn = $("interceptToggleButton");
+  if (!btn) {
+    btn = document.createElement("button");
+    btn.id = "interceptToggleButton";
+    btn.className = "intercept-toggle-button";
+    btn.setAttribute("type", "button");
+    btn.setAttribute("aria-label", "Toggle intercept notifications");
+    btn.innerHTML = `
+      <span class="intercept-toggle-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" role="img" focusable="false">
+          <path d="M4 6h16a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1zm8 7 8-5H4l8 5z"></path>
+        </svg>
+      </span>
+      <span class="intercept-toggle-count" id="interceptToggleCount" hidden>0</span>
+    `;
+    btn.addEventListener("click", () => {
+      interceptPanelExpanded = !interceptPanelExpanded;
+      renderInterceptPanel();
+    });
+    document.body.appendChild(btn);
+  }
+  interceptToggleButton = btn;
+  return btn;
 }
 
 function panelItemsForTrace(traceId) {
@@ -222,6 +236,7 @@ function upsertInterceptPanelItem(traceId, ev) {
 
 function renderInterceptPanel() {
   const host = ensureInterceptPanelHost();
+  const toggleBtn = ensureInterceptToggleButton();
   const activeTraceId = selectedTraceId || "";
   const items = panelItemsForTrace(activeTraceId);
   const count = items.length;
@@ -255,6 +270,16 @@ function renderInterceptPanel() {
     </div>
     <ul class="intercept-panel-list">${listHtml}</ul>
   `;
+
+  const countEl = toggleBtn.querySelector("#interceptToggleCount");
+  if (countEl) {
+    countEl.textContent = String(count);
+    countEl.hidden = count === 0;
+  }
+  toggleBtn.classList.toggle("has-alert", count > 0);
+  toggleBtn.setAttribute("aria-expanded", interceptPanelExpanded ? "true" : "false");
+  host.dataset.expanded = interceptPanelExpanded ? "true" : "false";
+  host.classList.toggle("expanded", interceptPanelExpanded);
 
   const clearBtn = host.querySelector(".intercept-panel-clear");
   if (clearBtn) {
@@ -308,33 +333,8 @@ function describeInterceptEvent(ev) {
   return requestId ? `policy action requested (request #${requestId})` : "policy action requested";
 }
 
-function pushInterceptToast(ev) {
-  const host = ensureInterceptToastHost();
-  const kind = String(ev.event_type || "");
-  const isAsk = kind === "intercept_ask";
-  const title = isAsk ? "Permission Required" : "Command Rejected";
-  const detail = describeInterceptEvent(ev);
-
-  const toast = document.createElement("div");
-  toast.className = `intercept-toast ${isAsk ? "ask" : "deny"}`;
-  toast.innerHTML = `
-    <div class="intercept-toast-title">${escapeHtml(title)}</div>
-    <div class="intercept-toast-detail">${escapeHtml(detail)}</div>
-  `;
-
-  host.appendChild(toast);
-  const ttl = isAsk ? 9000 : 7000;
-  window.setTimeout(() => {
-    toast.classList.add("fade-out");
-    window.setTimeout(() => toast.remove(), 220);
-  }, ttl);
-}
-
 async function syncInterceptNotifications(traceId, options = {}) {
   if (!traceId) return;
-  const showToasts = Boolean(options.showToasts);
-  const recentOnlySeconds = Number(options.recentOnlySeconds || 0);
-  const nowTs = Date.now() / 1000;
   const sinceSeq = Number(interceptLatestSeqByTrace.get(traceId) || 0);
 
   let payload;
@@ -348,28 +348,13 @@ async function syncInterceptNotifications(traceId, options = {}) {
   interceptLatestSeqByTrace.set(traceId, latestSeq);
 
   reconcileInterceptPanel(traceId, payload.active_events);
-
-  if (!showToasts) return;
   const events = Array.isArray(payload.events) ? payload.events : [];
   for (const ev of events) {
     const type = String(ev.event_type || "");
     if (type === "intercept_monitor_stopped") {
       clearInterceptPanelForTrace(traceId);
       interceptDismissedKeysByTrace.delete(traceId);
-      continue;
     }
-    const ts = Number(ev.ts || 0);
-    if (recentOnlySeconds > 0 && Number.isFinite(ts) && ts > 0 && nowTs - ts > recentOnlySeconds) {
-      continue;
-    }
-    const key = `${traceId}:${String(ev.seq || "")}:${String(ev.event_type || "")}:${String(ev.request_id || "")}`;
-    if (interceptSeenKeys.has(key)) continue;
-    interceptSeenKeys.add(key);
-    if (interceptSeenKeys.size > 2000) {
-      const first = interceptSeenKeys.values().next();
-      if (!first.done) interceptSeenKeys.delete(first.value);
-    }
-    pushInterceptToast(ev);
   }
   renderInterceptPanel();
 }
@@ -393,7 +378,7 @@ async function submitInterceptDecision(traceId, itemKey, requestId, decision) {
     }
     // Do not optimistically dismiss; keep item until backend confirms
     // the monitor consumed this decision and emitted resolution.
-    await syncInterceptNotifications(traceId, { showToasts: false });
+    await syncInterceptNotifications(traceId);
   } catch (_) {
     // Keep item visible so user can retry.
   } finally {
@@ -2291,7 +2276,7 @@ async function selectTrace(traceId) {
   renderInterceptPanel();
   graphWrapper.classList.toggle("replay-mode", true);
   await loadReplayOverview();
-  await syncInterceptNotifications(traceId, { showToasts: true, recentOnlySeconds: 20 });
+  await syncInterceptNotifications(traceId);
 }
 
 async function refreshTraces(force = false, options = {}) {
@@ -2325,13 +2310,13 @@ async function refreshTraces(force = false, options = {}) {
   }
 
   if (preserveView && !selectedTraceChanged && !needsMainPaneBootstrap) {
-    await syncInterceptNotifications(selectedTraceId, { showToasts: true });
+    await syncInterceptNotifications(selectedTraceId);
     return;
   }
 
   graphWrapper.classList.toggle("replay-mode", true);
   await loadReplayOverview();
-  await syncInterceptNotifications(selectedTraceId, { showToasts: true });
+  await syncInterceptNotifications(selectedTraceId);
 }
 
 function installStyles() {
@@ -2340,7 +2325,7 @@ function installStyles() {
     .intercept-panel {
       position: fixed;
       right: 12px;
-      bottom: 12px;
+      bottom: 68px;
       width: min(420px, calc(100vw - 24px));
       max-height: min(48vh, 520px);
       border: 1px solid var(--border);
@@ -2349,8 +2334,65 @@ function installStyles() {
       box-shadow: var(--shadow-lg);
       overflow: hidden;
       z-index: 1550;
-      display: grid;
+      display: none;
       grid-template-rows: auto 1fr;
+    }
+    .intercept-panel.expanded {
+      display: grid;
+    }
+    .intercept-toggle-button {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      width: 44px;
+      height: 44px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      box-shadow: var(--shadow-md);
+      cursor: pointer;
+      z-index: 1560;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--slate-400);
+      transition: color .16s ease, transform .16s ease, box-shadow .16s ease;
+    }
+    .intercept-toggle-button:hover {
+      transform: translateY(-1px);
+      box-shadow: var(--shadow-lg);
+      color: var(--slate-500);
+    }
+    .intercept-toggle-button.has-alert {
+      color: var(--red-600);
+    }
+    .intercept-toggle-icon {
+      width: 20px;
+      height: 20px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .intercept-toggle-icon svg {
+      width: 20px;
+      height: 20px;
+      fill: currentColor;
+    }
+    .intercept-toggle-count {
+      position: absolute;
+      top: -4px;
+      right: -4px;
+      min-width: 18px;
+      height: 18px;
+      border-radius: 999px;
+      background: var(--red-600);
+      color: #fff;
+      font-size: 10px;
+      line-height: 18px;
+      text-align: center;
+      padding: 0 4px;
+      font-weight: 700;
+      border: 1px solid #fff;
     }
     .intercept-panel-head {
       display: flex;
@@ -2456,18 +2498,6 @@ function installStyles() {
       color: var(--text-muted);
       text-align: center;
       padding: 10px;
-    }
-
-    .intercept-toast-host { position: fixed; top: 12px; right: 12px; z-index: 1600; display: grid; gap: 8px; max-width: min(420px, 90vw); pointer-events: none; }
-    .intercept-toast { border-radius: 10px; border: 1px solid var(--border); box-shadow: var(--shadow-lg); background: var(--surface); padding: 10px 12px; animation: toast-slide-in .2s ease; pointer-events: auto; }
-    .intercept-toast.ask { border-color: var(--amber-100); background: var(--amber-50); }
-    .intercept-toast.deny { border-color: var(--red-100); background: var(--red-50); }
-    .intercept-toast-title { font-size: 12px; font-weight: 700; color: var(--text-primary); }
-    .intercept-toast-detail { margin-top: 3px; font-size: 12px; color: var(--text-secondary); word-break: break-word; }
-    .intercept-toast.fade-out { opacity: 0; transform: translateY(-6px); transition: opacity .2s ease, transform .2s ease; }
-    @keyframes toast-slide-in {
-      from { opacity: 0; transform: translateY(-8px); }
-      to { opacity: 1; transform: translateY(0); }
     }
 
     .turn-tabs { display:flex; flex-direction:column; gap:10px; padding: 6px 0 14px; }

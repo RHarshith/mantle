@@ -14,3 +14,5 @@ trace_scenarios/*/.runtime/
 # Local validation and rust workspace lock noise
 temp_test.txt
 mantle/capture/rust/Cargo.lock
+
+.mantle

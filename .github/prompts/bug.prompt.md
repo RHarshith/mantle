@@ -1,5 +1,6 @@
 ---
-description: How to fix a bug using 5-WHYs root cause analysis
+name: bug
+description: Use this to fix a bug using 5-WHYs root cause analysis
 ---
 
 # Fix Bug Workflow
