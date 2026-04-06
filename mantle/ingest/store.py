@@ -11,7 +11,7 @@ import os
 import re
 import subprocess
 import time
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -3633,13 +3633,10 @@ class TraceStore:
                 "ts": setup_events[-1].get("ts", 0) if setup_events else 0,
             }
             related = setup_events
-            line_range = (int(setup_events[0].get("line_no", 0)), int(setup_events[-1].get("line_no", 0))) if setup_events else None
         else:
             start_event, end_event = self._find_tool_events(t, tool_call_id)
             if start_event is None:
                 raise KeyError(tool_call_id)
-            tool_ranges = self._tool_line_ranges(t)
-            line_range = tool_ranges.get(tool_call_id)
             related = self._related_sys_events_for_tool(t, tool_call_id, start_event, end_event)
 
         if related:

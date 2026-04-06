@@ -48,24 +48,32 @@ class TestFullTracePipeline:
         os.environ["AGENT_OBS_ROOT"] = str(obs_root)
 
         # Import agent after setting env vars
-        from mantle_agent.cli_agent import run_single_turn, build_client
+        from mantle_agent.cli_agent import run_single_turn
         from mantle_agent.agent_observability import JsonlEventSink
+        from openai import OpenAI
 
         # Create event sink
-        sink = JsonlEventSink(events_dir=events_dir)
+        sink = JsonlEventSink(
+            trace_id="test_trace",
+            session_id="test_session",
+            output_path=events_dir / "test_trace.events.jsonl"
+        )
 
         # Run a minimal agent turn
         # This tests the real pipeline: agent -> events -> store -> dashboard
         try:
-            client = build_client()
-            # A simple prompt that should complete in one turn
-            asyncio.get_event_loop().run_until_complete(
-                run_single_turn(
-                    client=client,
-                    prompt="Say exactly 'test complete' and nothing else.",
-                    sink=sink,
-                    auto_approve=True,
-                )
+            client = OpenAI(
+                api_key=os.getenv("OAK1") or os.getenv("OPENAI_API_KEY"),
+                base_url=os.getenv("OPENAI_BASE_URL", "https://chat-api.tamu.ai/api")
+            )
+            messages = [{"role": "user", "content": "Say exactly 'test complete' and nothing else."}]
+            run_single_turn(
+                client=client,
+                model="protected.gpt-5.2",
+                messages=messages,
+                shared_globals={"__builtins__": __builtins__},
+                sink=sink,
+                auto_approve=True,
             )
         finally:
             sink.close()

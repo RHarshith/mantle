@@ -148,11 +148,16 @@ echo "  eBPF trace:  $ENABLE_EBPF"
 echo "  eBPF file:   $EBPF_FILE"
 echo "═══════════════════════════════════════════════════════════"
 
+UPSTREAM_BASE="${MANTLE_FORCE_OPENAI_BASE:-${OPENAI_BASE_URL:-https://api.openai.com}}"
+if [[ -z "${MANTLE_FORCE_OPENAI_BASE:-}" && -z "${OPENAI_BASE_URL:-}" && -n "${OAK1:-}" ]]; then
+    UPSTREAM_BASE="https://chat-api.tamu.ai/api"
+fi
+
 MANTLE_AGENT_ROOT_PID_FILE="$ROOT_PID_FILE" \
     "$MITM_CAPTURE_BIN" \
     --listen-port "$MITM_REV_PORT" \
     --capture-file "$MITM_JSONL" \
-    --upstream-base "https://api.openai.com" &
+    --upstream-base "$UPSTREAM_BASE" &
 MITM_PID=$!
 sleep 1
 kill -0 "$MITM_PID" 2>/dev/null || { echo "Error: Rust MITM proxy failed to start" >&2; exit 1; }

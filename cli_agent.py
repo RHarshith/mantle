@@ -1,21 +1,95 @@
+from __future__ import annotations
+
 import argparse
 import contextlib
 import io
 import json
 import os
-import time
 import subprocess
 import sys
+import threading
+import time
 import traceback
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Protocol
 
 from openai import OpenAI
 
-try:
-    # Works when invoked as `python -m mantle_agent.cli_agent`.
-    from mantle_agent.agent_observability import build_event_sink
-except ImportError:
-    # Fallback for direct execution from inside mantle_agent/.
-    from agent_observability import build_event_sink
+class EventSink(Protocol):
+    """Contract for emitting structured agent observability events."""
+    trace_id: str
+    session_id: str
+
+    def emit(self, event_type: str, payload: dict[str, Any] | None = None) -> None:
+        ...
+
+    def close(self) -> None:
+        ...
+
+
+class NullEventSink:
+    trace_id = "disabled"
+    session_id = "disabled"
+
+    def emit(self, event_type: str, payload: dict[str, Any] | None = None) -> None:
+        return
+
+    def close(self) -> None:
+        return
+
+
+@dataclass
+class JsonlEventSink:
+    trace_id: str
+    session_id: str
+    output_path: Path
+
+    def __post_init__(self) -> None:
+        self._seq = 0
+        self._lock = threading.Lock()
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = self.output_path.open("a", encoding="utf-8")
+
+    def emit(self, event_type: str, payload: dict[str, Any] | None = None) -> None:
+        payload = payload or {}
+        with self._lock:
+            self._seq += 1
+            record = {
+                "ts": time.time(),
+                "monotonic_ns": time.monotonic_ns(),
+                "trace_id": self.trace_id,
+                "session_id": self.session_id,
+                "seq": self._seq,
+                "event_type": event_type,
+                "payload": payload,
+            }
+            self._fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            self._fh.flush()
+
+    def close(self) -> None:
+        with self._lock:
+            self._fh.close()
+
+
+def build_event_sink() -> EventSink:
+    enabled = os.getenv("AGENT_OBS_ENABLED", "1").strip().lower() not in {"0", "false", "off", "no"}
+    if not enabled:
+        return NullEventSink()
+
+    trace_id = os.getenv("AGENT_TRACE_ID", "").strip()
+    if not trace_id:
+        trace_id = f"trace-{int(time.time())}-{os.getpid()}"
+
+    session_id = str(uuid.uuid4())
+
+    root = os.getenv("AGENT_OBS_ROOT", "~/shared/mantle/obs").strip()
+    root_path = Path(root).expanduser()
+
+    output_path = root_path / "events" / f"{trace_id}.events.jsonl"
+    return JsonlEventSink(trace_id=trace_id, session_id=session_id, output_path=output_path)
+
 # try:
 #     from langfuse.openai import OpenAI
 # except ImportError:
@@ -478,7 +552,12 @@ def main() -> None:
     parser.add_argument(
         "prompt",
         nargs="*",
-        help="Optional prompt. If provided, runs one turn and exits.",
+        help="Task description or prompt. Runs in auto mode by default.",
+    )
+    parser.add_argument(
+        "--cli",
+        action="store_true",
+        help="Open the interactive chat window.",
     )
     parser.add_argument(
         "--verbose",
@@ -488,13 +567,7 @@ def main() -> None:
     parser.add_argument(
         "--auto",
         action="store_true",
-        help="Auto-approve all tool calls (no manual approval prompts).",
-    )
-    parser.add_argument(
-        "--task",
-        type=str,
-        default=None,
-        help="Run agent in automated task mode: provide a task description and the agent loops until done.",
+        help="Auto-approve all tool calls in --cli mode (no manual approval prompts).",
     )
     args = parser.parse_args()
 
@@ -508,20 +581,31 @@ def main() -> None:
     client = OpenAI(api_key=api_key, base_url=base_url)
     sink = build_event_sink()
 
-    messages = []
+    system_prompt = (
+        "You are an automated, autonomous AI agent. Your job is to fulfill the user's request "
+        "by actively making tool calls. Do not just share commands or explanations with the user "
+        "unless explicitly asked. You must autonomously execute tools (like python_exec, command_exec) "
+        "to solve the problem step-by-step."
+    )
+    messages = [{"role": "system", "content": system_prompt}]
     shared_globals = {"__builtins__": __builtins__}
     verbose = args.verbose or os.getenv("AGENT_VERBOSE", "").strip().lower() in {"1", "true", "yes", "on"}
-    auto_approve = args.auto or os.getenv("AGENT_AUTO_APPROVE", "").strip().lower() in {"1", "true", "yes", "on"}
-
+    
     cli_prompt = " ".join(args.prompt).strip()
-    task_prompt = args.task
 
-    if task_prompt:
-        # Task mode is non-interactive automation; always bypass approval prompts.
+    if not args.cli:
+        # Auto mode is non-interactive automation; always bypass approval prompts.
         auto_approve = True
+    else:
+        auto_approve = args.auto or os.getenv("AGENT_AUTO_APPROVE", "").strip().lower() in {"1", "true", "yes", "on"}
 
     # ── Automated task mode ──────────────────────────────────────
-    if task_prompt:
+    if not args.cli:
+        if not cli_prompt:
+            print("Error: Please provide a task prompt or use --cli for interactive mode.")
+            sink.close()
+            sys.exit(1)
+
         log_event(verbose, "running automated task mode")
         sink.emit(
             "session_started",
@@ -531,8 +615,8 @@ def main() -> None:
                 "base_url": base_url,
             },
         )
-        sink.emit("user_prompt", {"content": task_prompt})
-        messages.append({"role": "user", "content": task_prompt})
+        sink.emit("user_prompt", {"content": cli_prompt})
+        messages.append({"role": "user", "content": cli_prompt})
         max_turns = int(os.getenv("AGENT_MAX_TURNS", "20"))
         for turn in range(max_turns):
             log_event(verbose, f"task turn {turn + 1}/{max_turns}")
@@ -555,32 +639,7 @@ def main() -> None:
         sink.close()
         return
 
-    # ── One-shot mode ────────────────────────────────────────────
-    if cli_prompt:
-        log_event(verbose, "running one-shot mode from CLI prompt")
-        sink.emit(
-            "session_started",
-            {
-                "mode": "oneshot",
-                "model": model,
-                "base_url": base_url,
-            },
-        )
-        sink.emit("user_prompt", {"content": cli_prompt})
-        messages.append({"role": "user", "content": cli_prompt})
-        try:
-            assistant_output = run_single_turn(client, model, messages, shared_globals, sink, verbose=verbose, auto_approve=auto_approve)
-        except Exception as exc:
-            sink.emit("agent_error", {"error": str(exc)})
-            print(f"assistant> Request failed: {exc}")
-            sink.close()
-            return
-        sink.emit("assistant_response", {"content": assistant_output.strip()})
-        sink.emit("session_ended", {"reason": "oneshot_complete"})
-        sink.close()
-        log_event(verbose, "assistant response already printed")
-        return
-
+    # ── Interactive Mode (--cli) ────────────────────────────────────────────
     print("CLI agent started. Press Ctrl+C or Ctrl+D to stop.")
     sink.emit(
         "session_started",
@@ -590,6 +649,18 @@ def main() -> None:
             "base_url": base_url,
         },
     )
+
+    if cli_prompt:
+        sink.emit("user_prompt", {"content": cli_prompt})
+        messages.append({"role": "user", "content": cli_prompt})
+        try:
+            assistant_output = run_single_turn(client, model, messages, shared_globals, sink, verbose=verbose, auto_approve=auto_approve)
+        except Exception as exc:
+            sink.emit("agent_error", {"error": str(exc)})
+            print(f"assistant> Request failed: {exc}")
+        else:
+            sink.emit("assistant_response", {"content": assistant_output.strip()})
+            log_event(verbose, "assistant response already printed")
 
     while True:
         try:
