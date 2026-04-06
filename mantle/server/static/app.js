@@ -19,6 +19,13 @@ let replaySourceMapTraceId = null;
 let allDimensionMetrics = [];
 let traceProcessMap = {};
 let processNames = ["default"];
+let interceptToastHost = null;
+const interceptSeenKeys = new Set();
+const interceptLatestSeqByTrace = new Map();
+const interceptPanelStateByTrace = new Map();
+const interceptDismissedKeysByTrace = new Map();
+const interceptDecisionPendingByKey = new Set();
+let interceptPanelHost = null;
 
 let turnsOverview = null;
 let currentTurnId = null;
@@ -98,6 +105,301 @@ function api(path) {
     }
     return res.json();
   });
+}
+
+function ensureInterceptToastHost() {
+  if (interceptToastHost) return interceptToastHost;
+  let host = $("interceptToastHost");
+  if (!host) {
+    host = document.createElement("div");
+    host.id = "interceptToastHost";
+    host.className = "intercept-toast-host";
+    document.body.appendChild(host);
+  }
+  interceptToastHost = host;
+  return host;
+}
+
+function ensureInterceptPanelHost() {
+  if (interceptPanelHost) return interceptPanelHost;
+  let panel = $("interceptPanelHost");
+  if (!panel) {
+    panel = document.createElement("aside");
+    panel.id = "interceptPanelHost";
+    panel.className = "intercept-panel";
+    document.body.appendChild(panel);
+  }
+  interceptPanelHost = panel;
+  return panel;
+}
+
+function panelItemsForTrace(traceId) {
+  if (!traceId) return [];
+  const bucket = interceptPanelStateByTrace.get(traceId);
+  if (!bucket) return [];
+  return Array.from(bucket.values()).sort((a, b) => Number(a.seq || 0) - Number(b.seq || 0));
+}
+
+function dismissedSetForTrace(traceId) {
+  let s = interceptDismissedKeysByTrace.get(traceId);
+  if (!s) {
+    s = new Set();
+    interceptDismissedKeysByTrace.set(traceId, s);
+  }
+  return s;
+}
+
+function reconcileInterceptPanel(traceId, activeEvents) {
+  if (!traceId) return;
+  const dismissed = dismissedSetForTrace(traceId);
+  const bucket = new Map();
+  const list = Array.isArray(activeEvents) ? activeEvents : [];
+  for (const ev of list) {
+    const type = String(ev.event_type || "");
+    if (type !== "intercept_ask" && type !== "intercept_violation") continue;
+    const key = `${String(ev.request_id || "none")}:${String(ev.seq || "0")}:${type}`;
+    if (dismissed.has(key)) continue;
+    bucket.set(key, {
+      key,
+      seq: Number(ev.seq || 0),
+      event_type: type,
+      title: type === "intercept_ask" ? "Permission Required" : "Command Rejected",
+      detail: describeInterceptEvent(ev),
+      requestId: ev.request_id != null ? String(ev.request_id) : null,
+      ts: Number(ev.ts || 0),
+    });
+  }
+  if (bucket.size > 0) {
+    interceptPanelStateByTrace.set(traceId, bucket);
+  } else {
+    interceptPanelStateByTrace.delete(traceId);
+  }
+}
+
+function dismissInterceptPanelItem(traceId, key) {
+  if (!traceId || !key) return;
+  const bucket = interceptPanelStateByTrace.get(traceId);
+  if (!bucket) return;
+  dismissedSetForTrace(traceId).add(key);
+  bucket.delete(key);
+  if (bucket.size === 0) {
+    interceptPanelStateByTrace.delete(traceId);
+  }
+  renderInterceptPanel();
+}
+
+function clearInterceptPanelForTrace(traceId) {
+  if (!traceId) return;
+  const items = panelItemsForTrace(traceId);
+  const dismissed = dismissedSetForTrace(traceId);
+  for (const item of items) {
+    dismissed.add(item.key);
+    interceptDecisionPendingByKey.delete(item.key);
+  }
+  interceptPanelStateByTrace.delete(traceId);
+  renderInterceptPanel();
+}
+
+function upsertInterceptPanelItem(traceId, ev) {
+  if (!traceId) return;
+  const type = String(ev.event_type || "");
+  if (type !== "intercept_ask" && type !== "intercept_violation") return;
+  const key = `${String(ev.request_id || "none")}:${String(ev.seq || "0")}:${type}`;
+  let bucket = interceptPanelStateByTrace.get(traceId);
+  if (!bucket) {
+    bucket = new Map();
+    interceptPanelStateByTrace.set(traceId, bucket);
+  }
+  bucket.set(key, {
+    key,
+    seq: Number(ev.seq || 0),
+    event_type: type,
+    title: type === "intercept_ask" ? "Permission Required" : "Command Rejected",
+    detail: describeInterceptEvent(ev),
+    ts: Number(ev.ts || 0),
+  });
+}
+
+function renderInterceptPanel() {
+  const host = ensureInterceptPanelHost();
+  const activeTraceId = selectedTraceId || "";
+  const items = panelItemsForTrace(activeTraceId);
+  const count = items.length;
+  const title = count > 0 ? `Intercept Notifications (${count})` : "Intercept Notifications";
+  const listHtml = count > 0
+    ? items
+        .map(
+          (item) => `
+      <li class="intercept-panel-item ${item.event_type === "intercept_ask" ? "ask" : "deny"}">
+        <div class="intercept-panel-item-head">
+          <strong>${escapeHtml(item.title)}</strong>
+          <button class="intercept-panel-dismiss" data-intercept-dismiss="${escapeHtml(item.key)}" title="Dismiss">x</button>
+        </div>
+        <div class="intercept-panel-item-detail">${escapeHtml(item.detail)}</div>
+        ${item.event_type === "intercept_ask" && item.requestId ? `
+        <div class="intercept-panel-actions">
+          <button class="intercept-panel-action allow" data-intercept-decision="allow" data-intercept-key="${escapeHtml(item.key)}" data-intercept-request-id="${escapeHtml(String(item.requestId))}" ${interceptDecisionPendingByKey.has(item.key) ? "disabled" : ""}>Allow</button>
+          <button class="intercept-panel-action deny" data-intercept-decision="deny" data-intercept-key="${escapeHtml(item.key)}" data-intercept-request-id="${escapeHtml(String(item.requestId))}" ${interceptDecisionPendingByKey.has(item.key) ? "disabled" : ""}>Deny</button>
+        </div>
+        ` : ""}
+      </li>
+    `
+        )
+        .join("")
+    : `<li class="intercept-panel-empty">No active policy notifications for current trace.</li>`;
+
+  host.innerHTML = `
+    <div class="intercept-panel-head">
+      <span>${escapeHtml(title)}</span>
+      <button class="intercept-panel-clear" ${count > 0 ? "" : "disabled"}>Clear</button>
+    </div>
+    <ul class="intercept-panel-list">${listHtml}</ul>
+  `;
+
+  const clearBtn = host.querySelector(".intercept-panel-clear");
+  if (clearBtn) {
+    clearBtn.onclick = () => clearInterceptPanelForTrace(activeTraceId);
+  }
+
+  host.querySelectorAll("[data-intercept-dismiss]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const key = String(btn.getAttribute("data-intercept-dismiss") || "");
+      dismissInterceptPanelItem(activeTraceId, key);
+    });
+  });
+
+  host.querySelectorAll("[data-intercept-decision]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const decision = String(btn.getAttribute("data-intercept-decision") || "");
+      const key = String(btn.getAttribute("data-intercept-key") || "");
+      const requestId = String(btn.getAttribute("data-intercept-request-id") || "").trim();
+      submitInterceptDecision(activeTraceId, key, requestId, decision);
+    });
+  });
+}
+
+function describeInterceptEvent(ev) {
+  const details = ev && typeof ev.details === "object" ? ev.details : {};
+  const category = String(details.category || "policy");
+  const action = String(ev.action || "").toLowerCase();
+  const requestId = ev.request_id != null ? String(ev.request_id) : "";
+
+  if (category === "filesystem") {
+    const op = String(details.op || "access");
+    const path = String(details.path || "<unknown path>");
+    return `${op} blocked for ${path}`;
+  }
+  if (category === "process") {
+    const cmd = String(details.command || "<unknown command>");
+    return `command requires policy decision: ${cmd}`;
+  }
+  if (category === "network") {
+    const dest = String(details.destination || "<unknown destination>");
+    return `network action requires policy decision: ${dest}`;
+  }
+
+  if (action === "deny") {
+    return "command rejected by policy";
+  }
+  const reason = String(ev.reason || "");
+  if (reason === "ask_decision_deny") {
+    return "permission request timed out or was denied";
+  }
+  return requestId ? `policy action requested (request #${requestId})` : "policy action requested";
+}
+
+function pushInterceptToast(ev) {
+  const host = ensureInterceptToastHost();
+  const kind = String(ev.event_type || "");
+  const isAsk = kind === "intercept_ask";
+  const title = isAsk ? "Permission Required" : "Command Rejected";
+  const detail = describeInterceptEvent(ev);
+
+  const toast = document.createElement("div");
+  toast.className = `intercept-toast ${isAsk ? "ask" : "deny"}`;
+  toast.innerHTML = `
+    <div class="intercept-toast-title">${escapeHtml(title)}</div>
+    <div class="intercept-toast-detail">${escapeHtml(detail)}</div>
+  `;
+
+  host.appendChild(toast);
+  const ttl = isAsk ? 9000 : 7000;
+  window.setTimeout(() => {
+    toast.classList.add("fade-out");
+    window.setTimeout(() => toast.remove(), 220);
+  }, ttl);
+}
+
+async function syncInterceptNotifications(traceId, options = {}) {
+  if (!traceId) return;
+  const showToasts = Boolean(options.showToasts);
+  const recentOnlySeconds = Number(options.recentOnlySeconds || 0);
+  const nowTs = Date.now() / 1000;
+  const sinceSeq = Number(interceptLatestSeqByTrace.get(traceId) || 0);
+
+  let payload;
+  try {
+    payload = await api(`/api/traces/${encodeURIComponent(traceId)}/intercept-events?since_seq=${encodeURIComponent(String(sinceSeq))}&limit=80`);
+  } catch (_) {
+    return;
+  }
+
+  const latestSeq = Number(payload.latest_seq || sinceSeq || 0);
+  interceptLatestSeqByTrace.set(traceId, latestSeq);
+
+  reconcileInterceptPanel(traceId, payload.active_events);
+
+  if (!showToasts) return;
+  const events = Array.isArray(payload.events) ? payload.events : [];
+  for (const ev of events) {
+    const type = String(ev.event_type || "");
+    if (type === "intercept_monitor_stopped") {
+      clearInterceptPanelForTrace(traceId);
+      interceptDismissedKeysByTrace.delete(traceId);
+      continue;
+    }
+    const ts = Number(ev.ts || 0);
+    if (recentOnlySeconds > 0 && Number.isFinite(ts) && ts > 0 && nowTs - ts > recentOnlySeconds) {
+      continue;
+    }
+    const key = `${traceId}:${String(ev.seq || "")}:${String(ev.event_type || "")}:${String(ev.request_id || "")}`;
+    if (interceptSeenKeys.has(key)) continue;
+    interceptSeenKeys.add(key);
+    if (interceptSeenKeys.size > 2000) {
+      const first = interceptSeenKeys.values().next();
+      if (!first.done) interceptSeenKeys.delete(first.value);
+    }
+    pushInterceptToast(ev);
+  }
+  renderInterceptPanel();
+}
+
+async function submitInterceptDecision(traceId, itemKey, requestId, decision) {
+  if (!traceId || !itemKey) return;
+  if (!requestId || !/^\d+$/.test(requestId)) return;
+  if (decision !== "allow" && decision !== "deny") return;
+  if (interceptDecisionPendingByKey.has(itemKey)) return;
+
+  interceptDecisionPendingByKey.add(itemKey);
+  renderInterceptPanel();
+  try {
+    const res = await fetch(`/api/traces/${encodeURIComponent(traceId)}/intercept-decisions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ request_id: requestId, decision }),
+    });
+    if (!res.ok) {
+      throw new Error(`Decision API ${res.status}`);
+    }
+    // Do not optimistically dismiss; keep item until backend confirms
+    // the monitor consumed this decision and emitted resolution.
+    await syncInterceptNotifications(traceId, { showToasts: false });
+  } catch (_) {
+    // Keep item visible so user can retry.
+  } finally {
+    interceptDecisionPendingByKey.delete(itemKey);
+    renderInterceptPanel();
+  }
 }
 
 function setCollapsed(sectionBody, caret, collapsed) {
@@ -1986,8 +2288,10 @@ async function selectTrace(traceId) {
   viewStack = [];
   renderTraceList(cachedTraces);
   renderBreadcrumbs();
+  renderInterceptPanel();
   graphWrapper.classList.toggle("replay-mode", true);
   await loadReplayOverview();
+  await syncInterceptNotifications(traceId, { showToasts: true, recentOnlySeconds: 20 });
 }
 
 async function refreshTraces(force = false, options = {}) {
@@ -2015,21 +2319,157 @@ async function refreshTraces(force = false, options = {}) {
     graphWrapper.classList.toggle("replay-mode", false);
     await loadDimensionMetricsCache();
     renderBreadcrumbs();
+    renderInterceptPanel();
     renderDimensionOverview(activeTab);
     return;
   }
 
   if (preserveView && !selectedTraceChanged && !needsMainPaneBootstrap) {
+    await syncInterceptNotifications(selectedTraceId, { showToasts: true });
     return;
   }
 
   graphWrapper.classList.toggle("replay-mode", true);
   await loadReplayOverview();
+  await syncInterceptNotifications(selectedTraceId, { showToasts: true });
 }
 
 function installStyles() {
   const style = document.createElement("style");
   style.textContent = `
+    .intercept-panel {
+      position: fixed;
+      right: 12px;
+      bottom: 12px;
+      width: min(420px, calc(100vw - 24px));
+      max-height: min(48vh, 520px);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--surface);
+      box-shadow: var(--shadow-lg);
+      overflow: hidden;
+      z-index: 1550;
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+    .intercept-panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+      font-weight: 700;
+      background: var(--slate-50);
+    }
+    .intercept-panel-clear {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--surface);
+      padding: 3px 7px;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    .intercept-panel-clear:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .intercept-panel-list {
+      list-style: none;
+      margin: 0;
+      padding: 8px;
+      display: grid;
+      gap: 8px;
+      overflow: auto;
+    }
+    .intercept-panel-item {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px;
+      background: var(--surface);
+    }
+    .intercept-panel-item.ask {
+      border-color: var(--amber-100);
+      background: var(--amber-50);
+    }
+    .intercept-panel-item.deny {
+      border-color: var(--red-100);
+      background: var(--red-50);
+    }
+    .intercept-panel-item-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 12px;
+    }
+    .intercept-panel-dismiss {
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      width: 20px;
+      height: 20px;
+      line-height: 16px;
+      font-size: 12px;
+      cursor: pointer;
+      background: var(--surface);
+      color: var(--text-muted);
+      padding: 0;
+      flex: 0 0 auto;
+    }
+    .intercept-panel-item-detail {
+      margin-top: 4px;
+      font-size: 12px;
+      color: var(--text-secondary);
+      word-break: break-word;
+    }
+    .intercept-panel-actions {
+      margin-top: 7px;
+      display: flex;
+      gap: 6px;
+    }
+    .intercept-panel-action {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--surface);
+      padding: 3px 8px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .intercept-panel-action.allow {
+      border-color: var(--emerald-100);
+      background: var(--emerald-50);
+      color: var(--emerald-600);
+    }
+    .intercept-panel-action.deny {
+      border-color: var(--red-100);
+      background: var(--red-50);
+      color: var(--red-600);
+    }
+    .intercept-panel-action:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+    .intercept-panel-empty {
+      font-size: 12px;
+      color: var(--text-muted);
+      text-align: center;
+      padding: 10px;
+    }
+
+    .intercept-toast-host { position: fixed; top: 12px; right: 12px; z-index: 1600; display: grid; gap: 8px; max-width: min(420px, 90vw); pointer-events: none; }
+    .intercept-toast { border-radius: 10px; border: 1px solid var(--border); box-shadow: var(--shadow-lg); background: var(--surface); padding: 10px 12px; animation: toast-slide-in .2s ease; pointer-events: auto; }
+    .intercept-toast.ask { border-color: var(--amber-100); background: var(--amber-50); }
+    .intercept-toast.deny { border-color: var(--red-100); background: var(--red-50); }
+    .intercept-toast-title { font-size: 12px; font-weight: 700; color: var(--text-primary); }
+    .intercept-toast-detail { margin-top: 3px; font-size: 12px; color: var(--text-secondary); word-break: break-word; }
+    .intercept-toast.fade-out { opacity: 0; transform: translateY(-6px); transition: opacity .2s ease, transform .2s ease; }
+    @keyframes toast-slide-in {
+      from { opacity: 0; transform: translateY(-8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
     .turn-tabs { display:flex; flex-direction:column; gap:10px; padding: 6px 0 14px; }
     .turn-tab { width:100%; border:1px solid var(--border); border-radius:8px; background:var(--surface); text-align:left; padding:10px; cursor:pointer; }
     .turn-tab.active { box-shadow: inset 0 0 0 2px var(--blue-500); background: var(--blue-50); }
@@ -2238,6 +2678,7 @@ function installStyles() {
 async function init() {
   installStyles();
   loadProcessState();
+  renderInterceptPanel();
 
   setCollapsed(fileSectionBody, fileCaret, true);
   setCollapsed(toolsSectionBody, toolsCaret, true);

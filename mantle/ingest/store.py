@@ -3966,6 +3966,95 @@ class TraceStore:
         }
         return replay_payload
 
+    def intercept_events(self, trace_id: str, since_seq: int = 0, limit: int = 50) -> dict[str, Any]:
+        """Return recent intercept policy events (deny/ask) for live dashboard notifications."""
+        trace = self._get_trace(trace_id)
+        safe_since = max(0, int(since_seq or 0))
+        safe_limit = max(1, min(200, int(limit or 50)))
+        out: list[dict[str, Any]] = []
+        latest_seq = safe_since
+        tracked_types = {
+            "intercept_monitor_started",
+            "intercept_violation",
+            "intercept_ask",
+            "intercept_ask_resolved",
+            "intercept_monitor_stopped",
+        }
+        active_asks: dict[str, dict[str, Any]] = {}
+        active_violations: list[dict[str, Any]] = []
+
+        for idx, event in enumerate(trace.agent_events):
+            if not isinstance(event, dict):
+                continue
+            event_type = str(event.get("event_type") or "")
+            if event_type not in tracked_types:
+                continue
+
+            seq_raw = event.get("seq")
+            try:
+                seq = int(seq_raw) if seq_raw is not None else idx + 1
+            except Exception:
+                seq = idx + 1
+
+            latest_seq = max(latest_seq, seq)
+
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+            req_id_raw = payload.get("request_id")
+            req_id_value = None
+            if isinstance(req_id_raw, int):
+                req_id_value = str(req_id_raw)
+            elif isinstance(req_id_raw, str) and req_id_raw.strip().isdigit():
+                req_id_value = req_id_raw.strip()
+            normalized = {
+                "seq": seq,
+                "event_type": event_type,
+                "ts": event.get("ts"),
+                "request_id": req_id_value,
+                "pid": payload.get("pid"),
+                "action": payload.get("action"),
+                "details": details,
+                "reason": payload.get("reason"),
+                "exit_code": payload.get("exit_code"),
+            }
+            if seq > safe_since:
+                out.append(normalized)
+
+            if event_type == "intercept_monitor_started":
+                active_asks = {}
+                active_violations = []
+            elif event_type == "intercept_ask":
+                req_id = normalized.get("request_id")
+                if isinstance(req_id, str) and req_id:
+                    active_asks[req_id] = normalized
+            elif event_type == "intercept_ask_resolved":
+                req_id = normalized.get("request_id")
+                if isinstance(req_id, str) and req_id:
+                    active_asks.pop(req_id, None)
+            elif event_type == "intercept_violation":
+                # Violation emitted as terminal outcome of an ask decision should not
+                # remain active in the persistent panel.
+                reason = str(normalized.get("reason") or "")
+                if reason.startswith("ask_decision_"):
+                    continue
+                active_violations.append(normalized)
+            elif event_type == "intercept_monitor_stopped":
+                active_asks = {}
+                active_violations = []
+
+        if len(out) > safe_limit:
+            out = out[-safe_limit:]
+
+        active_events = list(active_asks.values()) + list(active_violations)
+        active_events.sort(key=lambda event: int(event.get("seq") or 0))
+
+        return {
+            "trace_id": trace_id,
+            "events": out,
+            "latest_seq": latest_seq,
+            "active_events": active_events[-200:],
+        }
+
     def _turn_cutoff_ts(
         self,
         trace: TraceState,

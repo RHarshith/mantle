@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,8 @@ def _resolve_paths() -> tuple[Path, Path]:
 
 WATCH_DIR, EVENTS_DIR = _resolve_paths()
 MITM_DIR = WATCH_DIR.parent / "mitm" if WATCH_DIR else None
+INTERCEPT_DECISIONS_FILE = Path(".mantle/intercept.decisions.jsonl")
+INTERCEPT_DECISION_CURRENT_DIR = Path(".mantle/intercept.decision-current")
 
 store = TraceStore(trace_dir=WATCH_DIR, events_dir=EVENTS_DIR, mitm_dir=MITM_DIR)
 
@@ -173,6 +176,64 @@ def replay_turn_detail(trace_id: str, turn_id: str) -> dict[str, Any]:
 		return store.replay_turn_detail(trace_id, turn_id)
 	except KeyError:
 		raise HTTPException(status_code=404, detail="Trace turn not found")
+
+
+@app.get("/api/traces/{trace_id}/intercept-events")
+def intercept_events(trace_id: str, since_seq: int = 0, limit: int = 50) -> dict[str, Any]:
+	"""Return recent intercept policy events (deny/ask) for live UI notifications."""
+	try:
+		return store.intercept_events(trace_id, since_seq=since_seq, limit=limit)
+	except KeyError:
+		raise HTTPException(status_code=404, detail="Trace not found")
+
+
+@app.post("/api/traces/{trace_id}/intercept-decisions")
+def submit_intercept_decision(trace_id: str, payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+	"""Persist a user decision (allow/deny) for an intercept ask request."""
+	request_id_raw = payload.get("request_id") if isinstance(payload, dict) else None
+	decision = str(payload.get("decision") or "").strip().lower() if isinstance(payload, dict) else ""
+
+	request_id: int | None = None
+	request_id_text = ""
+	if isinstance(request_id_raw, int):
+		request_id = request_id_raw
+		request_id_text = str(request_id_raw)
+	elif isinstance(request_id_raw, str):
+		request_id_text = request_id_raw.strip()
+		if request_id_text.isdigit():
+			request_id = int(request_id_text)
+
+	if request_id is None:
+		raise HTTPException(status_code=400, detail="request_id must be an integer or numeric string")
+	if decision not in {"allow", "deny"}:
+		raise HTTPException(status_code=400, detail="decision must be 'allow' or 'deny'")
+
+	record = {
+		"id": request_id_text,
+		"decision": decision,
+		"trace_id": trace_id,
+	}
+
+	try:
+		INTERCEPT_DECISIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+		with INTERCEPT_DECISIONS_FILE.open("a", encoding="utf-8") as fh:
+			fh.write(json.dumps(record, ensure_ascii=True))
+			fh.write("\n")
+		INTERCEPT_DECISION_CURRENT_DIR.mkdir(parents=True, exist_ok=True)
+		current_path = INTERCEPT_DECISION_CURRENT_DIR / f"{trace_id}.json"
+		with current_path.open("w", encoding="utf-8") as fh:
+			fh.write(json.dumps(record, ensure_ascii=True))
+			fh.write("\n")
+	except Exception as exc:
+		raise HTTPException(status_code=500, detail=f"failed to persist decision: {exc}")
+
+	return {
+		"ok": True,
+		"trace_id": trace_id,
+		"request_id": request_id_text,
+		"decision": decision,
+		"decisions_file": str(INTERCEPT_DECISIONS_FILE),
+	}
 
 
 @app.get("/api/traces/{trace_id}/replay-state-diff")

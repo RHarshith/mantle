@@ -1,0 +1,20 @@
+{"id": 1597365340929667048, "decision": "allow", "trace_id": "codex_20260406_001311.ebpf.jsonl"}
+{"id": 7902673330686104000, "decision": "allow", "trace_id": "codex_20260406_003925.ebpf.jsonl"}
+{"id": 7902673330686104000, "decision": "allow", "trace_id": "codex_20260406_003925.ebpf.jsonl"}
+{"id": 6997258556281338000, "decision": "allow", "trace_id": "codex_20260406_004849.ebpf.jsonl"}
+{"id": 3290225783804514300, "decision": "deny", "trace_id": "codex_20260406_005007.ebpf.jsonl"}
+{"id": "17658478385631609264", "decision": "allow", "trace_id": "codex_20260406_005338.ebpf.jsonl"}
+{"id": "1672880575096201302", "decision": "deny", "trace_id": "codex_20260406_005534.ebpf.jsonl"}
+{"id": "17047633754456918000", "decision": "allow", "trace_id": "codex_20260406_010521.ebpf.jsonl"}
+{"id": "17047633754456918276", "decision": "allow", "trace_id": "codex_20260406_010521.ebpf.jsonl"}
+{"id": "8427743458986637000", "decision": "allow", "trace_id": "codex_20260406_010846.ebpf.jsonl"}
+{"id": "8427743458986637313", "decision": "allow", "trace_id": "codex_20260406_010846.ebpf.jsonl"}
+{"id": "17806751143682102416", "decision": "allow", "trace_id": "bash_20260406_011456"}
+{"id": "4545143760434887725", "decision": "allow", "trace_id": "codex_20260406_011848.ebpf.jsonl"}
+{"id": "4365769450119856665", "decision": "allow", "trace_id": "codex_20260406_011939.ebpf.jsonl"}
+{"id": "13453964669797105897", "decision": "allow", "trace_id": "codex_20260406_012046.ebpf.jsonl"}
+{"id": "11876848138821961999", "decision": "allow", "trace_id": "bash_20260406_012338"}
+{"id": "4107928188730288117", "decision": "allow", "trace_id": "bash_20260406_012338"}
+{"id": "15374026852086604471", "decision": "allow", "trace_id": "bash_20260406_012840"}
+{"id":"18182505923003194388","decision":"allow","trace_id":"bash_20260406_013931"}
+{"id": "400521146552284672", "decision": "allow", "trace_id": "codex_20260406_014502.ebpf.jsonl"}

@@ -18,6 +18,11 @@ libc = "0.2"
 axum = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 futures-util = "0.3"
+seccompiler = { version = "0.5", features = ["json"] }
+serde_yaml = "0.9"
+glob = "0.3"
+nix = { version = "0.29", features = ["socket", "uio"] }
+uuid = { version = "1.10", features = ["v4"] }
 
 [[bin]]
 name = "mantle_capture_ebpf"
@@ -26,3 +31,7 @@ path = "src/bin/mantle_capture_ebpf.rs"
 [[bin]]
 name = "mantle_capture_mitm_proxy"
 path = "src/bin/mantle_capture_mitm_proxy.rs"
+
+[[bin]]
+name = "mantle_intercept_monitor"
+path = "src/bin/mantle_intercept_monitor.rs"

@@ -9,13 +9,11 @@ The key principle: **fix the disease, not the symptom**.
 
 ## Steps
 
-1. **Reproduce** — write a failing test that demonstrates the bug
-   ```bash
-   # Add test to appropriate file in tests/unit/ or tests/integration/
-   # Run it to confirm it fails:
-   // turbo
-   .venv/bin/python -m pytest tests/ -k "test_name_of_bug" -v
-   ```
+1. **Reproduce** — write a failing test that demonstrates the bug end-to-end
+Use the user description of the bug to write an end-to-end test [required]
+Isolate failing behavior using integration test [required]
+Narrow down to a failing unit test [optional]
+
 
 2. **Root Cause Analysis** — create a temporary RCA document
    ```bash
@@ -52,20 +50,13 @@ The key principle: **fix the disease, not the symptom**.
 
 3. **Fix the root cause** — implement the fix identified in the RCA
    - Fix the ROOT CAUSE from the RCA, NOT the surface symptom
+   - If the root cause is a design issue, propose a fundamental change to design
    - If the root cause is "missing validation", add validation
    - If the root cause is "missing test", add the test AND the fix
 
-4. **Verify** — all tests pass
-   ```bash
-   // turbo
-   make test
-   ```
+4. **Verify** — all tests pass, including regression
 
 5. **Cleanup** — delete the RCA document
-   ```bash
-   // turbo
-   rm tmp/rca_*.md
-   ```
 
 ## Why This Matters
 

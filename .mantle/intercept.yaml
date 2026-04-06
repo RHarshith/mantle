@@ -1,0 +1,41 @@
+defaults:
+  unmatched: notify
+
+filesystem:
+  - path: "/etc/**"
+    ops: [write, delete]
+    action: deny
+  - path: "temp_block.txt"
+    ops: [write, delete]
+    action: deny
+  - path: "/home/harshith/code_projects/mantle/temp_block.txt"
+    ops: [write, delete]
+    action: deny
+  - path: "temp_permission.txt"
+    ops: [write, delete]
+    action: ask
+  - path: "/home/harshith/code_projects/mantle/temp_permission.txt"
+    ops: [write, delete]
+    action: ask
+  - path: "/home/harshith/code_projects/mantle/obs/**"
+    ops: [write]
+    action: allow
+  - path: "/home/harshith/code_projects/mantle/**"
+    ops: [write]
+    action: notify
+
+process:
+  - command: "curl"
+    action: deny
+  - command: "git"
+    action: allow
+  - command: "*"
+    action: notify
+
+network:
+  - destination: "10.*"
+    action: allow
+  - destination: "127.0.0.1:*"
+    action: allow
+  - destination: "*"
+    action: notify

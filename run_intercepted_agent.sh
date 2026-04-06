@@ -87,9 +87,14 @@ MITM_JSONL="$OBS_ROOT/mitm/${TRACE_BASENAME}.mitm.jsonl"
 EBPF_FILE="$OBS_ROOT/traces/$TRACE_ID"
 ROOT_PID_FILE="$OBS_ROOT/mitm/${TRACE_BASENAME}.root.pid"
 PID_WRAPPER_SCRIPT=""
+EVENTS_FILE="$OBS_ROOT/events/${TRACE_BASENAME}.events.jsonl"
 
 MITM_CAPTURE_BIN="${MANTLE_CAPTURE_MITM_BIN:-$SCRIPT_DIR/mantle/capture/rust/target/release/mantle_capture_mitm_proxy}"
 EBPF_CAPTURE_BIN="${MANTLE_CAPTURE_EBPF_BIN:-$SCRIPT_DIR/mantle/capture/rust/target/release/mantle_capture_ebpf}"
+INTERCEPT_MONITOR_BIN="${MANTLE_INTERCEPT_MONITOR_BIN:-$SCRIPT_DIR/mantle/capture/rust/target/release/mantle_intercept_monitor}"
+INTERCEPT_POLICY_FILE="${MANTLE_INTERCEPT_POLICY_FILE:-$SCRIPT_DIR/.mantle/intercept.yaml}"
+INTERCEPT_DECISIONS_FILE="${MANTLE_INTERCEPT_DECISIONS_FILE:-$SCRIPT_DIR/.mantle/intercept.decisions.jsonl}"
+INTERCEPT_DECISION_CURRENT_DIR="${MANTLE_INTERCEPT_DECISION_CURRENT_DIR:-$SCRIPT_DIR/.mantle/intercept.decision-current}"
 
 if [[ ! -x "$MITM_CAPTURE_BIN" ]]; then
     echo "Error: MITM Rust binary not found or not executable: $MITM_CAPTURE_BIN" >&2
@@ -99,6 +104,16 @@ fi
 if [[ ! -x "$EBPF_CAPTURE_BIN" ]]; then
     echo "Error: eBPF Rust binary not found or not executable: $EBPF_CAPTURE_BIN" >&2
     echo "Build it first: mantle/capture/rust/scripts/build_capture_rust.sh" >&2
+    exit 1
+fi
+if [[ ! -x "$INTERCEPT_MONITOR_BIN" ]]; then
+    echo "Error: intercept monitor Rust binary not found or not executable: $INTERCEPT_MONITOR_BIN" >&2
+    echo "Build it first: mantle/capture/rust/scripts/build_capture_rust.sh" >&2
+    exit 1
+fi
+if [[ ! -f "$INTERCEPT_POLICY_FILE" ]]; then
+    echo "Error: intercept policy file not found: $INTERCEPT_POLICY_FILE" >&2
+    echo "Create it first (example): .mantle/intercept.yaml" >&2
     exit 1
 fi
 
@@ -170,7 +185,14 @@ make_pid_wrapper() {
         echo "set -euo pipefail"
         echo "echo \"\$\$\" > $(printf '%q' "$ROOT_PID_FILE")"
         printf "exec "
-        printf "%q " "$AGENT_BIN_PATH" "${AGENT_ARGS[@]}"
+        printf "%q " "$INTERCEPT_MONITOR_BIN"
+        printf -- "--policy-file %q " "$INTERCEPT_POLICY_FILE"
+        printf -- "--trace-id %q " "$TRACE_BASENAME"
+        printf -- "--events-file %q " "$EVENTS_FILE"
+        printf -- "--ask-decisions-file %q " "$INTERCEPT_DECISIONS_FILE"
+        printf -- "--ask-current-dir %q " "$INTERCEPT_DECISION_CURRENT_DIR"
+        printf -- "-- %q " "$AGENT_BIN_PATH"
+        printf "%q " "${AGENT_ARGS[@]}"
         echo
     } > "$wrapper"
     chmod 700 "$wrapper"
