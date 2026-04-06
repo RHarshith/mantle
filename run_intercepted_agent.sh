@@ -148,10 +148,13 @@ echo "  eBPF trace:  $ENABLE_EBPF"
 echo "  eBPF file:   $EBPF_FILE"
 echo "═══════════════════════════════════════════════════════════"
 
+# We fallback to OPENAI_BASE_URL but need to deduce internal defaults if missing.
 UPSTREAM_BASE="${MANTLE_FORCE_OPENAI_BASE:-${OPENAI_BASE_URL:-https://api.openai.com}}"
 if [[ -z "${MANTLE_FORCE_OPENAI_BASE:-}" && -z "${OPENAI_BASE_URL:-}" && -n "${OAK1:-}" ]]; then
     UPSTREAM_BASE="https://chat-api.tamu.ai/api"
 fi
+# Strip possible trailing slash
+UPSTREAM_BASE="${UPSTREAM_BASE%/}"
 
 MANTLE_AGENT_ROOT_PID_FILE="$ROOT_PID_FILE" \
     "$MITM_CAPTURE_BIN" \
@@ -163,10 +166,14 @@ sleep 1
 kill -0 "$MITM_PID" 2>/dev/null || { echo "Error: Rust MITM proxy failed to start" >&2; exit 1; }
 echo "[*] Rust MITM proxy started (PID $MITM_PID)"
 
-# Route OpenAI-compatible clients through local Rust reverse endpoint.
-export OPENAI_API_BASE="http://127.0.0.1:$MITM_REV_PORT/v1"
-export OPENAI_BASE_URL="http://127.0.0.1:$MITM_REV_PORT/v1"
-echo "[*] Forced OPENAI_BASE_URL/OPENAI_API_BASE to Rust reverse endpoint"
+# Route clients through local Rust endpoint using dynamic URL path encoding!
+export OPENAI_API_BASE="http://127.0.0.1:$MITM_REV_PORT/proxy/${UPSTREAM_BASE}/v1"
+export OPENAI_BASE_URL="http://127.0.0.1:$MITM_REV_PORT/proxy/${UPSTREAM_BASE}/v1"
+export ANTHROPIC_BASE_URL="http://127.0.0.1:$MITM_REV_PORT/proxy/https://api.anthropic.com"
+export GEMINI_API_BASE="http://127.0.0.1:$MITM_REV_PORT/proxy/https://generativelanguage.googleapis.com"
+export HTTP_PROXY="http://127.0.0.1:$MITM_REV_PORT"
+export HTTPS_PROXY="http://127.0.0.1:$MITM_REV_PORT"
+echo "[*] Forced SDK base URLs to dynamic Rust reverse endpoint"
 
 cleanup() {
     echo ""

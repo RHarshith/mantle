@@ -1,13 +1,15 @@
 use anyhow::{Context, Result};
 use axum::body::{to_bytes, Body};
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, Method};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
 use clap::Parser;
 use futures_util::TryStreamExt;
 use reqwest::StatusCode;
+use rcgen::{CertificateParams, KeyPair};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::fs;
@@ -16,7 +18,9 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
+use tokio_rustls::rustls::ServerConfig;
 
 #[derive(Parser, Debug)]
 #[command(about = "Rust MITM capture reverse proxy")]
@@ -35,6 +39,8 @@ struct AppState {
     upstream_base: String,
     client: reqwest::Client,
     capture_file: Arc<Mutex<std::fs::File>>,
+    ca_cert: Arc<rcgen::Certificate>,
+    ca_key: Arc<rcgen::KeyPair>,
 }
 
 #[derive(Debug)]
@@ -237,12 +243,91 @@ async fn handle(
     req: Request,
 ) -> Response {
     let method = req.method().clone();
+    let req_pid = pid_for_ports(addr.port(), state.listen_port);
+    let root_pid = read_agent_root_pid();
+    let should_capture = match (root_pid, req_pid) {
+        (Some(root), Some(pid)) => is_descendant_or_same(pid, root),
+        (Some(_), None) => false,
+        (None, _) => true,
+    };
+
+    if method == Method::CONNECT {
+        let host = req.uri().host().unwrap_or("").to_string();
+        let port = req.uri().port_u16().unwrap_or(443);
+
+        if should_capture {
+            let _ = write_record(&state, &json!({
+                "ts": now_ts(),
+                "direction": "request",
+                "url": format!("{}:{}", host, port),
+                "pid": req_pid,
+                "method": "CONNECT",
+                "_tier": "1_and_2",
+            })).await;
+        }
+
+        tokio::spawn(async move {
+            if let Ok(upgraded) = hyper::upgrade::on(req).await {
+                let upgraded_io = hyper_util::rt::TokioIo::new(upgraded);
+                let mut params = CertificateParams::new(vec![host.clone()]).unwrap();
+                if let Ok(cert) = params.self_signed(&*state.ca_key) {
+                    let rustls_cert = vec![cert.into()];
+                    let rustls_key = PrivateKeyDer::Pkcs8(state.ca_key.serialize_der().into());
+                    
+                    if let Ok(tls_config) = ServerConfig::builder().with_no_client_auth().with_single_cert(rustls_cert, rustls_key) {
+                        let mut tls_config = tls_config;
+                        tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+                        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+                        
+                        match acceptor.accept(upgraded_io).await {
+                            Ok(_) => {
+                                // For minimal proxy best-effort, if TLS handshake succeeds, we log that MITM was possible.
+                                if should_capture {
+                                    let _ = write_record(&state, &json!({
+                                        "ts": now_ts(),
+                                        "direction": "response",
+                                        "url": format!("{}:{}", host, port),
+                                        "pid": req_pid,
+                                        "method": "UNKNOWN",
+                                        "response_body": "[MITM TLS Established - Best effort payload capture not yet routed]",
+                                        "_masked_tls_fallback": false
+                                    })).await;
+                                }
+                            }
+                            Err(e) => {
+                                if should_capture {
+                                    let _ = write_record(&state, &json!({
+                                        "ts": now_ts(),
+                                        "direction": "response",
+                                        "url": format!("{}:{}", host, port),
+                                        "pid": req_pid,
+                                        "method": "UNKNOWN",
+                                        "response_body": format!("[Masked: Agent rejected SSL cert ({}). Tier 1/2 domain logged]", e),
+                                        "_masked_tls_fallback": true
+                                    })).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        return Response::builder().status(StatusCode::OK).body(Body::empty()).unwrap();
+    }
+
     let path_q = req
         .uri()
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| req.uri().path().to_string());
-    let url = format!("{}{}", state.upstream_base, path_q);
+        
+    let url = if let Some(idx) = path_q.find("/proxy/http") {
+        path_q[idx + 7..].to_string()
+    } else {
+        format!("{}{}", state.upstream_base, path_q)
+    };
+    
     let req_headers = req.headers().clone();
 
     let req_body = match to_bytes(req.into_body(), 16 * 1024 * 1024).await {
@@ -253,19 +338,12 @@ async fn handle(
     };
     let req_text = String::from_utf8_lossy(&req_body).to_string();
 
-    let req_pid = pid_for_ports(addr.port(), state.listen_port);
-    let root_pid = read_agent_root_pid();
-    let should_capture = match (root_pid, req_pid) {
-        (Some(root), Some(pid)) => is_descendant_or_same(pid, root),
-        (Some(_), None) => false,
-        (None, _) => true,
-    };
-
     let req_body_json = parse_json_or_raw(&req_text);
     let req_record = json!({
         "ts": now_ts(),
         "direction": "request",
         "url": url,
+        "debug_path_q": path_q,
         "method": method.as_str(),
         "pid": req_pid,
         "model": req_body_json.get("model").and_then(|v| v.as_str()).unwrap_or(""),
@@ -398,14 +476,22 @@ async fn main() -> Result<()> {
         .open(&cli.capture_file)
         .with_context(|| format!("failed to open capture file: {}", cli.capture_file))?;
 
+    let alg = &rcgen::PKCS_ECDSA_P256_SHA256;
+    let mut ca_params = CertificateParams::new(vec!["Mantle Root CA".into()]).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_key = KeyPair::generate_for(alg).unwrap();
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
     let state = AppState {
         listen_port: cli.listen_port,
         upstream_base: cli.upstream_base,
         client: reqwest::Client::builder().build().context("failed to build reqwest client")?,
         capture_file: Arc::new(Mutex::new(fh)),
+        ca_cert: Arc::new(ca_cert),
+        ca_key: Arc::new(ca_key),
     };
 
-    let app = Router::new().route("/*path", any(handle)).with_state(state);
+    let app = Router::new().fallback(any(handle)).with_state(state);
     let listen = SocketAddr::from(([127, 0, 0, 1], cli.listen_port));
 
     let listener = tokio::net::TcpListener::bind(listen)
