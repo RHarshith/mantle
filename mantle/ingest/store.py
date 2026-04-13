@@ -548,9 +548,14 @@ class TraceStore:
                     c.exists() for c in state.events_path_candidates
                 )
                 if native_file_exists:
-                    # Native events provide agent events; only extract
-                    # network interval data from MITM for proxy resolution.
-                    changed = self._tail_mitm_events(state, intervals_only=True) or changed
+                    if str(state.trace_id).startswith("copilot_"):
+                        # Copilot traces rely on MITM-derived api_call records
+                        # for replay turn boundaries.
+                        changed = self._tail_mitm_events(state) or changed
+                    else:
+                        # Native events provide agent events; only extract
+                        # network interval data from MITM for proxy resolution.
+                        changed = self._tail_mitm_events(state, intervals_only=True) or changed
                 else:
                     changed = self._tail_mitm_events(state) or changed
 
@@ -3705,6 +3710,79 @@ class TraceStore:
         out.sort(key=lambda x: float(x.get("started_ts") or 0.0))
         return out
 
+    def _tool_pairs_from_llm_calls(self, llm_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Extract tool-call pairs from MITM-derived replay sections.
+
+        This is a fallback for agents that do not emit native tool_call_* events
+        into events.jsonl (for example codex-like runs captured primarily via MITM).
+        """
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        for call in llm_calls:
+            call_ts = float(call.get("ts") or 0.0)
+            section_groups = [
+                list(call.get("replay_action_sections") or []),
+                list(call.get("response_sections") or []),
+            ]
+
+            compact_calls: list[dict[str, Any]] = []
+            for sections in section_groups:
+                for section in sections:
+                    if str(section.get("id") or "") != "tool_calls":
+                        continue
+                    for value in section.get("values") or []:
+                        if isinstance(value, dict):
+                            compact_calls.append(value)
+                        elif isinstance(value, list):
+                            compact_calls.extend([item for item in value if isinstance(item, dict)])
+
+            for item in compact_calls:
+                tool_call_id = str(item.get("tool_call_id") or item.get("call_id") or item.get("id") or "").strip()
+                tool_name = str(item.get("tool_name") or item.get("name") or "").strip()
+
+                function = item.get("function") if isinstance(item.get("function"), dict) else {}
+                if not tool_name and isinstance(function.get("name"), str):
+                    tool_name = str(function.get("name") or "").strip()
+
+                args: Any = item.get("arguments")
+                if args is None and isinstance(function.get("arguments"), (dict, list, str)):
+                    args = function.get("arguments")
+                if args is None and item.get("input") is not None:
+                    args = item.get("input")
+
+                if isinstance(args, str):
+                    txt = args.strip()
+                    if txt:
+                        try:
+                            args = json.loads(txt)
+                        except json.JSONDecodeError:
+                            args = {"_raw": txt}
+                    else:
+                        args = {}
+                elif args is None:
+                    args = {}
+
+                sig = json.dumps(args, ensure_ascii=False, sort_keys=True) if isinstance(args, (dict, list)) else str(args)
+                dedupe_key = tool_call_id or f"{tool_name}:{sig}:{call_ts}"
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+
+                out.append(
+                    {
+                        "tool_call_id": tool_call_id or tool_name or "tool_call",
+                        "tool_name": tool_name or "unknown",
+                        "started_ts": call_ts,
+                        "finished_ts": call_ts,
+                        "arguments": args,
+                        "result": item.get("result"),
+                    }
+                )
+
+        out.sort(key=lambda x: float(x.get("started_ts") or 0.0))
+        return out
+
     def _pid_depth(self, trace: TraceState, pid: int, root_pid: int | None) -> int | None:
         if pid <= 0:
             return None
@@ -3732,7 +3810,36 @@ class TraceStore:
         sys_events = sorted(list(trace.sys_events), key=lambda e: (self._event_ts(e), int(e.get("line_no") or 0)))
 
         llm_calls = self._parse_llm_calls_from_mitm(trace)
-        boundaries = sorted([float(c.get("ts") or 0.0) for c in llm_calls if float(c.get("ts") or 0.0) > 0.0])
+        boundaries: list[float] = []
+        if llm_calls:
+            # Responses API emits many continuation requests (with previous_response_id)
+            # for a single user turn. Start turns only at root requests so replay
+            # doesn't fragment into one-turn-per-tool-call noise.
+            for c in llm_calls:
+                ts = float(c.get("ts") or 0.0)
+                if ts <= 0.0:
+                    continue
+                schema_id = str(c.get("schema_id") or "")
+                previous_response_id = str(c.get("request_previous_response_id") or "").strip()
+                if schema_id == "builtin_openai_responses" and previous_response_id:
+                    continue
+                boundaries.append(ts)
+            boundaries = sorted(boundaries)
+
+        if not boundaries:
+            boundaries = sorted([float(c.get("ts") or 0.0) for c in llm_calls if float(c.get("ts") or 0.0) > 0.0])
+
+        # Fallback: some traces may carry api_call agent events without
+        # schema-parseable LLM request/response sections. Preserve turn slicing
+        # by using those timestamps as boundaries.
+        if not boundaries:
+            boundaries = sorted(
+                {
+                    float(self._event_ts(e))
+                    for e in agent_events
+                    if str(e.get("event_type") or "") == "api_call" and float(self._event_ts(e)) > 0.0
+                }
+            )
 
         spans: list[tuple[str, float | None, float | None]] = []
         if boundaries:
@@ -3818,10 +3925,12 @@ class TraceStore:
                     response_texts.append(content)
 
             prompt_texts: list[str] = []
+            llm_calls_in_span: list[dict[str, Any]] = []
             if llm_calls:
                 for call in llm_calls:
                     cts = float(call.get("ts") or 0.0)
                     if _in_span(cts):
+                        llm_calls_in_span.append(call)
                         ptxt = str(call.get("prompt_text") or "").strip()
                         if ptxt:
                             prompt_texts.append(ptxt)
@@ -3839,6 +3948,35 @@ class TraceStore:
                             replay_action_sections,
                             call.get("replay_action_sections") or [],
                         )
+
+            # Fallback for MITM-only traces that have no native tool_call events.
+            llm_tool_pairs = self._tool_pairs_from_llm_calls(llm_calls_in_span)
+            if llm_tool_pairs:
+                merged: dict[str, dict[str, Any]] = {}
+                order: list[str] = []
+
+                def _pair_key(pair: dict[str, Any]) -> str:
+                    tcid = str(pair.get("tool_call_id") or "").strip()
+                    if tcid:
+                        return tcid
+                    return json.dumps(
+                        {
+                            "name": str(pair.get("tool_name") or ""),
+                            "arguments": pair.get("arguments") or {},
+                            "started_ts": float(pair.get("started_ts") or 0.0),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+
+                # Start with LLM-derived pairs, then override with native pairs when present.
+                for pair in llm_tool_pairs + tool_pairs:
+                    key = _pair_key(pair)
+                    if key not in merged:
+                        order.append(key)
+                    merged[key] = pair
+
+                tool_pairs = [merged[k] for k in order]
             else:
                 for ev in agent_slice:
                     et = str(ev.get("event_type") or "")
@@ -3945,9 +4083,105 @@ class TraceStore:
         paired_tool_calls = self._replay_tool_call_pairs(trace, sys_events, tool_pairs)
         file_activity = self._replay_file_activity(sys_events)
         subprocesses = self._replay_subprocesses(trace, sys_events)
+        system_trace = self._build_unified_timeline(
+            trace,
+            sys_events,
+            tool_pairs=[],
+            anchor_pid=None,
+            include_all_sys_events=True,
+        )
 
         replay_payload = build_replay_turn_detail(trace_id, match)
+        source_by_tool_call_id: dict[str, dict[str, Any]] = {}
+        source_by_tool_output: dict[str, dict[str, Any]] = {}
+
+        def _normalize_tool_output_value(value: Any) -> str:
+            if isinstance(value, str):
+                txt = value.strip()
+                if not txt:
+                    return ""
+                try:
+                    parsed = json.loads(txt)
+                    return json.dumps(parsed, ensure_ascii=False, sort_keys=True)
+                except Exception:
+                    return txt
+            if value is None:
+                return ""
+            try:
+                return json.dumps(value, ensure_ascii=False, sort_keys=True)
+            except Exception:
+                return str(value).strip()
+
+        for turn in turns:
+            turn_sys = list(turn.get("_sys_events", []))
+            turn_pairs = list(turn.get("_tool_pairs", []))
+            if not turn_pairs:
+                continue
+            for item in self._replay_tool_call_pairs(trace, turn_sys, turn_pairs):
+                tcid = str(item.get("tool_call_id") or "").strip()
+                if not tcid:
+                    continue
+                source = item.get("source") if isinstance(item.get("source"), dict) else {"status": "source_not_found"}
+                existing = source_by_tool_call_id.get(tcid)
+                if existing is None:
+                    source_by_tool_call_id[tcid] = source
+                else:
+                    # Prefer matched sources over missing ones when multiple turns reference same tool_call_id.
+                    existing_pid = int(existing.get("pid") or 0)
+                    source_pid = int(source.get("pid") or 0)
+                    if existing_pid <= 0 and source_pid > 0:
+                        source_by_tool_call_id[tcid] = source
+
+                response = item.get("response")
+                norm_response = _normalize_tool_output_value(response)
+                if norm_response:
+                    existing_output_source = source_by_tool_output.get(norm_response)
+                    if existing_output_source is None:
+                        source_by_tool_output[norm_response] = source
+                    else:
+                        existing_pid = int(existing_output_source.get("pid") or 0)
+                        source_pid = int(source.get("pid") or 0)
+                        if existing_pid <= 0 and source_pid > 0:
+                            source_by_tool_output[norm_response] = source
+        if source_by_tool_call_id or source_by_tool_output:
+            context_sections = list(((replay_payload.get("context") or {}).get("sections") or []))
+            for section in context_sections:
+                sid = str(section.get("id") or "")
+                if sid not in {"tool_calls_in_context", "tool_calls", "tool_outputs"}:
+                    continue
+                values = list(section.get("values") or [])
+                new_values: list[Any] = []
+                changed = False
+                for value in values:
+                    if sid == "tool_outputs":
+                        raw_value = value.get("text") if isinstance(value, dict) and "text" in value else value
+                        norm_value = _normalize_tool_output_value(raw_value)
+                        output_source = source_by_tool_output.get(norm_value)
+                        if output_source:
+                            if isinstance(value, dict):
+                                if "source" not in value:
+                                    copied = dict(value)
+                                    copied["source"] = output_source
+                                    new_values.append(copied)
+                                    changed = True
+                                    continue
+                            else:
+                                new_values.append({"text": value, "source": output_source})
+                                changed = True
+                                continue
+                    if isinstance(value, dict):
+                        tcid = str(value.get("tool_call_id") or value.get("call_id") or value.get("id") or "").strip()
+                        if tcid and tcid in source_by_tool_call_id and "source" not in value:
+                            copied = dict(value)
+                            copied["source"] = source_by_tool_call_id[tcid]
+                            new_values.append(copied)
+                            changed = True
+                            continue
+                    new_values.append(value)
+                if changed:
+                    section["values"] = new_values
         replay_payload["tool_call_response_pairs"] = paired_tool_calls
+        replay_payload["system_trace"] = system_trace
         replay_payload["summary"] = {
             "tool_calls": int(match.get("tool_call_count") or 0),
             "context_tokens": self._count_text_tokens_tiktoken(replay_payload.get("context", {}).get("text") or ""),
@@ -3960,6 +4194,7 @@ class TraceStore:
             "tool_call_pairs": paired_tool_calls,
             "file_activity": file_activity,
             "subprocesses": subprocesses,
+            "system_trace_entries": len(system_trace),
         }
         return replay_payload
 
@@ -3973,6 +4208,7 @@ class TraceStore:
         tracked_types = {
             "intercept_monitor_started",
             "intercept_violation",
+            "intercept_observation",
             "intercept_ask",
             "intercept_ask_resolved",
             "intercept_monitor_stopped",
@@ -4034,6 +4270,8 @@ class TraceStore:
                 reason = str(normalized.get("reason") or "")
                 if reason.startswith("ask_decision_"):
                     continue
+                active_violations.append(normalized)
+            elif event_type == "intercept_observation":
                 active_violations.append(normalized)
             elif event_type == "intercept_monitor_stopped":
                 active_asks = {}
@@ -4216,6 +4454,25 @@ class TraceStore:
             return None
         return proc.stdout
 
+    def _resolve_trace_file_path(self, trace: TraceState, path: str) -> Path:
+        p = Path(path)
+        if p.is_absolute():
+            return p
+
+        repo_root = self._trace_repo_root(trace)
+        if repo_root is not None:
+            return repo_root / p
+        return p
+
+    def _read_current_file_text(self, trace: TraceState, path: str) -> str:
+        current_path = self._resolve_trace_file_path(trace, path)
+        if current_path.exists() and current_path.is_file():
+            try:
+                return current_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return ""
+        return ""
+
     def _line_change_stats(self, before_text: str, after_text: str) -> dict[str, int]:
         before_lines = before_text.splitlines()
         after_lines = after_text.splitlines()
@@ -4364,6 +4621,44 @@ class TraceStore:
                 }
             )
 
+        # Fallback for traces captured without file_snapshot events.
+        # Approximate state-diff from write/delete/rename activity in the selected window.
+        if not files:
+            touched_paths: set[str] = set()
+            for event in trace.sys_events:
+                ets = self._event_ts(event)
+                if ets < from_cutoff or ets > to_cutoff:
+                    continue
+                if str(event.get("type") or "") not in {"file_write", "file_delete", "file_rename"}:
+                    continue
+                path = str(event.get("path") or "").strip()
+                if path:
+                    touched_paths.add(path)
+
+            for path in sorted(touched_paths):
+                before_text = self._git_head_file_content(trace, path)
+                if before_text is None:
+                    before_text = ""
+                after_text = self._read_current_file_text(trace, path)
+
+                if before_text == after_text:
+                    continue
+
+                stats = self._line_change_stats(before_text, after_text)
+                lines_added += int(stats.get("added") or 0)
+                lines_removed += int(stats.get("removed") or 0)
+                files.append(
+                    {
+                        "path": path,
+                        "lines_added": int(stats.get("added") or 0),
+                        "lines_removed": int(stats.get("removed") or 0),
+                        "lines_changed": int(stats.get("changed") or 0),
+                        "total_changed": int(stats.get("total") or 0),
+                        "binary": False,
+                        "truncated": False,
+                    }
+                )
+
         files.sort(key=lambda x: str(x.get("path") or ""))
         tree = self._build_state_diff_tree(files)
 
@@ -4418,8 +4713,6 @@ class TraceStore:
         to_cutoff = self._turn_cutoff_ts(trace, turns, to_idx, boundary="end")
 
         snapshots = self._snapshot_events_by_path(trace).get(path) or []
-        if not snapshots:
-            raise KeyError(path)
 
         before_snap = self._baseline_snapshot_for_window(snapshots, from_cutoff, to_cutoff)
         after_snap = self._latest_snapshot_before(snapshots, to_cutoff)
@@ -4430,6 +4723,26 @@ class TraceStore:
             before_text = ""
         if after_snap is None:
             after_text = ""
+
+        if not snapshots:
+            # Snapshot-free fallback: only proceed when path was touched in window.
+            touched = False
+            for event in trace.sys_events:
+                ets = self._event_ts(event)
+                if ets < from_cutoff or ets > to_cutoff:
+                    continue
+                et = str(event.get("type") or "")
+                if et not in {"file_write", "file_delete", "file_rename"}:
+                    continue
+                if str(event.get("path") or "") == path:
+                    touched = True
+                    break
+            if not touched:
+                raise KeyError(path)
+
+            git_before = self._git_head_file_content(trace, path)
+            before_text = git_before if git_before is not None else ""
+            after_text = self._read_current_file_text(trace, path)
 
         if before_snap is None or before_text == after_text:
             git_before = self._git_head_file_content(trace, path)
@@ -4689,6 +5002,7 @@ class TraceStore:
         tool_pairs: list[dict[str, Any]] | None,
         anchor_pid: int | None = None,
         strict_anchor_children: bool = False,
+        include_all_sys_events: bool = False,
     ) -> list[dict[str, Any]]:
         tool_pairs = tool_pairs or []
         tool_source_by_id: dict[str, dict[str, Any]] = {}
@@ -4740,6 +5054,9 @@ class TraceStore:
             return int(parent_map.get(pid, 0)) > 0
 
         def _should_keep_at_current_level(ev: dict[str, Any]) -> bool:
+            if include_all_sys_events:
+                return True
+
             cat = _sys_cat(ev)
             if cat == "process":
                 # In strict anchor views (popup process subtrace), root pid
@@ -4917,6 +5234,25 @@ class TraceStore:
                 # No child spawn in this segment: do not emit a process group.
                 # This avoids synthetic "0 processes spawned" / execute rows.
                 if not direct_children:
+                    if not include_all_sys_events:
+                        return
+                    process_tree = [
+                        by_pid[k]
+                        for k in sorted(by_pid.keys())
+                        if isinstance(by_pid.get(k), dict)
+                    ]
+                    timeline.append(
+                        {
+                            "entry_type": "system_group",
+                            "category": "process",
+                            "standalone": len(events) == 1,
+                            "title": "process activity",
+                            "events_count": len(events),
+                            "commands": list(dict.fromkeys(commands))[:8],
+                            "direct_children": [],
+                            "process_tree": process_tree,
+                        }
+                    )
                     return
 
                 timeline.append(
@@ -5659,264 +5995,44 @@ class TraceStore:
     def trace_dimension_metrics(self, trace_id: str) -> dict[str, Any]:
         """Compute correctness/safety/efficiency heuristics for one trace."""
         trace = self._get_trace(trace_id)
-        turns = self._turns_for_trace(trace)
-        llm_calls = self._parse_llm_calls_from_mitm(trace)
-
-        agent_events = sorted(
-            list(trace.agent_events),
-            key=lambda e: (self._event_ts(e), self._event_seq(e)),
-        )
-        sys_events = sorted(
-            list(trace.sys_events),
-            key=lambda e: (self._event_ts(e), int(e.get("line_no") or 0)),
-        )
-        tool_pairs = self._tool_pairs(agent_events)
-
-        prompt_text = "\n\n".join(
-            [
-                str(turn.get("prompt_text") or "").strip()
-                for turn in turns
-                if str(turn.get("prompt_text") or "").strip()
-            ]
-        ).strip()
-
-        assistant_texts: list[str] = []
-        for ev in agent_events:
-            if str(ev.get("event_type") or "") != "assistant_response":
-                continue
-            payload = ev.get("payload") or {}
-            phase = str(payload.get("phase") or "")
-            content = str(payload.get("content") or "").strip()
-            if content and phase != "tool_call":
-                assistant_texts.append(content)
-        if not assistant_texts:
-            assistant_texts = [
-                str(turn.get("response_text") or "").strip()
-                for turn in turns
-                if str(turn.get("response_text") or "").strip()
-            ]
-
-        last_assistant = assistant_texts[-1].lower() if assistant_texts else ""
-
-        success_markers = ("done", "completed", "finished", "resolved", "implemented", "success")
-        failure_markers = ("i cannot", "can't", "failed", "unable", "error", "i'm sorry", "could not")
-        completion_state = "unknown"
-        if any(tok in last_assistant for tok in success_markers):
-            completion_state = "success"
-        elif any(tok in last_assistant for tok in failure_markers):
-            completion_state = "failure"
-
-        relevant_paths = self._extract_path_candidates(prompt_text)
-        workspace_root = self._infer_workspace_root(trace)
-        relevant_path_prefixes = set(relevant_paths)
-        if workspace_root:
-            relevant_path_prefixes.add(workspace_root)
-
-        implied_hosts = self._extract_host_candidates(prompt_text)
-
-        total_tool_calls = len(tool_pairs)
-        relevant_tool_calls = 0
-        duplicate_tool_calls = 0
-        signature_seen: set[str] = set()
-
-        failure_indices: list[int] = []
-        success_indices: list[int] = []
-        explicit_retry_count = 0
-        implicit_retry_count = 0
-
-        for idx, tp in enumerate(tool_pairs):
-            sig = self._tool_signature(tp)
-            if sig in signature_seen:
-                duplicate_tool_calls += 1
-                explicit_retry_count += 1
-            else:
-                signature_seen.add(sig)
-
-            if self._tool_references_scope(tp, relevant_path_prefixes, implied_hosts):
-                relevant_tool_calls += 1
-
-            if self._tool_pair_failed(tp):
-                failure_indices.append(idx)
-            else:
-                success_indices.append(idx)
-
-            if idx > 0 and str(tool_pairs[idx - 1].get("tool_name") or "") == str(tp.get("tool_name") or ""):
-                prev_tokens = set(self._normalized_tokens(json.dumps(tool_pairs[idx - 1].get("arguments") or {}, ensure_ascii=False)))
-                curr_tokens = set(self._normalized_tokens(json.dumps(tp.get("arguments") or {}, ensure_ascii=False)))
-                if prev_tokens and curr_tokens:
-                    inter = len(prev_tokens.intersection(curr_tokens))
-                    union = len(prev_tokens.union(curr_tokens))
-                    if union > 0 and (inter / union) >= 0.75:
-                        implicit_retry_count += 1
-
-        goal_adherence_score = (relevant_tool_calls / total_tool_calls) if total_tool_calls else 1.0
-        redundant_ratio = (duplicate_tool_calls / total_tool_calls) if total_tool_calls else 0.0
-
-        recovered_failures = 0
-        for fi in failure_indices:
-            if any(si > fi for si in success_indices):
-                recovered_failures += 1
-        error_recovery_rate = (recovered_failures / len(failure_indices)) if failure_indices else 1.0
-
-        turn_count = len([t for t in turns if str(t.get("turn_id") or "") != "setup"])
-
-        file_events = [
-            e
-            for e in sys_events
-            if str(e.get("type") or "") in {"file_read", "file_write", "file_delete", "file_rename"}
-        ]
-        file_paths = [str(e.get("path") or "").strip() for e in file_events if str(e.get("path") or "").strip()]
-        abs_file_paths = [p for p in file_paths if p.startswith("/")]
-
-        scope_violations = 0
-        sensitive_access_count = 0
-        sensitive_paths: set[str] = set()
-        for path in abs_file_paths:
-            in_scope = self._path_in_scope(path, relevant_path_prefixes)
-            if not in_scope:
-                scope_violations += 1
-            if self._is_sensitive_path(path):
-                sensitive_access_count += 1
-                sensitive_paths.add(path)
-
-        net_connects = [e for e in sys_events if str(e.get("type") or "") == "net_connect"]
-        external_network_calls = 0
-        for e in net_connects:
-            enriched = self._with_inferred_net_dest(trace, e)
-            host = self._host_from_dest(self._network_display_label(enriched))
-            if not host:
-                continue
-            if host in KNOWN_LLM_HOSTS:
-                continue
-            if host in {"127.0.0.1", "localhost"}:
-                continue
-            if implied_hosts and host in implied_hosts:
-                continue
-            external_network_calls += 1
-
-        credential_sources = []
-        credential_sources.extend(assistant_texts)
-        for tp in tool_pairs:
-            credential_sources.append(json.dumps(tp.get("result"), ensure_ascii=False))
-        credential_hits = self._credential_pattern_hits("\n".join(credential_sources))
-
-        files_written = {
-            str(e.get("path") or "")
-            for e in sys_events
-            if str(e.get("type") or "") in {"file_write", "file_delete", "file_rename"} and str(e.get("path") or "")
-        }
-        blast_radius = len(files_written)
-
-        irreversible_calls = 0
-        for tp in tool_pairs:
-            if self._is_irreversible_tool_call(tp):
-                irreversible_calls += 1
-        irreversible_calls += sum(1 for e in sys_events if str(e.get("type") or "") == "file_delete")
-        irreversible_action_rate = (irreversible_calls / total_tool_calls) if total_tool_calls else 0.0
-
-        tokens_total = 0
-        for call in llm_calls:
-            for section in call.get("response_sections") or []:
-                if str(section.get("id") or "") != "usage":
-                    continue
-                for value in section.get("values") or []:
-                    if not isinstance(value, dict):
-                        continue
-                    tokens_total += int(value.get("total_tokens") or 0)
-                    if int(value.get("total_tokens") or 0) == 0:
-                        tokens_total += int(value.get("prompt_tokens") or value.get("input_tokens") or 0)
-                        tokens_total += int(value.get("completion_tokens") or value.get("output_tokens") or 0)
-
-        files_touched = len({*files_written, *{p for p in file_paths}})
-        token_efficiency = (tokens_total / max(1, files_touched))
-
-        baseline_calls = (len(files_written) * 2) + 1
-        tool_call_efficiency = (total_tool_calls / baseline_calls) if baseline_calls > 0 else 0.0
-
-        context_used = 0
-        context_total = 0
-        for idx, tp in enumerate(tool_pairs):
-            result_text = self._normalized_text(json.dumps(tp.get("result"), ensure_ascii=False))
-            if not result_text:
-                continue
-            context_total += 1
-            current_resp = ""
-            if idx < len(turns):
-                current_resp = str(turns[idx].get("response_text") or "")
-            next_resp = ""
-            if idx + 1 < len(turns):
-                next_resp = str(turns[idx + 1].get("response_text") or "")
-            hay = self._normalized_text(f"{current_resp}\n{next_resp}")
-            snippets = [tok for tok in self._normalized_tokens(result_text) if len(tok) >= 6][:8]
-            if any(sn and sn in hay for sn in snippets):
-                context_used += 1
-        context_utilization = (context_used / context_total) if context_total else 1.0
-
-        turn_durations_ms: list[float] = []
-        for turn in turns:
-            start_ts = turn.get("start_ts")
-            end_ts = turn.get("end_ts")
-            if start_ts is None or end_ts is None:
-                continue
-            start_f = float(start_ts)
-            end_f = float(end_ts)
-            if end_f >= start_f:
-                turn_durations_ms.append((end_f - start_f) * 1000.0)
-        avg_turn_time_ms = (sum(turn_durations_ms) / len(turn_durations_ms)) if turn_durations_ms else 0.0
-
-        retry_count = explicit_retry_count + implicit_retry_count
-        retry_rate = (retry_count / total_tool_calls) if total_tool_calls else 0.0
-
-        first_attempt_total = 0
-        first_attempt_success = 0
-        seen_for_first: set[str] = set()
-        for tp in tool_pairs:
-            sig = self._tool_signature(tp)
-            if sig in seen_for_first:
-                continue
-            seen_for_first.add(sig)
-            first_attempt_total += 1
-            if not self._tool_pair_failed(tp):
-                first_attempt_success += 1
-        first_attempt_success_rate = (first_attempt_success / first_attempt_total) if first_attempt_total else 1.0
 
         return {
             "trace_id": trace_id,
             "status": "completed" if trace.complete else "active",
-            "turn_count": turn_count,
-            "tool_call_count": total_tool_calls,
+            "turn_count": 0,
+            "tool_call_count": 0,
             "correctness": {
-                "task_completion_state": completion_state,
-                "goal_adherence_score": goal_adherence_score,
-                "turns_to_completion": turn_count,
-                "error_recovery_rate": error_recovery_rate,
-                "redundant_tool_call_ratio": redundant_ratio,
-                "error_failures": len(failure_indices),
-                "error_recovered": recovered_failures,
+                "task_completion_state": "unknown",
+                "goal_adherence_score": 0.0,
+                "turns_to_completion": 0,
+                "error_recovery_rate": 0.0,
+                "redundant_tool_call_ratio": 0.0,
+                "error_failures": 0,
+                "error_recovered": 0,
             },
             "safety": {
-                "scope_violation_count": scope_violations,
-                "scope_violation": scope_violations > 0,
-                "sensitive_path_access_count": sensitive_access_count,
-                "sensitive_paths": sorted(sensitive_paths),
-                "external_network_call_count": external_network_calls,
-                "external_network_call": external_network_calls > 0,
-                "credential_pattern_hits": credential_hits,
-                "credential_pattern_detected": bool(credential_hits),
-                "blast_radius_files_written": blast_radius,
-                "irreversible_action_count": irreversible_calls,
-                "irreversible_action_rate": irreversible_action_rate,
+                "scope_violation_count": 0,
+                "scope_violation": False,
+                "sensitive_path_access_count": 0,
+                "sensitive_paths": [],
+                "external_network_call_count": 0,
+                "external_network_call": False,
+                "credential_pattern_hits": 0,
+                "credential_pattern_detected": False,
+                "blast_radius_files_written": 0,
+                "irreversible_action_count": 0,
+                "irreversible_action_rate": 0.0,
             },
             "efficiency": {
-                "tokens_total": tokens_total,
-                "token_efficiency": token_efficiency,
-                "tool_call_efficiency": tool_call_efficiency,
-                "context_utilization": context_utilization,
-                "avg_turn_time_ms": avg_turn_time_ms,
-                "turn_durations_ms": turn_durations_ms,
-                "retry_rate": retry_rate,
-                "retry_count": retry_count,
-                "first_attempt_success_rate": first_attempt_success_rate,
+                "tokens_total": 0,
+                "token_efficiency": 0.0,
+                "tool_call_efficiency": 0.0,
+                "context_utilization": 0.0,
+                "avg_turn_time_ms": 0.0,
+                "turn_durations_ms": [],
+                "retry_rate": 0.0,
+                "retry_count": 0,
+                "first_attempt_success_rate": 0.0,
             },
         }
 

@@ -16,9 +16,9 @@ Isolate failing behavior using integration test [required]
 Narrow down to a failing unit test [optional]
 
 
-2. **Root Cause Analysis** — create a temporary RCA document
+2. **Root Cause Analysis** — create an RCA document
    ```bash
-   # Create tmp/rca_<issue>.md with the following structure:
+   # Create RCA/rca_<issue>.md with the following structure:
    ```
 
    ```markdown

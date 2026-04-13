@@ -6,7 +6,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
 use clap::Parser;
-use futures_util::TryStreamExt;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -300,12 +299,29 @@ async fn handle(
         .unwrap_or(false);
 
     if is_event_stream {
+        // Buffer SSE payload so replay parsers can recover streamed tool-call data.
+        let resp_body = match upstream_resp.bytes().await {
+            Ok(v) => v,
+            Err(e) => {
+                return (StatusCode::BAD_GATEWAY, format!("failed to read upstream streaming response body: {}", e)).into_response();
+            }
+        };
         let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(0);
+        let resp_text = String::from_utf8_lossy(&resp_body).to_string();
+        let mut resp_body_json = parse_json_or_raw(&resp_text);
+
+        if let Some(obj) = resp_body_json.as_object_mut() {
+            obj.entry("_streamed").or_insert_with(|| json!(true));
+            if !obj.contains_key("_raw") {
+                obj.insert("_raw".to_string(), json!(resp_text));
+            }
+        }
+
         if should_capture {
-            let model = req_record
-                .get("request_body")
-                .and_then(|v| v.get("model"))
+            let model = resp_body_json
+                .get("model")
                 .and_then(|v| v.as_str())
+                .or_else(|| req_record.get("request_body").and_then(|v| v.get("model")).and_then(|v| v.as_str()))
                 .unwrap_or("");
             let resp_record = json!({
                 "ts": now_ts(),
@@ -317,10 +333,7 @@ async fn handle(
                 "model": model,
                 "duration_ms": duration_ms,
                 "request_body": req_record.get("request_body").cloned().unwrap_or_else(|| json!({})),
-                "response_body": {
-                    "_streamed": true,
-                    "_note": "event-stream passthrough; body not buffered"
-                },
+                "response_body": resp_body_json,
             });
 
             if let Err(e) = write_record(&state, &req_record).await {
@@ -331,13 +344,10 @@ async fn handle(
             }
         }
 
-        let stream = upstream_resp.bytes_stream().map_err(std::io::Error::other);
         let mut resp = Response::builder().status(status);
         let headers = resp.headers_mut().expect("response headers available");
         copy_resp_headers(&resp_headers, headers);
-        return resp
-            .body(Body::from_stream(stream))
-            .expect("valid streaming response body");
+        return resp.body(Body::from(resp_body)).expect("valid response body");
     }
 
     let resp_body = match upstream_resp.bytes().await {

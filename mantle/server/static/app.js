@@ -883,6 +883,13 @@ function buildReplayToolSourceIndex(turnDetailPayload) {
 }
 
 function findReplaySourceForValue(value) {
+  if (value && typeof value === "object" && value.source && typeof value.source === "object") {
+    const pid = Number(value.source.pid || 0);
+    if (pid > 0) {
+      return value.source;
+    }
+  }
+
   const callId = extractToolCallIdFromValue(value);
   if (callId && replaySourceByToolCallId.has(callId)) {
     return replaySourceByToolCallId.get(callId);
@@ -1500,11 +1507,12 @@ function replayValueBlock(value, options = {}) {
 
 function replaySectionCard(section, turnId, options = {}) {
   const values = Array.isArray(section.values) ? section.values : [];
-  const isToolOutput = String(section.style || "") === "tool_output";
+  const style = String(section.style || "");
+  const showSource = style === "tool_output" || style === "tool_call";
   const sneakLines = Number(options.sneakLines || 0);
   const openByDefault = Boolean(options.openByDefault);
   const blocks = values.map((v) => {
-    if (!isToolOutput) {
+    if (!showSource) {
       return replayValueBlock(v, { sneakLines });
     }
     const source = findReplaySourceForValue(v);

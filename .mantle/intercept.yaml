@@ -37,5 +37,9 @@ network:
     action: allow
   - destination: "127.0.0.1:*"
     action: allow
+  - destination: "*github.com*"
+    action: ask
+  - destination: "140.82.*:443"
+    action: ask
   - destination: "*"
     action: notify

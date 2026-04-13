@@ -18,3 +18,8 @@
 {"id": "15374026852086604471", "decision": "allow", "trace_id": "bash_20260406_012840"}
 {"id":"18182505923003194388","decision":"allow","trace_id":"bash_20260406_013931"}
 {"id": "400521146552284672", "decision": "allow", "trace_id": "codex_20260406_014502.ebpf.jsonl"}
+{"id": "14113630221605110651", "decision": "allow", "trace_id": "python_20260406_134304.ebpf.jsonl"}
+{"id": "3575113367261038401", "decision": "deny", "trace_id": "python_20260406_134410.ebpf.jsonl"}
+{"id": "3575113367261038568", "decision": "deny", "trace_id": "python_20260406_134410.ebpf.jsonl"}
+{"id": "3575113367261038681", "decision": "deny", "trace_id": "python_20260406_134410.ebpf.jsonl"}
+{"id": "11846128740137304821", "decision": "allow", "trace_id": "python_20260406_141710.ebpf.jsonl"}

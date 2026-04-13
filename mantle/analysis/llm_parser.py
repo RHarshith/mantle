@@ -419,15 +419,18 @@ def extract_tool_calls_compact(raw_calls: Any) -> list[dict[str, Any]]:
         for call in raw_calls:
             if not isinstance(call, dict):
                 continue
+            call_type = str(call.get("type") or "")
+            if call_type and call_type not in {"function", "function_call", "custom_tool_call", "tool_call"}:
+                continue
             fn = call.get("function") if isinstance(call.get("function"), dict) else {}
-            call_id = str(call.get("id") or call.get("call_id") or "")
+            call_id = str(call.get("call_id") or call.get("id") or "")
             name = str((fn.get("name") if isinstance(fn, dict) else "") or call.get("name") or "")
             arguments = (fn.get("arguments") if isinstance(fn, dict) else None)
             if arguments is None:
                 arguments = call.get("arguments")
             if arguments is None:
                 arguments = call.get("input")
-            _append_call(call_id, name, str(call.get("type") or ""), arguments)
+            _append_call(call_id, name, call_type, arguments)
         return out
 
     if isinstance(raw_calls, dict):
@@ -849,6 +852,7 @@ def parse_llm_calls_from_mitm(trace: Any, llm_api_schemas: list[dict[str, Any]])
                         "ts": ts,
                         "url": url,
                         "schema_id": schema_match.get("id"),
+                        "request_previous_response_id": str(req_body.get("previous_response_id") or ""),
                         "prompt_sections": prompt_sections,
                         "prompt_text": sections_to_text(prompt_sections),
                         "replay_context_sections": section_values(

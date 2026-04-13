@@ -27,6 +27,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+AGENT_CWD="${MANTLE_AGENT_CWD:-$PWD}"
+if [[ ! -d "$AGENT_CWD" ]]; then
+    echo "Error: MANTLE_AGENT_CWD does not exist or is not a directory: $AGENT_CWD" >&2
+    exit 1
+fi
 OBS_ROOT_DEFAULT="$SCRIPT_DIR/obs"
 OBS_ROOT_ENV="${AGENT_OBS_ROOT:-}"
 OBS_ROOT="$OBS_ROOT_DEFAULT"
@@ -89,6 +94,12 @@ ROOT_PID_FILE="$OBS_ROOT/mitm/${TRACE_BASENAME}.root.pid"
 PID_WRAPPER_SCRIPT=""
 EVENTS_FILE="$OBS_ROOT/events/${TRACE_BASENAME}.events.jsonl"
 
+# The intercept monitor may run as root while the agent command runs as
+# the invoking user. Pre-create the events file with shared write access
+# so both processes can append observability records.
+touch "$EVENTS_FILE"
+chmod 0666 "$EVENTS_FILE"
+
 MITM_CAPTURE_BIN="${MANTLE_CAPTURE_MITM_BIN:-$SCRIPT_DIR/mantle/capture/rust/target/release/mantle_capture_mitm_proxy}"
 EBPF_CAPTURE_BIN="${MANTLE_CAPTURE_EBPF_BIN:-$SCRIPT_DIR/mantle/capture/rust/target/release/mantle_capture_ebpf}"
 INTERCEPT_MONITOR_BIN="${MANTLE_INTERCEPT_MONITOR_BIN:-$SCRIPT_DIR/mantle/capture/rust/target/release/mantle_intercept_monitor}"
@@ -129,9 +140,19 @@ if [[ "$(basename "$AGENT_BIN_PATH")" == "codex" ]]; then
         echo "Error: OPENAI_API_KEY is not set in environment." >&2
         exit 1
     fi
-    if ! printf '%s' "$OPENAI_API_KEY" | codex login --with-api-key >/dev/null 2>&1; then
-        echo "Error: failed to initialize Codex auth from OPENAI_API_KEY." >&2
-        exit 1
+
+    # Keep codex auth material in the same user context as the watched process.
+    if [[ "$(id -u)" -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+        codex_login_env="OPENAI_API_KEY,XDG_CONFIG_HOME,XDG_STATE_HOME,XDG_CACHE_HOME,XDG_DATA_HOME,XDG_RUNTIME_DIR,DBUS_SESSION_BUS_ADDRESS,PATH"
+        if ! printf '%s' "$OPENAI_API_KEY" | sudo -u "$SUDO_USER" --preserve-env="$codex_login_env" -- codex login --with-api-key >/dev/null 2>&1; then
+            echo "Error: failed to initialize Codex auth from OPENAI_API_KEY for user '$SUDO_USER'." >&2
+            exit 1
+        fi
+    else
+        if ! printf '%s' "$OPENAI_API_KEY" | codex login --with-api-key >/dev/null 2>&1; then
+            echo "Error: failed to initialize Codex auth from OPENAI_API_KEY." >&2
+            exit 1
+        fi
     fi
 fi
 
@@ -149,7 +170,7 @@ echo "  eBPF file:   $EBPF_FILE"
 echo "═══════════════════════════════════════════════════════════"
 
 UPSTREAM_BASE="${MANTLE_FORCE_OPENAI_BASE:-${OPENAI_BASE_URL:-https://api.openai.com}}"
-if [[ -z "${MANTLE_FORCE_OPENAI_BASE:-}" && -z "${OPENAI_BASE_URL:-}" && -n "${OAK1:-}" ]]; then
+if [[ "$(basename "$AGENT_BIN_PATH")" != "codex" && -z "${MANTLE_FORCE_OPENAI_BASE:-}" && -z "${OPENAI_BASE_URL:-}" && -n "${OAK1:-}" ]]; then
     UPSTREAM_BASE="https://chat-api.tamu.ai/api"
 fi
 
@@ -164,9 +185,13 @@ kill -0 "$MITM_PID" 2>/dev/null || { echo "Error: Rust MITM proxy failed to star
 echo "[*] Rust MITM proxy started (PID $MITM_PID)"
 
 # Route OpenAI-compatible clients through local Rust reverse endpoint.
-export OPENAI_API_BASE="http://127.0.0.1:$MITM_REV_PORT/v1"
-export OPENAI_BASE_URL="http://127.0.0.1:$MITM_REV_PORT/v1"
-echo "[*] Forced OPENAI_BASE_URL/OPENAI_API_BASE to Rust reverse endpoint"
+if [[ "$(basename "$AGENT_BIN_PATH")" == "copilot" ]]; then
+    echo "[*] Skipping forced OPENAI_BASE_URL/OPENAI_API_BASE for Copilot CLI"
+else
+    export OPENAI_API_BASE="http://127.0.0.1:$MITM_REV_PORT/v1"
+    export OPENAI_BASE_URL="http://127.0.0.1:$MITM_REV_PORT/v1"
+    echo "[*] Forced OPENAI_BASE_URL/OPENAI_API_BASE to Rust reverse endpoint"
+fi
 
 cleanup() {
     echo ""
@@ -182,6 +207,20 @@ cleanup() {
 trap cleanup EXIT
 
 AGENT_ARGS=("${TASK[@]}")
+AGENT_LAUNCH=("$AGENT_BIN_PATH" "${AGENT_ARGS[@]}")
+
+export MANTLE_AGENT_CWD="$AGENT_CWD"
+export PWD="$AGENT_CWD"
+
+# When launched via `sudo` from bin/mantle, keep monitor/capture root-owned
+# but execute the actual agent command as the invoking user so user-scoped
+# credentials (for example Copilot auth) remain available.
+if [[ "$(id -u)" -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    SUDO_BIN="$(command -v sudo)"
+    agent_preserve_env="HOME,PATH,USER,LOGNAME,PWD,MANTLE_AGENT_CWD,LANG,LC_ALL,LC_CTYPE,XDG_CONFIG_HOME,XDG_STATE_HOME,XDG_CACHE_HOME,XDG_DATA_HOME,XDG_RUNTIME_DIR,DBUS_SESSION_BUS_ADDRESS,GITHUB_TOKEN,GH_TOKEN,GITHUB_COPILOT_TOKEN,COPILOT_TOKEN,OPENAI_API_KEY,OAK1,OPENAI_BASE_URL,OPENAI_API_BASE,OPENAI_MODEL,RTRACE_FORCE_OPENAI_BASE,MANTLE_FORCE_OPENAI_BASE,AGENT_TRACE_ID,AGENT_OBS_ROOT,AGENT_OBS_ENABLED"
+    AGENT_LAUNCH=("$SUDO_BIN" -u "$SUDO_USER" --preserve-env="$agent_preserve_env" -- "$AGENT_BIN_PATH" "${AGENT_ARGS[@]}")
+fi
+
 make_pid_wrapper() {
     local wrapper
     wrapper="$(mktemp /tmp/mantle-agent-launch.XXXXXX.sh)"
@@ -189,6 +228,7 @@ make_pid_wrapper() {
         echo "#!/usr/bin/env bash"
         echo "set -euo pipefail"
         echo "echo \"\$\$\" > $(printf '%q' "$ROOT_PID_FILE")"
+        echo "cd $(printf '%q' "$AGENT_CWD")"
         printf "exec "
         printf "%q " "$INTERCEPT_MONITOR_BIN"
         printf -- "--policy-file %q " "$INTERCEPT_POLICY_FILE"
@@ -196,8 +236,8 @@ make_pid_wrapper() {
         printf -- "--events-file %q " "$EVENTS_FILE"
         printf -- "--ask-decisions-file %q " "$INTERCEPT_DECISIONS_FILE"
         printf -- "--ask-current-dir %q " "$INTERCEPT_DECISION_CURRENT_DIR"
-        printf -- "-- %q " "$AGENT_BIN_PATH"
-        printf "%q " "${AGENT_ARGS[@]}"
+        printf -- "-- "
+        printf "%q " "${AGENT_LAUNCH[@]}"
         echo
     } > "$wrapper"
     chmod 700 "$wrapper"
@@ -205,16 +245,69 @@ make_pid_wrapper() {
 }
 make_pid_wrapper
 
+seed_copilot_mitm_from_logs_if_empty() {
+    if [[ "$(basename "$AGENT_BIN_PATH")" != "copilot" ]]; then
+        return 0
+    fi
+    if [[ ! -f "$MITM_JSONL" ]]; then
+        return 0
+    fi
+    if [[ $(wc -l < "$MITM_JSONL" 2>/dev/null || echo 0) -gt 0 ]]; then
+        return 0
+    fi
+
+    local user_home logs_dir latest_log model_name
+    user_home="$HOME"
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+        user_home="$(getent passwd "$SUDO_USER" | cut -d: -f6 || true)"
+    fi
+    if [[ -z "$user_home" ]]; then
+        user_home="$HOME"
+    fi
+
+    logs_dir="$user_home/.copilot/logs"
+    if [[ ! -d "$logs_dir" ]]; then
+        return 0
+    fi
+
+    latest_log="$(find "$logs_dir" -maxdepth 1 -type f -name 'process-*.log' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2-)"
+    if [[ -z "$latest_log" || ! -f "$latest_log" ]]; then
+        return 0
+    fi
+
+    model_name="${OPENAI_MODEL:-gpt-4.1}"
+    local added=0
+
+    while IFS= read -r line; do
+        [[ "$line" == *"Sending request to the AI model"* ]] || continue
+
+        local iso_ts epoch_ts
+        iso_ts="${line%% *}"
+        epoch_ts="$(date -d "$iso_ts" +%s.%3N 2>/dev/null || true)"
+        if [[ -z "$epoch_ts" ]]; then
+            epoch_ts="$(date +%s.%3N)"
+        fi
+
+        printf '{"ts": %s, "direction": "response", "url": "https://api.individual.githubcopilot.com/v1/chat/completions", "method": "POST", "status_code": 200, "duration_ms": 0, "model": "%s", "request_body": {"model": "%s", "messages": [{"role": "user", "content": "[copilot-log-fallback]"}]}, "response_body": {"id": "copilot-fallback", "object": "chat.completion", "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "[copilot-log-fallback]"}}]}}\n' "$epoch_ts" "$model_name" "$model_name" >> "$MITM_JSONL"
+        added=$((added + 1))
+    done < "$latest_log"
+
+    if [[ "$added" -gt 0 ]]; then
+        echo "[*] Seeded MITM log from Copilot runtime log fallback ($added synthetic calls)"
+    fi
+}
+
 if ! $ENABLE_EBPF; then
     echo "[*] Running $AGENT_BIN interactively (eBPF disabled to preserve TTY)..."
     "$PID_WRAPPER_SCRIPT"
+    seed_copilot_mitm_from_logs_if_empty
     echo "[*] $AGENT_BIN finished."
     exit 0
 fi
 
 CAPTURE_CMD=("$PID_WRAPPER_SCRIPT")
 if $USE_PTY_WRAPPER; then
-    printf -v PTY_AGENT_CMD '%q ' "$AGENT_BIN_PATH" "${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}"
+    printf -v PTY_AGENT_CMD '%q ' "${AGENT_LAUNCH[@]}"
     CAPTURE_CMD=(script -qefc "$PTY_AGENT_CMD" /dev/null)
     echo "[*] Interactive PTY wrapper enabled for eBPF capture."
 fi
@@ -226,5 +319,6 @@ fi
 
 echo "[*] Running $AGENT_BIN with eBPF capture..."
 "$EBPF_CAPTURE_BIN" --output "$EBPF_FILE" -- "${CAPTURE_CMD[@]}"
+seed_copilot_mitm_from_logs_if_empty
 
 echo "[*] $AGENT_BIN finished."
