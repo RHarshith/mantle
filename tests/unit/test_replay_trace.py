@@ -81,6 +81,29 @@ class TestBuildReplayTurnDetail:
         assert len(result["context"]["sections"]) == 1
         assert len(result["action"]["sections"]) == 1
 
+    def test_adds_assistant_text_when_action_sections_have_no_assistant(self):
+        turn = {
+            "turn_id": "turn_2",
+            "label": "Turn 2",
+            "response_text": "Wrote today's date to temp.txt.",
+            "replay_context_sections": [],
+            # Real traces can have usage-only action sections from MITM parsing.
+            "replay_action_sections": [
+                {"id": "usage", "label": "Usage", "values": [{"prompt_tokens": 10, "completion_tokens": 5}]},
+            ],
+            "response_sections": [
+                {"id": "usage", "label": "Usage", "values": [{"prompt_tokens": 10, "completion_tokens": 5}]},
+            ],
+        }
+
+        result = build_replay_turn_detail("trace_001", turn)
+        action_sections = result["action"]["sections"]
+        assistant_sections = [
+            s for s in action_sections if str(s.get("id") or "") in {"assistant_text", "assistant_messages", "response"}
+        ]
+        assert assistant_sections
+        assert "Wrote today's date to temp.txt." in assistant_sections[0].get("values", [])
+
 
 @pytest.mark.unit
 class TestAttachReplaySections:

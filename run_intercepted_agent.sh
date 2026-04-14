@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────
-# Run codex (or any external agent) with mitmproxy API interception
+# Run an external agent with mitmproxy API interception
 # and optional eBPF syscall tracing.
 #
 # Uses iptables transparent redirect to force ALL HTTPS traffic
@@ -10,20 +10,20 @@
 # Requires: root, iptables, mitmproxy, mitmproxyuser system account
 #
 # Usage:
-#   ./run_intercepted_codex.sh "List files in the home directory"
-#   ./run_intercepted_codex.sh                    # interactive (no task)
-#   ./run_intercepted_codex.sh --agent "aider" "Fix the bug"
+#   ./run_intercepted_agent.sh "List files in the home directory"
+#   ./run_intercepted_agent.sh                    # interactive (no task)
+#   ./run_intercepted_agent.sh --agent "aider" "Fix the bug"
 # ─────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 TRACE_ID=""
 MITM_PORT=8899
 MITM_REV_PORT=8898
-AGENT_BIN="codex"
+AGENT_BIN="aider"
 TASK=()
 MITM_USER="mitmproxyuser"
 INTERCEPT_MODE="${MANTLE_INTERCEPT_MODE:-${RTRACE_INTERCEPT_MODE:-proxy}}"
-AGENT_TAG="codex"
+AGENT_TAG="agent"
 ENABLE_EBPF=true
 INTERACTIVE_EBPF=false
 USE_PTY_WRAPPER=false
@@ -192,18 +192,8 @@ fi
 command -v "$AGENT_BIN" >/dev/null 2>&1 || { echo "Error: '$AGENT_BIN' not found in PATH" >&2; exit 1; }
 AGENT_BIN_PATH="$(command -v "$AGENT_BIN")"
 
-# Ensure Codex auth is initialized from current environment key for this run.
-if [[ "$(basename "$AGENT_BIN_PATH")" == "codex" ]]; then
-    if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-        echo "Error: OPENAI_API_KEY is not set in container environment." >&2
-        echo "Export OPENAI_API_KEY on host and recreate container, then retry." >&2
-        exit 1
-    fi
-    if ! printf '%s' "$OPENAI_API_KEY" | codex login --with-api-key >/dev/null 2>&1; then
-        echo "Error: failed to initialize Codex auth from OPENAI_API_KEY." >&2
-        echo "Verify your key and retry." >&2
-        exit 1
-    fi
+if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+    echo "[*] OPENAI_API_KEY is not set. External agents that require API access may fail." >&2
 fi
 
 if [[ "$INTERCEPT_MODE" != "proxy" && "$INTERCEPT_MODE" != "transparent" ]]; then
@@ -266,7 +256,7 @@ if [[ "$INTERCEPT_MODE" == "transparent" ]]; then
     kill -0 "$MITM_PID" 2>/dev/null || { echo "Error: mitmdump failed to start" >&2; exit 1; }
     echo "[*] mitmdump started as $MITM_USER (PID $MITM_PID)"
 else
-    # Stable default for containerized codex: explicit proxy mode.
+    # Stable default for intercepted agent runs: explicit proxy mode.
     "${MITMDUMP_LAUNCH[@]}" \
         -p "$MITM_PORT" \
         --ssl-insecure \
@@ -340,7 +330,7 @@ export REQUESTS_CA_BUNDLE="$COMBINED_CA"
 export NODE_EXTRA_CA_CERTS="$COMBINED_CA"
 export NODE_TLS_REJECT_UNAUTHORIZED=0
 
-# Newer Codex versions may drop auth headers for plaintext http base URLs.
+# Some agent runtimes may drop auth headers for plaintext http base URLs.
 # Transparent iptables interception is sufficient, so do NOT override base URL
 # by default. Allow opt-in for debugging compatibility.
 if [[ "${MANTLE_FORCE_OPENAI_BASE:-${RTRACE_FORCE_OPENAI_BASE:-0}}" == "1" ]]; then

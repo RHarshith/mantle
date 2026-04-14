@@ -28,9 +28,9 @@ Commands:
 
 Examples:
   mantle serve --host 0.0.0.0 --port 8099
-  mantle watch codex
-    mantle watch codex exec "inspect this repo and summarize"
-    mantle watch --mode transparent codex --sandbox danger-full-access exec "trace network behavior"
+    mantle watch aider
+        mantle watch aider "inspect this repo and summarize"
+        mantle watch --mode transparent aider "trace network behavior"
   mantle watch aider "fix failing tests"
 EOF
 }
@@ -39,11 +39,7 @@ serve_cmd() {
     local host port obs_root python_bin
     local cli_obs_root repo_obs_root env_obs_root env_score repo_score
 
-    if [[ -f "/.dockerenv" ]]; then
-        host="0.0.0.0"
-    else
-        host="127.0.0.1"
-    fi
+    host="127.0.0.1"
     port="8099"
     cli_obs_root=""
     repo_obs_root="$REPO_ROOT/obs"
@@ -123,7 +119,7 @@ watch_cmd() {
     local runner executable resolved_executable preserve_env
     local -a runner_args passthrough task_args
 
-    runner="$REPO_ROOT/run_intercepted_codex.sh"
+    runner="$REPO_ROOT/run_intercepted_agent.sh"
     if [[ ! -x "$runner" ]]; then
         echo "Error: $runner not found or not executable." >&2
         exit 1
@@ -164,7 +160,7 @@ watch_cmd() {
     done
 
     if [[ $# -lt 1 ]]; then
-        echo "Error: 'watch' requires an executable (for example: codex)." >&2
+        echo "Error: 'watch' requires an executable (for example: aider)." >&2
         usage
         exit 1
     fi

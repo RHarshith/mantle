@@ -26,7 +26,7 @@ install_if_missing() {
 
     if ! command_exists apt-get; then
         echo "[setup] Missing required binary '$bin' and apt-get is unavailable." >&2
-        echo "[setup] Run this scenario in the Ubuntu Docker container, or preinstall '$pkg'." >&2
+        echo "[setup] Preinstall '$pkg' to run this scenario on this host." >&2
         exit 1
     fi
 

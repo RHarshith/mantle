@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ENV_DIR="/root/.config/mantle/agent-env"
-ENV_FILE="$ENV_DIR/codex.env"
+ENV_FILE="$ENV_DIR/openai.env"
 BASHRC="/root/.bashrc"
 MARKER_START="# >>> mantle-agent-env >>>"
 MARKER_END="# <<< mantle-agent-env <<<"
@@ -16,18 +16,9 @@ export OPENAI_API_KEY='${OPENAI_API_KEY}'
 EOF
     chmod 600 "$ENV_FILE"
 
-    # Initialize Codex CLI auth store so it works in non-interactive runs.
-    if command -v codex >/dev/null 2>&1; then
-        if printf '%s' "$OPENAI_API_KEY" | codex login --with-api-key >/dev/null 2>&1; then
-            echo "[codex-setup] Codex login initialized from OPENAI_API_KEY."
-        else
-            echo "[codex-setup] Warning: codex login initialization failed (env file still written)."
-        fi
-    fi
-
-    echo "[codex-setup] OPENAI_API_KEY synced to container runtime env file."
+    echo "[agent-env-setup] OPENAI_API_KEY synced to runtime env file."
 else
-    echo "[codex-setup] OPENAI_API_KEY not present in environment; skipping key sync."
+    echo "[agent-env-setup] OPENAI_API_KEY not present in environment; skipping key sync."
 fi
 
 if [[ -f "$BASHRC" ]]; then

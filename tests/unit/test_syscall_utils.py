@@ -151,9 +151,9 @@ class TestParseSocketAddress:
         assert result["endpoint"] == "10.0.0.1:443"
 
     def test_unix_socket(self):
-        result = parse_socket_address('sun_path="/var/run/docker.sock"')
+        result = parse_socket_address('sun_path="/var/run/service.sock"')
         assert result["host"] == "unix"
-        assert result["endpoint"] == "unix:/var/run/docker.sock"
+        assert result["endpoint"] == "unix:/var/run/service.sock"
 
     def test_unknown_format(self):
         result = parse_socket_address("garbage")

@@ -166,6 +166,15 @@ def turn_detail(trace_id: str, turn_id: str) -> dict[str, Any]:
 		raise HTTPException(status_code=404, detail="Trace turn not found")
 
 
+@app.get("/api/traces/{trace_id}/turns/{turn_id}/raw-events")
+def turn_raw_events(trace_id: str, turn_id: str) -> dict[str, Any]:
+	"""Return raw capture events in the selected turn timestamp range."""
+	try:
+		return store.raw_events_for_turn(trace_id, turn_id)
+	except KeyError:
+		raise HTTPException(status_code=404, detail="Trace turn not found")
+
+
 @app.get("/api/traces/{trace_id}/replay-turns/{turn_id}")
 def replay_turn_detail(trace_id: str, turn_id: str) -> dict[str, Any]:
 	"""Return structured context/action panes for one replay turn."""

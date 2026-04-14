@@ -486,9 +486,21 @@ def main() -> None:
         help="Show agent step logs (API calls, tool calls, and response flow).",
     )
     parser.add_argument(
-        "--auto",
+        "--manual",
         action="store_true",
-        help="Auto-approve all tool calls (no manual approval prompts).",
+        help="Require manual approval for each tool call.",
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Run interactive REPL mode.",
+    )
+    parser.add_argument(
+        "--mock",
+        nargs="?",
+        const="http://127.0.0.1:4010/v1",
+        default=None,
+        help="Use local mock LLM server base URL (default: http://127.0.0.1:4010/v1).",
     )
     parser.add_argument(
         "--task",
@@ -498,12 +510,17 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    api_key = os.getenv("OAK1")
-    base_url = os.getenv("OPENAI_BASE_URL", "https://chat-api.tamu.ai/api")
     model = os.getenv("OPENAI_MODEL", "protected.gpt-5.2")
-
-    if not api_key:
-        raise RuntimeError("Missing OAK1 environment variable.")
+    if args.mock:
+        api_key = os.getenv("OAK1", "mock-key")
+        base_url = args.mock
+        if model == "protected.gpt-5.2":
+            model = "mock-model"
+    else:
+        api_key = os.getenv("OAK1")
+        base_url = os.getenv("OPENAI_BASE_URL", "https://chat-api.tamu.ai/api")
+        if not api_key:
+            raise RuntimeError("Missing OAK1 environment variable.")
 
     client = OpenAI(api_key=api_key, base_url=base_url)
     sink = build_event_sink()
@@ -511,14 +528,20 @@ def main() -> None:
     messages = []
     shared_globals = {"__builtins__": __builtins__}
     verbose = args.verbose or os.getenv("AGENT_VERBOSE", "").strip().lower() in {"1", "true", "yes", "on"}
-    auto_approve = args.auto or os.getenv("AGENT_AUTO_APPROVE", "").strip().lower() in {"1", "true", "yes", "on"}
+    auto_approve = True
+    env_auto = os.getenv("AGENT_AUTO_APPROVE", "").strip().lower()
+    if env_auto in {"0", "false", "no", "off"}:
+        auto_approve = False
+    elif env_auto in {"1", "true", "yes", "on"}:
+        auto_approve = True
+    if args.manual:
+        auto_approve = False
 
     cli_prompt = " ".join(args.prompt).strip()
     task_prompt = args.task
 
-    if task_prompt:
-        # Task mode is non-interactive automation; always bypass approval prompts.
-        auto_approve = True
+    if args.interactive and (cli_prompt or task_prompt):
+        raise RuntimeError("--interactive cannot be combined with prompt text or --task")
 
     # ── Automated task mode ──────────────────────────────────────
     if task_prompt:
@@ -580,6 +603,9 @@ def main() -> None:
         sink.close()
         log_event(verbose, "assistant response already printed")
         return
+
+    if not args.interactive:
+        raise RuntimeError("No prompt provided. Use '<prompt>'/--task for automated mode, or use --interactive.")
 
     print("CLI agent started. Press Ctrl+C or Ctrl+D to stop.")
     sink.emit(

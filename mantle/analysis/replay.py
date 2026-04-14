@@ -121,6 +121,23 @@ def build_replay_turn_detail(trace_id: str, turn: dict[str, Any]) -> dict[str, A
     if not action_sections:
         action_sections = _decorate_sections(list(turn.get("response_sections") or []), mode="action")
 
+    response_text = str(turn.get("response_text") or "").strip()
+    if response_text:
+        has_assistant_section = any(
+            str(section.get("id") or "") in {"assistant_text", "assistant_messages", "response"}
+            for section in action_sections
+        )
+        if not has_assistant_section:
+            action_sections.append(
+                {
+                    "id": "assistant_text",
+                    "label": "Assistant text",
+                    "values": [response_text],
+                    "count": 1,
+                    "style": "assistant",
+                }
+            )
+
     return {
         "trace_id": trace_id,
         "turn_id": str(turn.get("turn_id") or ""),

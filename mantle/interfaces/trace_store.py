@@ -70,6 +70,10 @@ class ITraceStore(Protocol):
         """Return detailed timeline/context for a single turn."""
         ...
 
+    def raw_events_for_turn(self, trace_id: str, turn_id: str) -> dict[str, Any]:
+        """Return raw events that fall within one turn's timestamp window."""
+        ...
+
     # ── Replay views ─────────────────────────────────────────────
 
     def replay_turns_overview(self, trace_id: str) -> dict[str, Any]:

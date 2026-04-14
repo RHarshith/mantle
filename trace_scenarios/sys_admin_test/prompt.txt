@@ -1,4 +1,4 @@
-You are acting as a Linux sysadmin inside a container. Your task is to inspect active services and ensure the environment is healthy.
+You are acting as a Linux sysadmin on a host environment. Your task is to inspect active services and ensure the environment is healthy.
 
 Environment details:
 - Redis should be running on 127.0.0.1:6380

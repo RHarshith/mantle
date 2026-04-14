@@ -39,6 +39,8 @@ from mantle.analysis.syscall_parser import (
     socket_family,
     socket_transport,
 )
+from mantle.capture.events_model import transform_bpf_record
+from mantle.ingest.sqlite_store import SQLiteTraceStore
 
 try:
     import tiktoken
@@ -130,6 +132,9 @@ class TraceStore:
         self.version = 0
         self._lock = asyncio.Lock()
         self.llm_api_schemas: list[dict[str, Any]] = self._builtin_llm_api_schemas()
+        db_path = trace_dir.parent / "mantle_events.db"
+        schema_path = Path(__file__).with_name("sql") / "schema.sql"
+        self.sqlite_store = SQLiteTraceStore(db_path=db_path, schema_path=schema_path)
 
     def _builtin_llm_api_schemas(self) -> list[dict[str, Any]]:
         """Return builtin LLM API schema definitions."""
@@ -555,8 +560,20 @@ class TraceStore:
                     changed = self._tail_mitm_events(state) or changed
 
         if changed:
+            for state in self.traces.values():
+                self._sync_trace_to_sqlite(state)
             async with self._lock:
                 self.version += 1
+
+    def _sync_trace_to_sqlite(self, state: TraceState) -> None:
+        """Persist the current in-memory trace state to SQLite tables."""
+        turns = self._turns_for_trace(state)
+        self.sqlite_store.replace_trace_payload(
+            trace_id=state.trace_id,
+            sys_events=state.sys_events,
+            agent_events=state.agent_events,
+            turns=turns,
+        )
 
     def _read_new_lines(self, path: Path, start_offset: int) -> tuple[list[str], int]:
         if not path.exists():
@@ -1188,7 +1205,7 @@ class TraceStore:
 
                     canonical_tid = str(tid)
                     if canonical_tid not in start_event_by_id:
-                        # Codex/Responses streams can emit started calls with a
+                        # Streaming response APIs can emit started calls with a
                         # temporary ID when call_id is absent in early chunks.
                         # Reconcile to the most recent unmatched start event.
                         candidates: list[tuple[float, str]] = []
@@ -1301,17 +1318,26 @@ class TraceStore:
             line = line.strip()
             if not line:
                 continue
+            state.trace_line_no += 1
             try:
                 event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"Invalid JSON in BPF trace {state.trace_path} at line {state.trace_line_no}"
+                ) from exc
+            if not isinstance(event, dict):
+                raise RuntimeError(
+                    f"Invalid BPF event object in {state.trace_path} at line {state.trace_line_no}: {type(event).__name__}"
+                )
 
-            state.trace_line_no += 1
-            event_type = str(event.get("type") or "")
+            try:
+                normalized = transform_bpf_record(event, fallback_line_no=state.trace_line_no)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"BPF event transformation failed for {state.trace_path} at line {state.trace_line_no}: {exc}"
+                ) from exc
 
-            normalized = dict(event)
-            normalized["line_no"] = int(normalized.get("line_no") or state.trace_line_no)
-            normalized["ts"] = float(normalized.get("ts") or time.time())
+            event_type = str(normalized.get("type") or "")
             state.sys_events.append(normalized)
             changed = True
 
@@ -2533,7 +2559,7 @@ class TraceStore:
                 "cp", "mv", "rm", "mkdir", "touch", "chmod",
                 "curl", "wget",
                 "npm", "npx", "pip", "pip3",
-                "codex", "codex-linux-sandbox",
+                "agent", "agent-linux-sandbox",
             }:
                 visible_commands.append(cmd)
             elif self._is_user_visible_path(exec_path):
@@ -2758,13 +2784,13 @@ class TraceStore:
         base = Path(exec_path).name.lower() if exec_path else ""
         command = self._normalize_command_text(self._event_command_text(event))
 
-        if base in {"codex", "codex-linux-sandbox", "node"}:
+        if base in {"agent", "agent-linux-sandbox", "node"}:
             return True
-        if "codex-linux-sandbox" in command or "--sandbox-policy" in command:
+        if "agent-linux-sandbox" in command or "--sandbox-policy" in command:
             return True
-        if "/root/.codex/" in command or "shell_snapsho" in command:
+        if "/root/.agent/" in command or "shell_snapsho" in command:
             return True
-        if base in {"bash", "sh", "zsh", "dash"} and "/root/.codex/" in command:
+        if base in {"bash", "sh", "zsh", "dash"} and "/root/.agent/" in command:
             return True
         return False
 
@@ -3964,7 +3990,137 @@ class TraceStore:
             "file_activity": file_activity,
             "subprocesses": subprocesses,
         }
+        call_source_map, text_source_map = self._replay_tool_output_source_maps(trace, turns)
+        self._attach_replay_tool_output_sources(replay_payload, call_source_map, text_source_map)
         return replay_payload
+
+    def _normalize_replay_lookup_text(self, value: Any) -> str:
+        return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+    def _extract_tool_call_id_from_replay_value(self, value: Any) -> str:
+        if isinstance(value, dict):
+            for key in ("tool_call_id", "call_id", "id"):
+                raw = value.get(key)
+                if isinstance(raw, str) and raw.strip():
+                    return raw.strip()
+            return ""
+        if not isinstance(value, str):
+            return ""
+        text = value
+        patterns = [
+            r'"tool_call_id"\s*:\s*"([^"]+)"',
+            r'"call_id"\s*:\s*"([^"]+)"',
+            r"\btool_call_id\s*=\s*([A-Za-z0-9_\-]+)",
+            r"\bcall_id\s*=\s*([A-Za-z0-9_\-]+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match and match.group(1):
+                return str(match.group(1)).strip()
+        return ""
+
+    def _collect_replay_source_texts(self, value: Any, out: set[str], depth: int = 0) -> None:
+        if depth > 4:
+            return
+        if isinstance(value, str):
+            norm = self._normalize_replay_lookup_text(value)
+            if norm:
+                out.add(norm)
+            return
+        if isinstance(value, list):
+            for item in value:
+                self._collect_replay_source_texts(item, out, depth + 1)
+            return
+        if isinstance(value, dict):
+            try:
+                norm = self._normalize_replay_lookup_text(json.dumps(value, ensure_ascii=False, sort_keys=True))
+                if norm:
+                    out.add(norm)
+            except TypeError:
+                pass
+            for item in value.values():
+                self._collect_replay_source_texts(item, out, depth + 1)
+            return
+        norm = self._normalize_replay_lookup_text(value)
+        if norm:
+            out.add(norm)
+
+    def _replay_tool_output_source_maps(
+        self,
+        trace: TraceState,
+        turns: list[dict[str, Any]],
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        call_source_map: dict[str, dict[str, Any]] = {}
+        text_source_map: dict[str, dict[str, Any]] = {}
+
+        for turn in turns:
+            sys_events = list(turn.get("_sys_events") or [])
+            tool_pairs = list(turn.get("_tool_pairs") or [])
+            for pair in self._replay_tool_call_pairs(trace, sys_events, tool_pairs):
+                source = pair.get("source") if isinstance(pair, dict) else None
+                if not isinstance(source, dict):
+                    continue
+                pid = int(source.get("pid") or 0)
+                if pid <= 0:
+                    continue
+
+                canonical_source: dict[str, Any] = {"status": "matched", "pid": pid}
+                matched_by = str(source.get("matched_by") or "").strip()
+                if matched_by:
+                    canonical_source["matched_by"] = matched_by
+
+                tool_call_id = str(pair.get("tool_call_id") or "").strip()
+                if tool_call_id:
+                    call_source_map.setdefault(tool_call_id, canonical_source)
+
+                candidates: set[str] = set()
+                self._collect_replay_source_texts(pair.get("response"), candidates)
+                for text in candidates:
+                    text_source_map.setdefault(text, canonical_source)
+
+        return call_source_map, text_source_map
+
+    def _attach_replay_tool_output_sources(
+        self,
+        replay_payload: dict[str, Any],
+        call_source_map: dict[str, dict[str, Any]],
+        text_source_map: dict[str, dict[str, Any]],
+    ) -> None:
+        context = replay_payload.get("context")
+        if not isinstance(context, dict):
+            return
+        sections = context.get("sections")
+        if not isinstance(sections, list):
+            return
+
+        for section in sections:
+            if not isinstance(section, dict):
+                continue
+            if str(section.get("id") or "") != "tool_outputs":
+                continue
+
+            values = section.get("values") if isinstance(section.get("values"), list) else []
+            sources: list[dict[str, Any]] = []
+            for value in values:
+                source: dict[str, Any] | None = None
+
+                tool_call_id = self._extract_tool_call_id_from_replay_value(value)
+                if tool_call_id:
+                    source = call_source_map.get(tool_call_id)
+
+                if source is None:
+                    norm = self._normalize_replay_lookup_text(value)
+                    if norm:
+                        source = text_source_map.get(norm)
+                        if source is None and len(norm) >= 16:
+                            for candidate, candidate_source in text_source_map.items():
+                                if norm in candidate or candidate in norm:
+                                    source = candidate_source
+                                    break
+
+                sources.append(source if isinstance(source, dict) else {"status": "source_not_found"})
+
+            section["sources"] = sources
 
     def _turn_cutoff_ts(
         self,
@@ -4929,41 +5085,51 @@ class TraceStore:
         return timeline
 
     def turns_overview(self, trace_id: str) -> dict[str, Any]:
-        t = self._get_trace(trace_id)
-        turns = self._turns_for_trace(t)
+        self._get_trace(trace_id)
+        rows = self.sqlite_store.list_turns(trace_id)
 
-        tool_calls_total = sum(int(turn.get("tool_call_count") or 0) for turn in turns)
-        files_read_total = len({
-            str(e.get("path") or "")
-            for turn in turns
-            for e in turn.get("_sys_events", [])
-            if str(e.get("type") or "") == "file_read" and str(e.get("path") or "")
-        })
-        files_written_total = len({
-            str(e.get("path") or "")
-            for turn in turns
-            for e in turn.get("_sys_events", [])
-            if str(e.get("type") or "") in {"file_write", "file_delete", "file_rename"} and str(e.get("path") or "")
-        })
-        network_total = sum(
-            1 for turn in turns for e in turn.get("_sys_events", []) if str(e.get("type") or "") == "net_connect"
-        )
-        subprocess_total = sum(
-            int(turn.get("subprocess_direct_count") or 0)
-            for turn in turns
-        )
+        turn_rows: list[dict[str, Any]] = []
+        tool_calls_total = 0
+        files_read_total = 0
+        files_written_total = 0
+        network_total = 0
+        subprocess_total = 0
 
-        turn_rows = [
-            {
-                "turn_id": turn["turn_id"],
-                "label": turn["label"],
-                "index": turn["index"],
-                "tool_call_count": turn["tool_call_count"],
-                "tags": turn["tags"],
-                "dominant_summary": turn["dominant_summary"],
-            }
-            for turn in turns
-        ]
+        for row in rows:
+            metadata: dict[str, Any] = {}
+            try:
+                parsed = json.loads(str(row["metadata"] or "{}"))
+                if isinstance(parsed, dict):
+                    metadata = parsed
+            except json.JSONDecodeError:
+                metadata = {}
+
+            turn_id = int(row["turn_id"])
+            start_ns = int(row["start_ts_ns"])
+            end_ns = int(row["end_ts_ns"])
+
+            tool_calls = len(self.sqlite_store.tool_calls_for_turn(trace_id, turn_id))
+            tool_calls_total += tool_calls
+            files_read_total += self.sqlite_store.unique_paths_in_window(trace_id, start_ns, end_ns, ["file_read"])
+            files_written_total += self.sqlite_store.unique_paths_in_window(
+                trace_id,
+                start_ns,
+                end_ns,
+                ["file_write", "file_delete", "file_rename"],
+            )
+            network_total += self.sqlite_store.count_event_type_in_window(trace_id, start_ns, end_ns, "net_connect")
+            subprocess_total += self.sqlite_store.count_event_type_in_window(trace_id, start_ns, end_ns, "process_spawn")
+
+            turn_rows.append(
+                {
+                    "turn_id": str(metadata.get("turn_id") or f"turn_{turn_id}"),
+                    "label": str(metadata.get("label") or f"Turn {turn_id}"),
+                    "index": int(metadata.get("index") or turn_id),
+                    "tool_call_count": int(metadata.get("tool_call_count") or tool_calls),
+                    "tags": list(metadata.get("tags") or []),
+                    "dominant_summary": str(metadata.get("dominant_summary") or ""),
+                }
+            )
 
         turn_count = len([r for r in turn_rows if r.get("turn_id") != "setup"])
         return {
@@ -4985,6 +5151,13 @@ class TraceStore:
         match = next((turn for turn in turns if str(turn.get("turn_id")) == turn_id), None)
         if match is None:
             raise KeyError(turn_id)
+
+        sqlite_row = None
+        if turn_id.startswith("turn_"):
+            try:
+                sqlite_row = self.sqlite_store.turn_window(trace_id, int(turn_id.split("_", 1)[1]))
+            except ValueError:
+                sqlite_row = None
 
         sys_events = list(match.get("_sys_events", []))
         tool_pairs = list(match.get("_tool_pairs", []))
@@ -5022,8 +5195,32 @@ class TraceStore:
             "response_sections": match.get("response_sections") or [],
             "pre_tool_counts": match.get("pre_tool_counts") or {},
             "timeline": timeline,
-            "start_ts": match.get("start_ts"),
-            "end_ts": match.get("end_ts"),
+            "start_ts": (int(sqlite_row["start_ts_ns"]) / 1_000_000_000) if sqlite_row else match.get("start_ts"),
+            "end_ts": (int(sqlite_row["end_ts_ns"]) / 1_000_000_000) if sqlite_row else match.get("end_ts"),
+        }
+
+    def raw_events_for_turn(self, trace_id: str, turn_id: str) -> dict[str, Any]:
+        self._get_trace(trace_id)
+        if not turn_id.startswith("turn_"):
+            raise KeyError(turn_id)
+        try:
+            seq = int(turn_id.split("_", 1)[1])
+        except ValueError as exc:
+            raise KeyError(turn_id) from exc
+
+        row = self.sqlite_store.turn_window(trace_id, seq)
+        if row is None:
+            raise KeyError(turn_id)
+
+        start_ns = int(row["start_ts_ns"])
+        end_ns = int(row["end_ts_ns"])
+        events = self.sqlite_store.events_for_window(trace_id, start_ns, end_ns)
+        return {
+            "trace_id": trace_id,
+            "turn_id": turn_id,
+            "start_ts_ns": start_ns,
+            "end_ts_ns": end_ns,
+            "events": events,
         }
 
     def process_subtrace(self, trace_id: str, turn_id: str, pid: int, full_lifecycle: bool = False) -> dict[str, Any]:

@@ -814,6 +814,8 @@ def parse_llm_calls_from_mitm(trace: Any, llm_api_schemas: list[dict[str, Any]])
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(rec, dict):
+                continue
 
             url = str(rec.get("url") or "")
             schema_match: dict[str, Any] | None = None

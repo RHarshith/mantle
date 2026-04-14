@@ -89,30 +89,7 @@ mantle serve --host 0.0.0.0 --port 8099
 Terminal 2 (run and trace an agent command):
 
 ```bash
-mantle watch codex exec "inspect this repository and summarize"
-```
-
-Open `http://127.0.0.1:8099`.
-
-## Docker Workflow
-
-```bash
-git clone <your-repo-url>
-cd mantle
-export OPENAI_API_KEY="<your_key_in_local_shell>"
-docker compose up -d --build
-```
-
-Start dashboard:
-
-```bash
-docker compose exec mantle-lab bash -lc 'mantle serve'
-```
-
-Run traced task:
-
-```bash
-docker compose exec mantle-lab bash -lc 'mantle watch codex exec "count shell scripts and print result"'
+mantle watch python3 -m mantle_agent.cli_agent "inspect this repository and summarize"
 ```
 
 Open `http://127.0.0.1:8099`.
@@ -133,10 +110,10 @@ Open `http://127.0.0.1:8099`.
 Examples:
 
 ```bash
-mantle watch codex
-mantle watch --interactive-ebpf codex
-mantle watch codex exec "summarize this repository"
-mantle watch --mode transparent codex exec "trace outbound API calls"
+mantle watch python3 -m mantle_agent.cli_agent --interactive
+mantle watch --interactive-ebpf python3 -m mantle_agent.cli_agent --interactive
+mantle watch python3 -m mantle_agent.cli_agent "summarize this repository"
+mantle watch --mode transparent python3 -m mantle_agent.cli_agent "trace outbound API calls"
 mantle watch aider "fix failing tests"
 ```
 
@@ -184,7 +161,7 @@ These files are the source of truth for replay, debugging, and analysis.
 │   └── cli_agent.py
 ├── trace_scenarios/
 ├── scripts/
-├── run_intercepted_codex.sh
+├── run_intercepted_agent.sh
 └── obs/
 ```
 
@@ -206,20 +183,20 @@ Compatibility fallback variables (`RTRACE_*`) are supported.
 
 ## Troubleshooting
 
-Dashboard unreachable from host in Docker:
+Dashboard unreachable from host:
 
-- `docker compose ps`
-- `docker compose port mantle-lab 8099`
+- Confirm `mantle serve` is running and bound to the expected host/port.
+- Check local firewall rules and ensure the selected port is available.
 
 No low-level syscall nodes in drilldown:
 
 - Ensure `bpftrace` is installed and runnable as root.
 - Confirm run output prints `eBPF trace: true` (`mantle watch <agent>` prints `false` unless `--interactive-ebpf` is provided).
 
-Codex authentication issues:
+API credential issues:
 
 ```bash
-docker compose exec mantle-lab bash -lc 'printenv OPENAI_API_KEY | codex login --with-api-key && codex login status'
+printenv OPENAI_API_KEY | wc -c
 ```
 
 ## Demo And Portfolio Notes

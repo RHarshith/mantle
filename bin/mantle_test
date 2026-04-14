@@ -7,7 +7,7 @@
 #
 # Example:
 #   mantle_test sys_admin_test
-#   mantle_test sys_admin_test --agent codex
+#   mantle_test sys_admin_test --agent aider
 # ─────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -42,11 +42,11 @@ Arguments:
     scenario_name   Name of the directory under trace_scenarios/ (e.g. sys_admin_test)
 
 Options:
-    --agent <name>  Agent to use: mantle (default) or codex
+    --agent <name>  Agent to use: mantle (default) or any executable available in PATH
 
 Examples:
     mantle_test sys_admin_test
-    mantle_test sys_admin_test --agent codex
+    mantle_test sys_admin_test --agent aider
 EOF
     exit 1
 }
@@ -110,16 +110,16 @@ fi
 PROMPT="$(cat "$PROMPT_FILE")"
 TRACE_ID="${SCENARIO_NAME}_$(date +%Y%m%d_%H%M%S)"
 
-if [[ "$AGENT" == "codex" ]]; then
-    echo "  Running Codex under mantle watch..."
-    "$SCRIPT_DIR/mantle" watch --trace-id "$TRACE_ID" codex exec "$PROMPT"
-else
+if [[ "$AGENT" == "mantle" ]]; then
     echo "  Running mantle agent..."
     AGENT_OBS_ROOT="${AGENT_OBS_ROOT:-$REPO_ROOT/obs}"
     AGENT_OBS_ENABLED=1 \
     AGENT_TRACE_ID="$TRACE_ID" \
     AGENT_AUTO_APPROVE=1 \
     "$VENV_PATH/bin/python" -m mantle_agent.cli_agent "$PROMPT"
+else
+    echo "  Running $AGENT under mantle watch..."
+    "$SCRIPT_DIR/mantle" watch --trace-id "$TRACE_ID" "$AGENT" "$PROMPT"
 fi
 
 echo ""

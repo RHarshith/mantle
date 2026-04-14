@@ -14,7 +14,7 @@ Expected operator flow:
 5. Agent verifies all checks are green.
 
 Files:
-- `prompt.txt`: prompt sent to Codex.
+- `prompt.txt`: prompt sent to the selected agent.
 - `setup.sh`: idempotent bootstrap.
 - `verify.sh`: validates pre-run fault and service readiness.
 - `cleanup.sh`: idempotent teardown.

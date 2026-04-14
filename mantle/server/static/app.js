@@ -1213,14 +1213,18 @@ function replayValueBlock(value, options = {}) {
 
 function replaySectionCard(section, turnId, options = {}) {
   const values = Array.isArray(section.values) ? section.values : [];
+  const sectionSources = Array.isArray(section.sources) ? section.sources : [];
   const isToolOutput = String(section.style || "") === "tool_output";
   const sneakLines = Number(options.sneakLines || 0);
   const openByDefault = Boolean(options.openByDefault);
-  const blocks = values.map((v) => {
+  const blocks = values.map((v, idx) => {
     if (!isToolOutput) {
       return replayValueBlock(v, { sneakLines });
     }
-    const source = findReplaySourceForValue(v);
+    const preferredSource = sectionSources[idx];
+    const source = preferredSource && typeof preferredSource === "object"
+      ? preferredSource
+      : findReplaySourceForValue(v);
     return replayValueBlock(v, { sneakLines, showSource: true, source, turnId });
   }).join("");
   return `
