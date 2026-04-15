@@ -116,6 +116,10 @@ class ITraceStore(Protocol):
         """Return summary metrics and grouped behavior for a trace."""
         ...
 
+    def trace_capture_quality(self, trace_id: str) -> dict[str, Any]:
+        """Return capture confidence and fallback metadata for a trace."""
+        ...
+
     def tool_summary(self, trace_id: str, tool_call_id: str) -> dict[str, Any]:
         """Return summarized insights for one tool call."""
         ...

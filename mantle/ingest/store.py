@@ -987,13 +987,10 @@ class TraceStore:
             status_code = record.get("status_code")
 
             if endpoint:
-                try:
-                    parsed_url = urlparse(str(endpoint))
-                    host = parsed_url.hostname or ""
-                    if host:
-                        port = parsed_url.port or (443 if parsed_url.scheme == "https" else 80)
-                        state.mitm_endpoints.add(f"{host}:{port}")
-                except Exception:
+                endpoint_label = self._endpoint_label_from_url(str(endpoint))
+                if endpoint_label:
+                    state.mitm_endpoints.add(endpoint_label)
+                else:
                     log_exception("Failed parsing MITM endpoint URL")
 
             messages = req_body.get("messages", [])
@@ -1058,16 +1055,12 @@ class TraceStore:
             # between [response_ts - duration, response_ts].  We store these
             # sorted intervals so _with_inferred_net_dest can binary-search.
             if endpoint and ts > 0:
-                try:
-                    pu = urlparse(str(endpoint))
-                    ihost = pu.hostname or ""
-                    if ihost:
-                        iport = pu.port or (443 if pu.scheme == "https" else 80)
-                        dest_label = f"{ihost}:{iport}"
-                        dur_s = (float(duration_ms) / 1000.0) if duration_ms else 5.0
-                        start_ts = ts - dur_s
-                        state.mitm_intervals.append((start_ts, ts, dest_label))
-                except Exception:
+                dest_label = self._endpoint_label_from_url(str(endpoint))
+                if dest_label:
+                    dur_s = (float(duration_ms) / 1000.0) if duration_ms else 5.0
+                    start_ts = ts - dur_s
+                    state.mitm_intervals.append((start_ts, ts, dest_label))
+                else:
                     log_exception("Failed deriving MITM interval from endpoint")
 
             if not intervals_only:
@@ -1434,30 +1427,59 @@ class TraceStore:
             return f"{family} {dest}"
         return dest
 
+    def _endpoint_label_from_url(self, endpoint: str) -> str | None:
+        """Resolve host:port label from URL, returning None for invalid endpoints."""
+        parsed_url = urlparse(str(endpoint))
+        host = parsed_url.hostname or ""
+        if not host:
+            return None
+        try:
+            port = parsed_url.port
+        except ValueError:
+            return None
+        if port is None:
+            port = 443 if parsed_url.scheme == "https" else 80
+        return f"{host}:{port}"
+
     def _with_inferred_net_dest(self, trace: TraceState, event: dict[str, Any]) -> dict[str, Any]:
         enriched = dict(event)
         dest = str(enriched.get("dest") or "")
-        if not trace.mitm_endpoints or enriched.get("inferred_dest"):
+
+        if not str(enriched.get("capture_tier") or "").strip():
+            enriched["capture_tier"] = "tier3_network_only"
+            enriched["capture_tier_rank"] = 3
+            enriched["capture_tier_reason"] = "network_event_only"
+
+        if enriched.get("inferred_dest"):
+            if int(enriched.get("capture_tier_rank") or 3) > 2:
+                enriched["capture_tier"] = "tier2_payload_mapped"
+                enriched["capture_tier_rank"] = 2
+                enriched["capture_tier_reason"] = "precomputed_inference"
+            if not str(enriched.get("inferred_dest_source") or "").strip():
+                enriched["inferred_dest_source"] = "precomputed"
             return enriched
 
-        def _best_endpoint_for_event_ts(ts: float) -> str:
+        if not trace.mitm_endpoints:
+            return enriched
+
+        def _fallback_endpoint() -> str:
+            non_llm = sorted(
+                ep for ep in trace.mitm_endpoints if ep.split(":", 1)[0] not in KNOWN_LLM_HOSTS
+            )
+            return non_llm[0] if non_llm else sorted(trace.mitm_endpoints)[0]
+
+        def _best_endpoint_for_event_ts(ts: float) -> tuple[str, str, str, int]:
             """Map a BPF timestamp to the MITM call whose active interval
             contains it.  Falls back to nearest interval within 2 s, then
             to global MITM endpoints."""
             if ts <= 0:
                 # No usable timestamp — fall back to global endpoints
-                non_llm = sorted(
-                    ep for ep in trace.mitm_endpoints if ep.split(":", 1)[0] not in KNOWN_LLM_HOSTS
-                )
-                return non_llm[0] if non_llm else sorted(trace.mitm_endpoints)[0]
+                return (_fallback_endpoint(), "mitm_no_timestamp", "tier2_payload_mapped", 2)
 
             intervals = trace.mitm_intervals
             if not intervals:
                 # No interval data yet — fall back to global endpoints
-                non_llm = sorted(
-                    ep for ep in trace.mitm_endpoints if ep.split(":", 1)[0] not in KNOWN_LLM_HOSTS
-                )
-                return non_llm[0] if non_llm else sorted(trace.mitm_endpoints)[0]
+                return (_fallback_endpoint(), "mitm_no_intervals", "tier2_payload_mapped", 2)
 
             # Ensure intervals are sorted by start_ts for binary search
             # (they are appended in chronological order during ingestion,
@@ -1473,7 +1495,8 @@ class TraceStore:
             # All intervals starting at or before ts could contain it
             right = bisect.bisect_right(start_keys, ts)
 
-            best_match: str | None = None
+            best_exact: str | None = None
+            best_near: str | None = None
             best_dist = float("inf")
 
             # Check a small window of intervals around the insertion point
@@ -1485,32 +1508,33 @@ class TraceStore:
                 s, e, label = intervals[i]
                 if s <= ts <= e:
                     # Exact containment — prefer this
-                    if best_match is None or (label.split(":", 1)[0] not in KNOWN_LLM_HOSTS):
-                        best_match = label
-                        best_dist = 0
+                    if best_exact is None or (label.split(":", 1)[0] not in KNOWN_LLM_HOSTS):
+                        best_exact = label
                 else:
                     # Near miss — track closest within 2s tolerance
                     d = min(abs(ts - s), abs(ts - e))
                     if d < best_dist and d <= 2.0:
                         best_dist = d
-                        best_match = label
+                        best_near = label
 
-            if best_match:
-                return best_match
+            if best_exact:
+                return (best_exact, "mitm_interval_exact", "tier1_payload_exact", 1)
+            if best_near:
+                return (best_near, "mitm_interval_nearest", "tier2_payload_mapped", 2)
 
             # Nothing within 2s — fall back to global MITM endpoints
-            non_llm = sorted(
-                ep for ep in trace.mitm_endpoints if ep.split(":", 1)[0] not in KNOWN_LLM_HOSTS
-            )
-            if non_llm:
-                return non_llm[0]
-            return sorted(trace.mitm_endpoints)[0]
+            return (_fallback_endpoint(), "mitm_global_fallback", "tier2_payload_mapped", 2)
 
         # Map proxy-local traffic to known MITM upstream endpoints so users can
         # see where traffic really went (for example git clone -> github.com:443).
         proxy_dests = {"127.0.0.1:8899", "127.0.0.1:8898", "localhost:8899", "localhost:8898"}
         if dest in proxy_dests:
-            enriched["inferred_dest"] = _best_endpoint_for_event_ts(float(event.get("ts") or 0.0))
+            inferred_dest, source, tier, rank = _best_endpoint_for_event_ts(float(event.get("ts") or 0.0))
+            enriched["inferred_dest"] = inferred_dest
+            enriched["inferred_dest_source"] = source
+            enriched["capture_tier"] = tier
+            enriched["capture_tier_rank"] = rank
+            enriched["capture_tier_reason"] = source
         return enriched
 
     def _command_network_targets(self, command: str) -> list[str]:
@@ -1792,6 +1816,73 @@ class TraceStore:
                 }
             )
         return out
+
+    def trace_capture_quality(self, trace_id: str) -> dict[str, Any]:
+        """Return capture confidence metadata for one trace.
+
+        Tier semantics:
+        - tier1_payload_exact: payload extracted and endpoint matched to exact MITM interval
+        - tier2_payload_mapped: payload extracted but endpoint inferred heuristically
+        - tier3_network_only: only baseline network destination data is available
+        """
+        t = self.traces.get(trace_id)
+        if t is None:
+            raise KeyError(trace_id)
+
+        net_events = [
+            e
+            for e in t.sys_events
+            if str(e.get("type") or "") in {"net_connect", "net_send", "net_recv"}
+        ]
+
+        tier_counts = {
+            "tier1_payload_exact": 0,
+            "tier2_payload_mapped": 0,
+            "tier3_network_only": 0,
+        }
+        inferred_event_count = 0
+        unresolved_fd_count = 0
+        inference_sources: Counter[str] = Counter()
+
+        for event in net_events:
+            enriched = self._with_inferred_net_dest(t, event)
+            tier = str(enriched.get("capture_tier") or "tier3_network_only")
+            if tier not in tier_counts:
+                tier = "tier3_network_only"
+            tier_counts[tier] += 1
+
+            if str(event.get("dest") or "").startswith("fd="):
+                unresolved_fd_count += 1
+
+            inferred_dest = str(enriched.get("inferred_dest") or "")
+            if inferred_dest:
+                inferred_event_count += 1
+                source = str(enriched.get("inferred_dest_source") or "unknown")
+                inference_sources[source] += 1
+
+        payload_api_call_count = len(
+            [e for e in t.agent_events if str(e.get("event_type") or "") == "api_call"]
+        )
+
+        if payload_api_call_count <= 0:
+            overall_tier = "tier3_network_only"
+        elif tier_counts["tier1_payload_exact"] > 0:
+            overall_tier = "tier1_payload_exact"
+        else:
+            overall_tier = "tier2_payload_mapped"
+
+        total_net_events = len(net_events)
+        return {
+            "trace_id": trace_id,
+            "overall_tier": overall_tier,
+            "payload_api_call_count": payload_api_call_count,
+            "network_event_count": total_net_events,
+            "inferred_event_count": inferred_event_count,
+            "unresolved_fd_count": unresolved_fd_count,
+            "tiers": tier_counts,
+            "inference_sources": dict(inference_sources),
+            "unresolved_fd_ratio": (unresolved_fd_count / total_net_events) if total_net_events else 0.0,
+        }
 
     def _candidate_trace_paths(self, trace_id: str) -> list[Path]:
         candidates = [self.trace_dir / trace_id]

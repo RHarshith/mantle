@@ -32,6 +32,11 @@ The goal is to make agent behavior inspectable, testable, and reviewable.
 - Scenario-based validation:
 	- reproducible suites under `trace_scenarios/`
 	- setup, verify, and cleanup lifecycle
+- Tiered API tracing confidence:
+	- `tier1_payload_exact`: payload + exact endpoint match
+	- `tier2_payload_mapped`: payload + heuristic/mapped endpoint
+	- `tier3_network_only`: baseline network telemetry only
+	- per-trace quality endpoint: `/api/traces/{trace_id}/capture-quality`
 
 ## Architecture At A Glance
 
@@ -93,6 +98,25 @@ mantle watch python3 -m mantle_agent.cli_agent "inspect this repository and summ
 ```
 
 Open `http://127.0.0.1:8099`.
+
+## Demo Readiness Mode
+
+For client demos, run Mantle in hardening mode:
+
+- Freeze non-demo feature work for the sprint.
+- Validate runtime matrix:
+	- OpenAI Codex (latest)
+	- GitHub Copilot CLI
+	- `mantle_agent` with custom OpenAI-compatible endpoint
+- Require contract checks before behavior changes:
+	- frontend <-> API
+	- API <-> store
+	- store <-> capture
+	- userspace capture <-> kernel event ABI
+- Require test evidence before merge (`unit`, `integration`, and demo-relevant `e2e`).
+- Document micro decisions in `docs/micro-decisions.md`.
+
+See `docs/api-tracing-limitations.md` for capture guarantees and limitations.
 
 ## CLI Reference
 

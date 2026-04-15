@@ -49,6 +49,23 @@ class TestDashboardAPI:
         data = resp.json()
         assert isinstance(data, list) or "traces" in data
 
+    def test_capture_quality_endpoint(self, client):
+        traces_resp = client.get("/api/traces")
+        assert traces_resp.status_code == 200
+        traces_data = traces_resp.json()
+        traces = traces_data.get("traces") if isinstance(traces_data, dict) else traces_data
+        assert isinstance(traces, list)
+        assert traces
+
+        trace_id = traces[0]["trace_id"]
+        quality_resp = client.get(f"/api/traces/{trace_id}/capture-quality")
+        assert quality_resp.status_code == 200
+        quality = quality_resp.json()
+        assert quality.get("trace_id") == trace_id
+        assert "overall_tier" in quality
+        assert "tiers" in quality
+        assert "tier3_network_only" in (quality.get("tiers") or {})
+
     def test_get_settings(self, client):
         resp = client.get("/api/settings/llm-schemas")
         assert resp.status_code == 200

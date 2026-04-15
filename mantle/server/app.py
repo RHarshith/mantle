@@ -264,6 +264,15 @@ def trace_summary(trace_id: str) -> dict[str, Any]:
 		raise HTTPException(status_code=404, detail="Trace not found")
 
 
+@app.get("/api/traces/{trace_id}/capture-quality")
+def trace_capture_quality(trace_id: str) -> dict[str, Any]:
+	"""Return tiered capture confidence metadata for a trace."""
+	try:
+		return store.trace_capture_quality(trace_id)
+	except KeyError:
+		raise HTTPException(status_code=404, detail="Trace not found")
+
+
 @app.get("/api/traces/{trace_id}/dimension-metrics")
 def trace_dimension_metrics(trace_id: str) -> dict[str, Any]:
 	"""Return correctness/safety/efficiency heuristic metrics for one trace."""

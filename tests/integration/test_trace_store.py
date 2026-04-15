@@ -151,6 +151,90 @@ class TestTraceStoreGraphAndViews:
 
 
 @pytest.mark.integration
+class TestTraceCaptureQuality:
+    def test_capture_quality_defaults_to_tier3_without_proxy_inference(self, populated_store: TraceStore):
+        asyncio.get_event_loop().run_until_complete(populated_store.poll_once())
+        traces = populated_store.list_traces()
+        assert traces
+
+        quality = populated_store.trace_capture_quality(traces[0]["trace_id"])
+        assert quality["overall_tier"] in {
+            "tier1_payload_exact",
+            "tier2_payload_mapped",
+            "tier3_network_only",
+        }
+        assert quality["network_event_count"] >= 1
+        assert "tiers" in quality
+        assert "tier3_network_only" in quality["tiers"]
+
+    def test_capture_quality_exact_interval_inference_is_tier1(self, tmp_path: Path):
+        obs = tmp_path / "obs"
+        traces_dir = obs / "traces"
+        events_dir = obs / "events"
+        mitm_dir = obs / "mitm"
+        traces_dir.mkdir(parents=True)
+        events_dir.mkdir(parents=True)
+        mitm_dir.mkdir(parents=True)
+
+        trace_id = "proxy_tier_quality.ebpf.jsonl"
+        trace_file = traces_dir / trace_id
+        trace_file.write_text(
+            json.dumps(
+                {
+                    "ts": 1710000000.8,
+                    "line_no": 1,
+                    "type": "command_exec",
+                    "pid": 1200,
+                    "ppid": 1,
+                    "exec_path": "/usr/bin/python3",
+                    "argv": ["python3", "-c", "pass"],
+                    "command": "python3 -c pass",
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "ts": 1710000001.0,
+                    "line_no": 2,
+                    "type": "net_connect",
+                    "pid": 1200,
+                    "dest": "127.0.0.1:8899",
+                    "transport": "tcp",
+                    "family": "AF_INET",
+                    "ok": True,
+                    "label": "connect 127.0.0.1:8899",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        mitm_file = mitm_dir / "proxy_tier_quality.mitm.jsonl"
+        mitm_file.write_text(
+            json.dumps(
+                {
+                    "direction": "response",
+                    "ts": 1710000001.3,
+                    "duration_ms": 400,
+                    "url": "https://api.openai.com/v1/chat/completions",
+                    "request_body": {"model": "gpt-4", "messages": [{"role": "user", "content": "hello"}]},
+                    "response_body": {"choices": [{"message": {"role": "assistant", "content": "hi"}}]},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        store = TraceStore(trace_dir=traces_dir, events_dir=events_dir, mitm_dir=mitm_dir)
+        asyncio.get_event_loop().run_until_complete(store.poll_once())
+
+        quality = store.trace_capture_quality(trace_id)
+        assert quality["overall_tier"] == "tier1_payload_exact"
+        assert quality["tiers"]["tier1_payload_exact"] >= 1
+        assert quality["inference_sources"].get("mitm_interval_exact", 0) >= 1
+
+
+@pytest.mark.integration
 class TestTraceStoreDelete:
     """Test trace deletion."""
 

@@ -5,3 +5,6 @@ __pycache__/
 .env.local
 trace_scenarios/*/.runtime/
 .venv/
+
+.github/*
+commands
