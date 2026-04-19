@@ -9,7 +9,7 @@ from typing import Any
 
 
 def builtin_llm_api_schemas() -> list[dict[str, Any]]:
-    """Return builtin schema definitions used for MITM LLM payload parsing."""
+    """Return builtin schema definitions used for LLM payload parsing."""
     return [
         {
             "id": "builtin_tamu_chat_completions",
@@ -784,9 +784,15 @@ def normalize_response_body_for_sections(response_body: Any) -> dict[str, Any]:
     return response_body
 
 
-def parse_llm_calls_from_mitm(trace: Any, llm_api_schemas: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Parse MITM JSONL and return prompt/response turns matched by URL+time."""
-    if not trace.mitm_path or not trace.mitm_path.exists():
+def parse_llm_calls_from_capture(capture_path: Any, llm_api_schemas: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # Response records define boundaries; matched request records contribute context.
+    if capture_path is None:
+        return []
+
+    path = capture_path
+    if not hasattr(path, "exists"):
+        return []
+    if not path.exists():
         return []
 
     compiled: list[tuple[dict[str, Any], re.Pattern[str]]] = []
@@ -805,7 +811,7 @@ def parse_llm_calls_from_mitm(trace: Any, llm_api_schemas: list[dict[str, Any]])
     pending: list[dict[str, Any]] = []
     calls: list[dict[str, Any]] = []
 
-    with trace.mitm_path.open("r", encoding="utf-8", errors="replace") as fh:
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
             line = line.strip()
             if not line:
@@ -833,18 +839,25 @@ def parse_llm_calls_from_mitm(trace: Any, llm_api_schemas: list[dict[str, Any]])
             req_cfg = schema_match.get("request") or {}
             resp_cfg = schema_match.get("response") or {}
 
-            if direction == "request":
-                req_sections = req_cfg.get("sections") if isinstance(req_cfg.get("sections"), list) else []
-                if not req_sections:
-                    req_sections = []
-                    instructions_path = str(req_cfg.get("instructions_path") or "")
-                    messages_path = str(req_cfg.get("messages_path") or "")
-                    if instructions_path:
-                        req_sections.append({"id": "instructions", "label": "Instructions", "path": instructions_path, "mode": "text"})
-                    if messages_path:
-                        req_sections.append({"id": "messages", "label": "Messages", "path": messages_path, "mode": "messages_text"})
+            req_sections = req_cfg.get("sections") if isinstance(req_cfg.get("sections"), list) else []
+            if not req_sections:
+                req_sections = []
+                instructions_path = str(req_cfg.get("instructions_path") or "")
+                messages_path = str(req_cfg.get("messages_path") or "")
+                if instructions_path:
+                    req_sections.append({"id": "instructions", "label": "Instructions", "path": instructions_path, "mode": "text"})
+                if messages_path:
+                    req_sections.append({"id": "messages", "label": "Messages", "path": messages_path, "mode": "messages_text"})
 
-                prompt_sections = section_values(req_body, req_sections)
+            prompt_sections = section_values(req_body, req_sections)
+            replay_context_sections = section_values(
+                req_body,
+                req_cfg.get("replay_context_sections")
+                if isinstance(req_cfg.get("replay_context_sections"), list)
+                else req_sections,
+            )
+
+            if direction == "request":
 
                 pending.append(
                     {
@@ -853,12 +866,7 @@ def parse_llm_calls_from_mitm(trace: Any, llm_api_schemas: list[dict[str, Any]])
                         "schema_id": schema_match.get("id"),
                         "prompt_sections": prompt_sections,
                         "prompt_text": sections_to_text(prompt_sections),
-                        "replay_context_sections": section_values(
-                            req_body,
-                            req_cfg.get("replay_context_sections")
-                            if isinstance(req_cfg.get("replay_context_sections"), list)
-                            else req_sections,
-                        ),
+                        "replay_context_sections": replay_context_sections,
                         "response_sections": [],
                         "response_text": "",
                         "replay_action_sections": [],
@@ -943,6 +951,24 @@ def parse_llm_calls_from_mitm(trace: Any, llm_api_schemas: list[dict[str, Any]])
                     item["response_text"] = response_text
                     item["replay_action_sections"] = replay_action_sections
                     calls.append(item)
+                    continue
+
+                # Response-only proxy records are boundary-capable and should
+                # not be dropped when no explicit request line is present.
+                calls.append(
+                    {
+                        "ts": ts,
+                        "url": url,
+                        "schema_id": schema_match.get("id"),
+                        "prompt_sections": prompt_sections,
+                        "prompt_text": sections_to_text(prompt_sections),
+                        "replay_context_sections": replay_context_sections,
+                        "response_sections": response_sections,
+                        "response_text": response_text,
+                        "replay_action_sections": replay_action_sections,
+                        "matched": True,
+                    }
+                )
 
     for item in pending:
         if not item.get("matched"):
@@ -950,3 +976,5 @@ def parse_llm_calls_from_mitm(trace: Any, llm_api_schemas: list[dict[str, Any]])
 
     calls.sort(key=lambda x: float(x.get("ts") or 0.0))
     return calls
+
+

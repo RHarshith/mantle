@@ -20,17 +20,16 @@ usage() {
     cat <<'EOF'
 Usage:
   mantle serve [--host <host>] [--port <port>] [--obs-root <path>]
-    mantle watch [--mode <proxy|transparent>] [--trace-id <id>] [--port <mitm_port>] [--interactive-ebpf] <executable> [args...]
+        mantle watch [--trace-id <id>] [--interactive-ebpf] <executable> [args...]
 
 Commands:
     serve    Start the observability dashboard.
-    watch    Run an executable under MITM + eBPF capture.
+    watch    Run an executable under eBPF capture (MITM disabled).
 
 Examples:
   mantle serve --host 0.0.0.0 --port 8099
     mantle watch aider
         mantle watch aider "inspect this repo and summarize"
-        mantle watch --mode transparent aider "trace network behavior"
   mantle watch aider "fix failing tests"
 EOF
 }
@@ -128,13 +127,28 @@ watch_cmd() {
     passthrough=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --mode|--trace-id|--port)
+            --trace-id)
                 if [[ $# -lt 2 ]]; then
                     echo "Error: $1 requires a value." >&2
                     exit 1
                 fi
                 passthrough+=("$1" "$2")
                 shift 2
+                ;;
+            --mode)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --mode requires a value." >&2
+                    exit 1
+                fi
+                if [[ "$2" != "none" ]]; then
+                    echo "Error: MITM interception is disabled. Only '--mode none' is allowed." >&2
+                    exit 1
+                fi
+                shift 2
+                ;;
+            --port)
+                echo "Error: --port is unavailable because MITM interception is disabled." >&2
+                exit 1
                 ;;
             --interactive-ebpf)
                 passthrough+=("$1")

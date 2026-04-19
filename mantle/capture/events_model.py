@@ -13,6 +13,7 @@ _SUPPORTED_EVENT_TYPES = {
     "fd_open",
     "file_delete",
     "file_rename",
+    "file_rename_ret",
     "file_snapshot",
     "fd_write",
     "fd_write_ret",
@@ -51,6 +52,9 @@ def _validate_type_requirements(event_type: str, record: dict[str, Any]) -> None
     elif event_type == "file_rename":
         _require_str(record, "src", allow_empty=True)
         _require_str(record, "path", allow_empty=True)
+    elif event_type == "file_rename_ret":
+        # Result-only rename events may not include path/src fields.
+        return
     elif event_type == "file_snapshot":
         _require_str(record, "path")
     elif event_type in {"net_connect", "net_send", "net_recv"}:

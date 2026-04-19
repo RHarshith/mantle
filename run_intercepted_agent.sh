@@ -1,38 +1,55 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────
-# Run an external agent with mitmproxy API interception
-# and optional eBPF syscall tracing.
+# Run an external agent with eBPF syscall tracing only.
 #
-# Uses iptables transparent redirect to force ALL HTTPS traffic
-# through mitmproxy — works even for binaries that ignore proxy
-# env vars (e.g. statically-linked Rust binaries).
-#
-# Requires: root, iptables, mitmproxy, mitmproxyuser system account
+# MITM interception is intentionally disabled so captured BPF network events
+# preserve real destination IP/port data points.
 #
 # Usage:
-#   ./run_intercepted_agent.sh "List files in the home directory"
-#   ./run_intercepted_agent.sh                    # interactive (no task)
-#   ./run_intercepted_agent.sh --agent "aider" "Fix the bug"
+#   ./run_intercepted_agent.sh --agent "codex" -- "exec do something"
+#   ./run_intercepted_agent.sh --trace-id "my_trace.ebpf.jsonl" --agent "aider"
 # ─────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 TRACE_ID=""
-MITM_PORT=8899
-MITM_REV_PORT=8898
 AGENT_BIN="aider"
 TASK=()
-MITM_USER="mitmproxyuser"
-INTERCEPT_MODE="${MANTLE_INTERCEPT_MODE:-${RTRACE_INTERCEPT_MODE:-proxy}}"
+INTERCEPT_MODE="${MANTLE_INTERCEPT_MODE:-${RTRACE_INTERCEPT_MODE:-none}}"
 AGENT_TAG="agent"
 ENABLE_EBPF=true
 INTERACTIVE_EBPF=false
 USE_PTY_WRAPPER=false
+RUN_AS_USER=""
+RUN_AS_HOME=""
+PROXY_LOG_DIR=""
+PROXY_CONTROL_URL=""
+
+# Keep BPF capture under root, but execute the target agent as the invoking
+# user so user-scoped CLI auth/config (for example ~/.codex/config.toml)
+# remains effective under `mantle watch`.
+if [[ "${EUID}" -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    RUN_AS_USER="${SUDO_USER}"
+    RUN_AS_HOME="$(getent passwd "${RUN_AS_USER}" | cut -d: -f6 || true)"
+fi
+
+is_likely_interactive_agent() {
+    local base
+    base="$(basename "$AGENT_BIN")"
+    case "$base" in
+        aider|codex|copilot|mantlecli)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --trace-id)    TRACE_ID="$2"; shift 2 ;;
-        --port)        MITM_PORT="$2"; shift 2 ;;
         --mode)        INTERCEPT_MODE="$2"; shift 2 ;;
+        --port)        echo "Error: --port is unavailable because MITM interception is disabled." >&2; exit 1 ;;
         --agent)       AGENT_BIN="$2"; shift 2 ;;
         --no-ebpf)     ENABLE_EBPF=false; shift ;;
         --interactive-ebpf) INTERACTIVE_EBPF=true; shift ;;
@@ -42,10 +59,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ "$INTERCEPT_MODE" != "none" ]]; then
+    echo "Error: MITM interception is disabled. Only --mode none is supported." >&2
+    exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OBS_ROOT_DEFAULT="$SCRIPT_DIR/obs"
 OBS_ROOT_ENV="${AGENT_OBS_ROOT:-}"
 OBS_ROOT="$OBS_ROOT_DEFAULT"
+PROXY_LOG_DIR="${MANTLE_PROXY_LOG_DIR:-$SCRIPT_DIR/litellm_proxy/bpf_logs}"
+PROXY_CONTROL_URL="${MANTLE_PROXY_CONTROL_URL:-http://127.0.0.1:4000/mantle/active-trace}"
 
 # If AGENT_OBS_ROOT is set but points to stale/empty data while this repo has
 # logs, prefer the repo-local obs folder to avoid silent trace loss after renames.
@@ -72,12 +96,12 @@ if [[ -n "$OBS_ROOT_ENV" ]]; then
         OBS_ROOT="$OBS_ROOT_ENV"
     fi
 fi
-AGENT_TAG="$(basename "$AGENT_BIN")"
-[ -z "$TRACE_ID" ] && TRACE_ID="${AGENT_TAG}_$(date +%Y%m%d_%H%M%S).ebpf.jsonl"
 
-# Interactive CLI flows require a real TTY. When no task is provided, launch
-# the agent directly (still under MITM capture) instead of piping through
-# bpftrace output capture, which forces stdout/stderr to non-TTY pipes.
+AGENT_TAG="$(basename "$AGENT_BIN")"
+[[ -z "$TRACE_ID" ]] && TRACE_ID="${AGENT_TAG}_$(date +%Y%m%d_%H%M%S).ebpf.jsonl"
+
+# No-task flows are often interactive for agent CLIs (aider/codex shell modes),
+# but script executables (for example ./run_codex.sh) should still be traced.
 if [[ ${#TASK[@]} -eq 0 ]]; then
     if $INTERACTIVE_EBPF; then
         if command -v script >/dev/null 2>&1; then
@@ -87,21 +111,21 @@ if [[ ${#TASK[@]} -eq 0 ]]; then
             ENABLE_EBPF=false
             echo "[mantle] --interactive-ebpf requested, but 'script' is unavailable; running without eBPF." >&2
         fi
-    else
+    elif is_likely_interactive_agent; then
         ENABLE_EBPF=false
+        echo "[mantle] No task provided for interactive agent '$AGENT_BIN'; running without eBPF to preserve TTY." >&2
+    else
+        ENABLE_EBPF=true
     fi
 fi
 
-# Resolve runtime venv path (allows consistent tool discovery under sudo).
-RUNTIME_VENV="${MANTLE_VENV:-${RTRACE_VENV:-$SCRIPT_DIR/.venv}}"
-
 mkdir -p "$OBS_ROOT/traces" "$OBS_ROOT/events" "$OBS_ROOT/mitm"
 
-TRACE_BASENAME="$TRACE_ID"
-TRACE_BASENAME="${TRACE_BASENAME%.ebpf.jsonl}"
-MITM_JSONL="$OBS_ROOT/mitm/${TRACE_BASENAME}.mitm.jsonl"
+TRACE_BASENAME="${TRACE_ID%.ebpf.jsonl}"
 EBPF_FILE="$OBS_ROOT/traces/$TRACE_ID"
-MITM_CA="${HOME}/.mitmproxy/mitmproxy-ca-cert.pem"
+ROOT_PID_FILE="$OBS_ROOT/mitm/${TRACE_BASENAME}.root.pid"
+PID_WRAPPER_SCRIPT=""
+
 EBPF_CAPTURE_SCRIPT="$SCRIPT_DIR/mantle/capture/ebpf.py"
 if [[ ! -f "$EBPF_CAPTURE_SCRIPT" ]]; then
     EBPF_CAPTURE_SCRIPT="$SCRIPT_DIR/mantle/ebpf_capture.py"
@@ -110,30 +134,29 @@ if [[ ! -f "$EBPF_CAPTURE_SCRIPT" ]]; then
     echo "Error: eBPF capture wrapper script not found" >&2
     exit 1
 fi
-MITM_CAPTURE_SCRIPT="$SCRIPT_DIR/mantle/capture/mitm.py"
-if [[ ! -f "$MITM_CAPTURE_SCRIPT" ]]; then
-    MITM_CAPTURE_SCRIPT="$SCRIPT_DIR/mantle/mitm_capture.py"
-fi
-if [[ ! -f "$MITM_CAPTURE_SCRIPT" ]]; then
-    echo "Error: mitm capture addon script not found" >&2
-    exit 1
-fi
-ROOT_PID_FILE="$OBS_ROOT/mitm/${TRACE_BASENAME}.root.pid"
-PID_WRAPPER_SCRIPT=""
 
-# Correlate native agent events with the same trace identifier used by eBPF/mitm.
+# Correlate native agent events with the same trace identifier used by eBPF.
 export AGENT_TRACE_ID="$TRACE_BASENAME"
 export MANTLE_AGENT_ROOT_PID_FILE="$ROOT_PID_FILE"
 rm -f "$ROOT_PID_FILE"
 
 make_pid_wrapper() {
     local wrapper
+    local preserve_env
     wrapper="$(mktemp /tmp/mantle-agent-launch.XXXXXX.sh)"
+    preserve_env="PATH,OPENAI_API_KEY,OAK1,OPENAI_BASE_URL,OPENAI_MODEL,AGENT_TRACE_ID,AGENT_OBS_ENABLED,AGENT_OBS_ROOT,RTRACE_VENV,RTRACE_INTERCEPT_MODE,RTRACE_FORCE_OPENAI_BASE,MANTLE_VENV,MANTLE_INTERCEPT_MODE,MANTLE_FORCE_OPENAI_BASE,XDG_CONFIG_HOME,XDG_STATE_HOME,XDG_CACHE_HOME,XDG_DATA_HOME,XDG_RUNTIME_DIR,DBUS_SESSION_BUS_ADDRESS,GITHUB_TOKEN,GH_TOKEN,GITHUB_COPILOT_TOKEN,COPILOT_TOKEN"
     {
         echo "#!/usr/bin/env bash"
         echo "set -euo pipefail"
         echo "echo \"\$\$\" > $(printf '%q' "$ROOT_PID_FILE")"
-        printf "exec "
+        if [[ -n "$RUN_AS_USER" ]]; then
+            if [[ -n "$RUN_AS_HOME" ]]; then
+                printf "export HOME=%q\\n" "$RUN_AS_HOME"
+            fi
+            printf "exec sudo -H -u %q --preserve-env=%q " "$RUN_AS_USER" "$preserve_env"
+        else
+            printf "exec "
+        fi
         printf "%q " "$AGENT_BIN_PATH" "${AGENT_ARGS[@]}"
         echo
     } > "$wrapper"
@@ -141,53 +164,54 @@ make_pid_wrapper() {
     PID_WRAPPER_SCRIPT="$wrapper"
 }
 
-# Find mitmdump
-MITMDUMP=""
-MITMDUMP_LAUNCH=()
-if [ -x "$RUNTIME_VENV/bin/mitmdump" ]; then
-    MITMDUMP="$RUNTIME_VENV/bin/mitmdump"
-elif [ -x "$SCRIPT_DIR/.venv/bin/mitmdump" ]; then
-    MITMDUMP="$SCRIPT_DIR/.venv/bin/mitmdump"
-elif command -v mitmdump >/dev/null 2>&1; then
-    MITMDUMP="$(command -v mitmdump)"
-elif [ -x "$HOME/.local/bin/mitmdump" ]; then
-    MITMDUMP="$HOME/.local/bin/mitmdump"
-fi
+set_proxy_active_trace() {
+    local trace_file="$1"
+    local payload_file
+    payload_file="$(mktemp /tmp/mantle-proxy-control.XXXXXX.json)"
 
-[ -n "$MITMDUMP" ] || {
-    echo "Error: mitmdump not found. Run scripts/install_mantle.sh or install with: pipx install mitmproxy" >&2
-    exit 1
-}
-
-# Handle stale shebangs after repo renames by invoking script via Python.
-if [ -x "$RUNTIME_VENV/bin/python" ] && [ -f "$MITMDUMP" ]; then
-    first_line="$(head -n 1 "$MITMDUMP" 2>/dev/null || true)"
-    if [[ "$first_line" == '#!'* ]]; then
-        shebang_path="${first_line#\#!}"
-        shebang_path="${shebang_path%% *}"
-        if [ -n "$shebang_path" ] && [ ! -x "$shebang_path" ]; then
-            MITMDUMP_LAUNCH=("$RUNTIME_VENV/bin/python" "$MITMDUMP")
-        fi
-    fi
-fi
-if [ ${#MITMDUMP_LAUNCH[@]} -eq 0 ]; then
-    MITMDUMP_LAUNCH=("$MITMDUMP")
-fi
-
-# First-run bootstrap: generate mitmproxy CA material if missing.
-if [ ! -f "$MITM_CA" ]; then
-    echo "[*] mitmproxy CA cert not found. Bootstrapping mitmproxy config..."
-    if command -v timeout >/dev/null 2>&1; then
-        timeout 2 "${MITMDUMP_LAUNCH[@]}" -q >/dev/null 2>&1 || true
+    if [[ "$trace_file" == "__NONE__" ]]; then
+        printf '{"trace_file": null}\n' > "$payload_file"
     else
-        "${MITMDUMP_LAUNCH[@]}" -q >/dev/null 2>&1 &
-        TMP_MITM_PID=$!
-        sleep 2
-        kill "$TMP_MITM_PID" >/dev/null 2>&1 || true
-        wait "$TMP_MITM_PID" >/dev/null 2>&1 || true
+        python3 - "$trace_file" "$payload_file" <<'PY'
+import json
+import os
+import sys
+
+trace_file, payload_path = sys.argv[1], sys.argv[2]
+base = os.path.basename(trace_file)
+if base != trace_file or base in {"", ".", ".."}:
+    raise SystemExit("trace_file must be a basename")
+with open(payload_path, "w", encoding="utf-8") as fh:
+    json.dump({"trace_file": base}, fh)
+PY
     fi
-fi
-[ -f "$MITM_CA" ] || { echo "Error: mitmproxy CA cert not found after bootstrap at $MITM_CA" >&2; exit 1; }
+
+    if ! python3 - "$PROXY_CONTROL_URL" "$payload_file" <<'PY'
+import sys
+import urllib.error
+import urllib.request
+
+url, payload_path = sys.argv[1], sys.argv[2]
+with open(payload_path, "rb") as fh:
+    data = fh.read()
+req = urllib.request.Request(
+    url,
+    data=data,
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(req, timeout=2.0) as resp:
+    if resp.status < 200 or resp.status >= 300:
+        raise RuntimeError(f"unexpected status: {resp.status}")
+PY
+    then
+        rm -f "$payload_file"
+        return 1
+    fi
+
+    rm -f "$payload_file"
+    return 0
+}
 
 command -v "$AGENT_BIN" >/dev/null 2>&1 || { echo "Error: '$AGENT_BIN' not found in PATH" >&2; exit 1; }
 AGENT_BIN_PATH="$(command -v "$AGENT_BIN")"
@@ -196,174 +220,34 @@ if [[ -z "${OPENAI_API_KEY:-}" ]]; then
     echo "[*] OPENAI_API_KEY is not set. External agents that require API access may fail." >&2
 fi
 
-if [[ "$INTERCEPT_MODE" != "proxy" && "$INTERCEPT_MODE" != "transparent" ]]; then
-    echo "Error: --mode must be 'proxy' or 'transparent'" >&2
-    exit 1
-fi
-
-if [[ "$INTERCEPT_MODE" == "transparent" ]]; then
-    # Ensure mitmproxyuser exists
-    if ! id "$MITM_USER" >/dev/null 2>&1; then
-        useradd -r -s /bin/false "$MITM_USER"
-        echo "[*] Created system user: $MITM_USER"
-    fi
-fi
-
 echo "═══════════════════════════════════════════════════════════"
-echo "  Intercepted External Agent"
+echo "  External Agent (eBPF only)"
 echo "═══════════════════════════════════════════════════════════"
 echo "  Agent:       $AGENT_BIN"
 echo "  Task:        ${TASK[*]:-<interactive>}"
 echo "  Trace ID:    $TRACE_ID"
-echo "  MITM mode:   $INTERCEPT_MODE"
-echo "  MITM proxy:  localhost:$MITM_PORT"
-echo "  MITM log:    $MITM_JSONL"
+echo "  MITM:        disabled"
 echo "  eBPF trace:  $ENABLE_EBPF"
 echo "  eBPF file:   $EBPF_FILE"
+if [[ -n "$RUN_AS_USER" ]]; then
+    echo "  Run as user: $RUN_AS_USER"
+fi
 echo "═══════════════════════════════════════════════════════════"
 
-export MITM_CAPTURE_FILE="$MITM_JSONL"
-if [[ "$INTERCEPT_MODE" == "transparent" ]]; then
-    # Make capture directory writable by mitmproxyuser
-    chmod 777 "$OBS_ROOT/mitm"
-    # Copy CA cert so mitmproxyuser can read it
-    MITM_USER_HOME="$(eval echo ~$MITM_USER)"
-    mkdir -p "$MITM_USER_HOME/.mitmproxy"
-    cp "$MITM_CA" "$MITM_USER_HOME/.mitmproxy/"
-    cp "${MITM_CA%.pem}-ca.pem" "$MITM_USER_HOME/.mitmproxy/" 2>/dev/null || true
-    cp "$HOME/.mitmproxy/mitmproxy-ca.pem" "$MITM_USER_HOME/.mitmproxy/" 2>/dev/null || true
-    cp "$HOME/.mitmproxy/mitmproxy-ca-cert.cer" "$MITM_USER_HOME/.mitmproxy/" 2>/dev/null || true
-    # Copy the full mitmproxy config directory for key material
-    cp -r "$HOME/.mitmproxy/"* "$MITM_USER_HOME/.mitmproxy/" 2>/dev/null || true
-    chown -R "$MITM_USER":"$MITM_USER" "$MITM_USER_HOME/.mitmproxy"
-
-    # Start mitmdump in transparent mode, running as mitmproxyuser
-    # so its own outbound traffic is excluded from iptables redirect.
-    sudo -u "$MITM_USER" \
-        MITM_CAPTURE_FILE="$MITM_JSONL" \
-        MANTLE_AGENT_ROOT_PID_FILE="$ROOT_PID_FILE" \
-        HOME="$MITM_USER_HOME" \
-        "${MITMDUMP_LAUNCH[@]}" \
-            --mode transparent@"$MITM_PORT" \
-            --mode reverse:https://api.openai.com@"$MITM_REV_PORT" \
-            --ssl-insecure \
-            --set connection_strategy=lazy \
-            -s "$MITM_CAPTURE_SCRIPT" \
-            --set capture_file="$MITM_JSONL" \
-            -q &
-    MITM_PID=$!
-    sleep 2
-    kill -0 "$MITM_PID" 2>/dev/null || { echo "Error: mitmdump failed to start" >&2; exit 1; }
-    echo "[*] mitmdump started as $MITM_USER (PID $MITM_PID)"
-else
-    # Stable default for intercepted agent runs: explicit proxy mode.
-    "${MITMDUMP_LAUNCH[@]}" \
-        -p "$MITM_PORT" \
-        --ssl-insecure \
-        -s "$MITM_CAPTURE_SCRIPT" \
-        --set capture_file="$MITM_JSONL" \
-        -q &
-    MITM_PID=$!
-    sleep 2
-    kill -0 "$MITM_PID" 2>/dev/null || { echo "Error: mitmdump failed to start" >&2; exit 1; }
-    echo "[*] mitmdump started in proxy mode (PID $MITM_PID)"
-fi
-
-IPTABLES_SETUP=false
-IP6TABLES_SETUP=false
-if [[ "$INTERCEPT_MODE" == "transparent" ]]; then
-    # Redirect all HTTPS traffic through mitmproxy in transparent mode.
-    if command -v iptables >/dev/null 2>&1; then
-        iptables -t nat -A OUTPUT -p tcp --dport 443 \
-            -m owner ! --uid-owner "$MITM_USER" \
-            -j REDIRECT --to-port "$MITM_PORT" 2>/dev/null && IPTABLES_SETUP=true
-        if $IPTABLES_SETUP; then
-            echo "[*] iptables redirect: port 443 → $MITM_PORT (excluding $MITM_USER)"
-        else
-            echo "[!] iptables redirect failed (need root?), falling back to env vars"
-        fi
-    else
-        echo "[!] iptables not available, falling back to env vars"
-    fi
-
-    if command -v ip6tables >/dev/null 2>&1; then
-        # Reject IPv6 traffic to force fallback to IPv4 (which is correctly proxied)
-        ip6tables -A OUTPUT -p tcp --dport 443 -j REJECT --reject-with tcp-reset 2>/dev/null && IP6TABLES_SETUP=true
-        if $IP6TABLES_SETUP; then
-            echo "[*] ip6tables reject: port 443 (forcing IPv4 fallback)"
-        fi
-    fi
-fi
-
-# Install mitmproxy CA to system trust store (important for Rust binaries ignoring env vars)
-if [ -d "/usr/local/share/ca-certificates" ]; then
-    if [ -w "/usr/local/share/ca-certificates" ]; then
-        cp "$MITM_CA" /usr/local/share/ca-certificates/mitmproxy.crt
-        update-ca-certificates >/dev/null 2>&1 || true
-        echo "[*] Installed mitmproxy CA to system trust store."
-    else
-        echo "[*] Skipping system CA install (no write permission); using env-based CA bundle."
-    fi
-fi
-
-# Create a combined CA bundle: system CAs + mitmproxy CA
-# Rust's rustls reads SSL_CERT_FILE but needs ALL CAs (not just mitmproxy)
-COMBINED_CA="$(mktemp /tmp/mantle-ca-bundle.XXXXXX.crt)"
-cat /etc/ssl/certs/ca-certificates.crt "$MITM_CA" > "$COMBINED_CA" 2>/dev/null || \
-    cp "$MITM_CA" "$COMBINED_CA"
-echo "[*] Combined CA bundle: $COMBINED_CA"
-
-# Also set proxy env vars as fallback (for agents that DO respect them)
-export HTTPS_PROXY="http://127.0.0.1:$MITM_PORT"
-export HTTP_PROXY="http://127.0.0.1:$MITM_PORT"
-export https_proxy="http://127.0.0.1:$MITM_PORT"
-export http_proxy="http://127.0.0.1:$MITM_PORT"
-export ALL_PROXY="http://127.0.0.1:$MITM_PORT"
-export all_proxy="http://127.0.0.1:$MITM_PORT"
-# Keep bypasses configurable instead of hard-coding localhost exclusions.
-# Empty by default so local traffic (for example curl localhost:8080) is proxied and captured.
-NO_PROXY_VALUE="${MANTLE_NO_PROXY:-${RTRACE_NO_PROXY:-}}"
-export NO_PROXY="$NO_PROXY_VALUE"
-export no_proxy="$NO_PROXY_VALUE"
-export SSL_CERT_FILE="$COMBINED_CA"
-export REQUESTS_CA_BUNDLE="$COMBINED_CA"
-export NODE_EXTRA_CA_CERTS="$COMBINED_CA"
-export NODE_TLS_REJECT_UNAUTHORIZED=0
-
-# Some agent runtimes may drop auth headers for plaintext http base URLs.
-# Transparent iptables interception is sufficient, so do NOT override base URL
-# by default. Allow opt-in for debugging compatibility.
-if [[ "${MANTLE_FORCE_OPENAI_BASE:-${RTRACE_FORCE_OPENAI_BASE:-0}}" == "1" ]]; then
-    export OPENAI_API_BASE="http://127.0.0.1:$MITM_REV_PORT/v1"
-    export OPENAI_BASE_URL="http://127.0.0.1:$MITM_REV_PORT/v1"
-    echo "[*] Forced OPENAI_BASE_URL/OPENAI_API_BASE to local reverse endpoint"
-fi
+# Ensure no inherited proxy vars accidentally reintroduce interception.
+unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy ALL_PROXY all_proxy
 
 cleanup() {
+    if ! set_proxy_active_trace "__NONE__"; then
+        echo "[mantle] Warning: failed to clear active trace on proxy control endpoint: $PROXY_CONTROL_URL" >&2
+    fi
     echo ""
-    # Remove iptables rule first
-    if $IPTABLES_SETUP; then
-        iptables -t nat -D OUTPUT -p tcp --dport 443 \
-            -m owner ! --uid-owner "$MITM_USER" \
-            -j REDIRECT --to-port "$MITM_PORT" 2>/dev/null || true
-        echo "[*] iptables redirect removed"
-    fi
-    if $IP6TABLES_SETUP; then
-        ip6tables -D OUTPUT -p tcp --dport 443 -j REJECT --reject-with tcp-reset 2>/dev/null || true
-        echo "[*] ip6tables reject removed"
-    fi
-    if [ -f "/usr/local/share/ca-certificates/mitmproxy.crt" ]; then
-        rm -f "/usr/local/share/ca-certificates/mitmproxy.crt"
-        update-ca-certificates >/dev/null 2>&1
-    fi
-    echo "[*] Stopping mitmdump (PID $MITM_PID)..."
-    kill "$MITM_PID" 2>/dev/null || true
-    wait "$MITM_PID" 2>/dev/null || true
     echo "[*] Done. Captured data:"
-    [ -f "$MITM_JSONL" ] && echo "    MITM log:   $MITM_JSONL ($(wc -l < "$MITM_JSONL") lines)"
-    [ -f "$EBPF_FILE" ] && echo "    eBPF log:   $EBPF_FILE ($(wc -l < "$EBPF_FILE") lines)"
-    [ -n "$PID_WRAPPER_SCRIPT" ] && rm -f "$PID_WRAPPER_SCRIPT"
-    [ -n "${COMBINED_CA:-}" ] && rm -f "$COMBINED_CA"
+    [[ -f "$EBPF_FILE" ]] && echo "    eBPF log:   $EBPF_FILE ($(wc -l < "$EBPF_FILE") lines)"
+    if [[ -f "$PROXY_LOG_DIR/$TRACE_ID" ]]; then
+        echo "    Proxy log:  $PROXY_LOG_DIR/$TRACE_ID ($(wc -l < "$PROXY_LOG_DIR/$TRACE_ID") lines)"
+    fi
+    [[ -n "$PID_WRAPPER_SCRIPT" ]] && rm -f "$PID_WRAPPER_SCRIPT"
     rm -f "$ROOT_PID_FILE"
 }
 trap cleanup EXIT
@@ -371,6 +255,12 @@ trap cleanup EXIT
 # Build the agent command args
 AGENT_ARGS=("${TASK[@]}")
 make_pid_wrapper
+
+if ! set_proxy_active_trace "$TRACE_ID"; then
+    echo "Error: could not set active trace file on proxy endpoint: $PROXY_CONTROL_URL" >&2
+    echo "Hint: start proxy with 'make proxy' or override MANTLE_PROXY_CONTROL_URL." >&2
+    exit 1
+fi
 
 if ! $ENABLE_EBPF; then
     echo "[*] Running $AGENT_BIN interactively (eBPF disabled to preserve TTY)..."
@@ -390,7 +280,7 @@ if ! command -v bpftrace >/dev/null 2>&1; then
     echo "Error: bpftrace is required for BPF tracing but was not found in PATH." >&2
     exit 1
 fi
-if [ ! -f "$EBPF_CAPTURE_SCRIPT" ]; then
+if [[ ! -f "$EBPF_CAPTURE_SCRIPT" ]]; then
     echo "Error: eBPF capture wrapper not found at $EBPF_CAPTURE_SCRIPT" >&2
     exit 1
 fi

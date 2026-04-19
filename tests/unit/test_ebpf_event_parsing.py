@@ -142,6 +142,30 @@ class TestEventFromLine:
         assert event["type"] == "fd_open"
         assert event["fd"] == 5
 
+    def test_connect4_sockaddr_event(self):
+        # IPv4 127.0.0.1 encoded from kernel sockaddr read on little-endian host.
+        # Port 443 in network order appears as 47873 when read as host u16.
+        event = self._parse("EVT|1000000000|connect4|200|7|16777343|47873")
+        assert event is not None
+        assert event["type"] == "net_connect"
+        assert event["fd"] == 7
+        assert event["dest"] == "127.0.0.1:443"
+        assert event["transport"] == "tcp"
+        assert event["family"] == "AF_INET"
+        assert event["endpoint_source"] == "connect_sockaddr"
+
+    def test_connect6_sockaddr_event(self):
+        # IPv6 connect target with port 443 (raw u16=47873 before byte swap).
+        event = self._parse("EVT|1000000000|connect6|200|7|1615335712|24648|0|2290614272|47873")
+        assert event is not None
+        assert event["type"] == "net_connect"
+        assert event["fd"] == 7
+        assert event["dest"].endswith(":443")
+        assert "::8888" in event["dest"]
+        assert event["transport"] == "tcp"
+        assert event["family"] == "AF_INET6"
+        assert event["endpoint_source"] == "connect_sockaddr"
+
 
 @pytest.mark.unit
 class TestCommandForBpftrace:

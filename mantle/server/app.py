@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from typing import Any
 
@@ -36,9 +37,20 @@ def _resolve_paths() -> tuple[Path, Path]:
 
 
 WATCH_DIR, EVENTS_DIR = _resolve_paths()
-MITM_DIR = WATCH_DIR.parent / "mitm" if WATCH_DIR else None
+_DEFAULT_PROXY_DIR = WATCH_DIR.parent.parent / "litellm_proxy" / "bpf_logs" if WATCH_DIR else None
+LLM_CAPTURE_SOURCE = str(os.getenv("MANTLE_LLM_CAPTURE_SOURCE", "proxy")).strip().lower() or "proxy"
+PROXY_DIR_ENV = str(os.getenv("MANTLE_PROXY_LOG_DIR", "")).strip()
+PROXY_LOG_FILE_ENV = str(os.getenv("MANTLE_PROXY_LOG_FILE", "")).strip()
+PROXY_DIR = Path(PROXY_DIR_ENV).expanduser() if PROXY_DIR_ENV else _DEFAULT_PROXY_DIR
+PROXY_LOG_FILE = Path(PROXY_LOG_FILE_ENV).expanduser() if PROXY_LOG_FILE_ENV else None
 
-store = TraceStore(trace_dir=WATCH_DIR, events_dir=EVENTS_DIR, mitm_dir=MITM_DIR)
+store = TraceStore(
+	trace_dir=WATCH_DIR,
+	events_dir=EVENTS_DIR,
+	proxy_dir=PROXY_DIR,
+	llm_capture_source=LLM_CAPTURE_SOURCE,
+	proxy_log_file=PROXY_LOG_FILE,
+)
 
 STATIC_DIR = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -123,7 +135,7 @@ def get_llm_schemas() -> dict[str, Any]:
 
 @app.post("/api/settings/llm-schemas")
 def set_llm_schemas(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
-	"""Update LLM schema parsing rules used for MITM trace interpretation."""
+	"""Update LLM schema parsing rules used for proxy-capture interpretation."""
 	schemas = payload.get("schemas") if isinstance(payload, dict) else []
 	if not isinstance(schemas, list):
 		raise HTTPException(status_code=400, detail="schemas must be a list")
@@ -222,6 +234,25 @@ def raw_resource_events(trace_id: str, turn_id: str, resource_type: str, resourc
 		return store.raw_resource_events(trace_id, turn_id, resource_type, resource_key)
 	except KeyError:
 		raise HTTPException(status_code=404, detail="Resource events not found")
+
+
+@app.get("/api/traces/{trace_id}/display-trace")
+def display_trace(
+	trace_id: str,
+	pid: int | None = None,
+	start_timestamp: float | None = None,
+	end_timestamp: float | None = None,
+) -> dict[str, Any]:
+	"""Return a unified event-view payload scoped by optional pid and timestamp window."""
+	try:
+		return store.display_trace(
+			trace_id,
+			pid=pid,
+			start_timestamp=start_timestamp,
+			end_timestamp=end_timestamp,
+		)
+	except KeyError:
+		raise HTTPException(status_code=404, detail="Trace or pid not found")
 
 
 @app.get("/api/traces/{trace_id}/process-graph/{pid}")

@@ -244,7 +244,7 @@ class SQLiteTraceStore:
 
             for event in agent_events:
                 ts_ns = self._ts_ns(event.get("ts"))
-                source = str(event.get("_source") or event.get("source") or "mitmproxy")
+                source = str(event.get("_source") or event.get("source") or "proxy")
                 event_type = str(event.get("event_type") or event.get("type") or "agent_event")
                 line_no = self._int_or_none(event.get("line_no"))
                 pid = self._int_or_none(event.get("pid"))
@@ -314,7 +314,11 @@ class SQLiteTraceStore:
                         continue
                     call = pair.get("call") or {}
                     result = pair.get("result") or {}
-                    tool_name = str(call.get("payload", {}).get("tool_name") or "unknown")
+                    tool_name = str(
+                        call.get("payload", {}).get("tool_name")
+                        or pair.get("tool_name")
+                        or "unknown"
+                    )
                     tool_start = self._ts_ns(call.get("ts") or turn.get("start_ts"))
                     tool_end = self._ts_ns(result.get("ts") or call.get("ts") or turn.get("end_ts"))
                     if tool_end <= tool_start:

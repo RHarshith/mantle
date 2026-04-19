@@ -8,3 +8,5 @@ trace_scenarios/*/.runtime/
 
 .github/*
 commands
+run_codex.sh
+experiments/*

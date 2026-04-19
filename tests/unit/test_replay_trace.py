@@ -87,7 +87,7 @@ class TestBuildReplayTurnDetail:
             "label": "Turn 2",
             "response_text": "Wrote today's date to temp.txt.",
             "replay_context_sections": [],
-            # Real traces can have usage-only action sections from MITM parsing.
+            # Real traces can have usage-only action sections from payload parsing.
             "replay_action_sections": [
                 {"id": "usage", "label": "Usage", "values": [{"prompt_tokens": 10, "completion_tokens": 5}]},
             ],

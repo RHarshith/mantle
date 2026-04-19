@@ -32,16 +32,16 @@ class TestTraceStorePollAndList:
             trace = traces[0]
             assert "trace_id" in trace
 
-    def test_mitm_non_object_lines_are_ignored(self, tmp_path):
+    def test_proxy_non_object_lines_are_ignored(self, tmp_path):
         obs = tmp_path / "obs"
         traces_dir = obs / "traces"
         events_dir = obs / "events"
-        mitm_dir = obs / "mitm"
+        proxy_dir = obs / "proxy_logs"
         traces_dir.mkdir(parents=True)
         events_dir.mkdir(parents=True)
-        mitm_dir.mkdir(parents=True)
+        proxy_dir.mkdir(parents=True)
 
-        trace_id = "mitm_scalar_regression.ebpf.jsonl"
+        trace_id = "proxy_scalar_regression.ebpf.jsonl"
         trace_file = traces_dir / trace_id
         trace_file.write_text(
             json.dumps(
@@ -60,8 +60,8 @@ class TestTraceStorePollAndList:
             encoding="utf-8",
         )
 
-        mitm_file = mitm_dir / "mitm_scalar_regression.mitm.jsonl"
-        mitm_file.write_text(
+        proxy_file = proxy_dir / "proxy_scalar_regression.proxy.jsonl"
+        proxy_file.write_text(
             "\n".join(
                 [
                     "1",
@@ -80,7 +80,7 @@ class TestTraceStorePollAndList:
             encoding="utf-8",
         )
 
-        store = TraceStore(trace_dir=traces_dir, events_dir=events_dir, mitm_dir=mitm_dir)
+        store = TraceStore(trace_dir=traces_dir, events_dir=events_dir, proxy_dir=proxy_dir)
         asyncio.get_event_loop().run_until_complete(store.poll_once())
 
         traces = store.list_traces()
@@ -88,6 +88,211 @@ class TestTraceStorePollAndList:
         # One api_call should be ingested from the valid response object, while
         # the scalar line is skipped without crashing.
         assert traces[0]["agent_event_count"] == 1
+
+    def test_activity_only_trace_uses_turn_1_instead_of_setup(self, tmp_path):
+        obs = tmp_path / "obs"
+        traces_dir = obs / "traces"
+        events_dir = obs / "events"
+        proxy_dir = obs / "proxy_logs"
+        traces_dir.mkdir(parents=True)
+        events_dir.mkdir(parents=True)
+        proxy_dir.mkdir(parents=True)
+
+        trace_id = "activity_only_turn_fallback.ebpf.jsonl"
+        (traces_dir / trace_id).write_text(
+            json.dumps(
+                {
+                    "ts": 1710000200.0,
+                    "line_no": 1,
+                    "type": "command_exec",
+                    "pid": 123,
+                    "ppid": 1,
+                    "exec_path": "/usr/bin/bash",
+                    "argv": ["bash", "-lc", "echo hi"],
+                    "command": "bash -lc 'echo hi'",
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "ts": 1710000200.2,
+                    "line_no": 2,
+                    "type": "net_connect",
+                    "pid": 123,
+                    "fd": 7,
+                    "dest": "140.82.113.4:443",
+                    "transport": "tcp",
+                    "family": "AF_INET",
+                    "ok": True,
+                    "label": "connect 140.82.113.4:443",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        store = TraceStore(trace_dir=traces_dir, events_dir=events_dir, proxy_dir=proxy_dir)
+        asyncio.get_event_loop().run_until_complete(store.poll_once())
+
+        overview = store.turns_overview(trace_id)
+        assert overview["executive_summary"]["turns"] == 1
+        assert len(overview["turns"]) == 1
+        assert overview["turns"][0]["turn_id"] == "turn_1"
+        assert overview["turns"][0]["label"] == "T1"
+
+
+@pytest.mark.integration
+class TestTraceStoreLiteLLMProxyIngest:
+    def _write_min_trace(self, traces_dir: Path, trace_id: str) -> None:
+        (traces_dir / trace_id).write_text(
+            json.dumps(
+                {
+                    "ts": 1710000100.0,
+                    "line_no": 1,
+                    "type": "command_exec",
+                    "pid": 777,
+                    "ppid": 1,
+                    "exec_path": "/usr/bin/python3",
+                    "argv": ["python3", "-c", "pass"],
+                    "command": "python3 -c pass",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def _write_proxy_record(self, path: Path) -> None:
+        path.write_text(
+            json.dumps(
+                {
+                    "direction": "response",
+                    "ts": 1710000101.5,
+                    "url": "https://api.openai.com/v1/responses",
+                    "method": "POST",
+                    "status_code": 200,
+                    "duration_ms": 250,
+                    "model": "gpt-5.4-nano",
+                    "request_body": {
+                        "model": "gpt-5.4-nano",
+                        "input": [{"role": "user", "content": "hello from proxy"}],
+                    },
+                    "response_body": {
+                        "output_text": "hello from assistant",
+                        "output": [
+                            {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [
+                                    {"type": "output_text", "text": "hello from assistant"}
+                                ],
+                            }
+                        ],
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def test_proxy_source_opt_in_ingests_proxy_events(self, tmp_path: Path):
+        obs = tmp_path / "obs"
+        traces_dir = obs / "traces"
+        events_dir = obs / "events"
+        proxy_dir = obs / "proxy_logs"
+        traces_dir.mkdir(parents=True)
+        events_dir.mkdir(parents=True)
+        proxy_dir.mkdir(parents=True)
+
+        trace_id = "proxy_ingest_opt_in.ebpf.jsonl"
+        self._write_min_trace(traces_dir, trace_id)
+        self._write_proxy_record(proxy_dir / "proxy_ingest_opt_in.proxy.jsonl")
+
+        store = TraceStore(
+            trace_dir=traces_dir,
+            events_dir=events_dir,
+            proxy_dir=proxy_dir,
+            llm_capture_source="proxy",
+        )
+        asyncio.get_event_loop().run_until_complete(store.poll_once())
+
+        traces = store.list_traces()
+        assert len(traces) == 1
+        assert traces[0]["agent_event_count"] >= 1
+        state = store.traces[trace_id]
+        assert any(str(ev.get("_source") or "") == "proxy" for ev in state.agent_events)
+
+    def test_proxy_logs_are_ingested_when_source_is_default_proxy(self, tmp_path: Path):
+        obs = tmp_path / "obs"
+        traces_dir = obs / "traces"
+        events_dir = obs / "events"
+        proxy_dir = obs / "proxy_logs"
+        traces_dir.mkdir(parents=True)
+        events_dir.mkdir(parents=True)
+        proxy_dir.mkdir(parents=True)
+
+        trace_id = "proxy_ingest_opt_out.ebpf.jsonl"
+        self._write_min_trace(traces_dir, trace_id)
+        self._write_proxy_record(proxy_dir / "proxy_ingest_opt_out.proxy.jsonl")
+
+        store = TraceStore(
+            trace_dir=traces_dir,
+            events_dir=events_dir,
+            proxy_dir=proxy_dir,
+        )
+        asyncio.get_event_loop().run_until_complete(store.poll_once())
+
+        traces = store.list_traces()
+        assert len(traces) == 1
+        assert traces[0]["agent_event_count"] >= 1
+
+    def test_proxy_logs_named_as_trace_file_are_ingested(self, tmp_path: Path):
+        obs = tmp_path / "obs"
+        traces_dir = obs / "traces"
+        events_dir = obs / "events"
+        proxy_dir = obs / "proxy_logs"
+        traces_dir.mkdir(parents=True)
+        events_dir.mkdir(parents=True)
+        proxy_dir.mkdir(parents=True)
+
+        trace_id = "proxy_same_name.ebpf.jsonl"
+        self._write_min_trace(traces_dir, trace_id)
+        self._write_proxy_record(proxy_dir / trace_id)
+
+        store = TraceStore(
+            trace_dir=traces_dir,
+            events_dir=events_dir,
+            proxy_dir=proxy_dir,
+            llm_capture_source="proxy",
+        )
+        asyncio.get_event_loop().run_until_complete(store.poll_once())
+
+        traces = store.list_traces()
+        assert len(traces) == 1
+        assert traces[0]["agent_event_count"] >= 1
+
+    def test_proxy_source_raises_when_log_selection_is_ambiguous(self, tmp_path: Path):
+        obs = tmp_path / "obs"
+        traces_dir = obs / "traces"
+        events_dir = obs / "events"
+        proxy_dir = obs / "proxy_logs"
+        traces_dir.mkdir(parents=True)
+        events_dir.mkdir(parents=True)
+        proxy_dir.mkdir(parents=True)
+
+        trace_id = "proxy_ingest_ambiguous.ebpf.jsonl"
+        self._write_min_trace(traces_dir, trace_id)
+        self._write_proxy_record(proxy_dir / "43100.log")
+        self._write_proxy_record(proxy_dir / "43104.log")
+
+        store = TraceStore(
+            trace_dir=traces_dir,
+            events_dir=events_dir,
+            proxy_dir=proxy_dir,
+            llm_capture_source="proxy",
+        )
+
+        with pytest.raises(RuntimeError, match="Ambiguous proxy log selection"):
+            asyncio.get_event_loop().run_until_complete(store.poll_once())
 
 
 @pytest.mark.integration
@@ -127,12 +332,12 @@ class TestTraceStoreGraphAndViews:
         obs_root = repo_root / "obs"
         traces_dir = obs_root / "traces"
         events_dir = obs_root / "events"
-        mitm_dir = obs_root / "mitm"
+        proxy_dir = obs_root / "proxy_logs"
 
-        if not traces_dir.exists() or not events_dir.exists() or not mitm_dir.exists():
+        if not traces_dir.exists() or not events_dir.exists() or not proxy_dir.exists():
             pytest.skip("Local obs fixtures not available")
 
-        store = TraceStore(trace_dir=traces_dir, events_dir=events_dir, mitm_dir=mitm_dir)
+        store = TraceStore(trace_dir=traces_dir, events_dir=events_dir, proxy_dir=proxy_dir)
         asyncio.get_event_loop().run_until_complete(store.poll_once())
 
         target = "python_20260414_105434.ebpf.jsonl"
@@ -171,10 +376,10 @@ class TestTraceCaptureQuality:
         obs = tmp_path / "obs"
         traces_dir = obs / "traces"
         events_dir = obs / "events"
-        mitm_dir = obs / "mitm"
+        proxy_dir = obs / "proxy_logs"
         traces_dir.mkdir(parents=True)
         events_dir.mkdir(parents=True)
-        mitm_dir.mkdir(parents=True)
+        proxy_dir.mkdir(parents=True)
 
         trace_id = "proxy_tier_quality.ebpf.jsonl"
         trace_file = traces_dir / trace_id
@@ -209,8 +414,8 @@ class TestTraceCaptureQuality:
             encoding="utf-8",
         )
 
-        mitm_file = mitm_dir / "proxy_tier_quality.mitm.jsonl"
-        mitm_file.write_text(
+        proxy_file = proxy_dir / "proxy_tier_quality.proxy.jsonl"
+        proxy_file.write_text(
             json.dumps(
                 {
                     "direction": "response",
@@ -225,13 +430,165 @@ class TestTraceCaptureQuality:
             encoding="utf-8",
         )
 
-        store = TraceStore(trace_dir=traces_dir, events_dir=events_dir, mitm_dir=mitm_dir)
+        store = TraceStore(trace_dir=traces_dir, events_dir=events_dir, proxy_dir=proxy_dir)
         asyncio.get_event_loop().run_until_complete(store.poll_once())
 
         quality = store.trace_capture_quality(trace_id)
         assert quality["overall_tier"] == "tier1_payload_exact"
         assert quality["tiers"]["tier1_payload_exact"] >= 1
-        assert quality["inference_sources"].get("mitm_interval_exact", 0) >= 1
+        assert quality["inference_sources"].get("proxy_interval_exact", 0) >= 1
+
+
+@pytest.mark.integration
+class TestDisplayTraceView:
+    def _write_scope_trace(self, traces_dir: Path, trace_id: str) -> None:
+        events = [
+            {
+                "ts": 1710000400.0,
+                "line_no": 1,
+                "type": "command_exec",
+                "pid": 100,
+                "ppid": 1,
+                "exec_path": "/usr/bin/bash",
+                "argv": ["bash", "-lc", "echo root"],
+                "command": "bash -lc 'echo root'",
+            },
+            {
+                "ts": 1710000400.1,
+                "line_no": 2,
+                "type": "file_read",
+                "pid": 100,
+                "path": "/workspace/root.txt",
+            },
+            {
+                "ts": 1710000400.2,
+                "line_no": 3,
+                "type": "process_spawn",
+                "pid": 100,
+                "child_pid": 200,
+            },
+            {
+                "ts": 1710000400.25,
+                "line_no": 4,
+                "type": "command_exec",
+                "pid": 200,
+                "ppid": 100,
+                "exec_path": "/usr/bin/python3",
+                "argv": ["python3", "-c", "print(1)"],
+                "command": "python3 -c print(1)",
+            },
+            {
+                "ts": 1710000400.3,
+                "line_no": 5,
+                "type": "file_read",
+                "pid": 200,
+                "path": "/workspace/child.txt",
+            },
+            {
+                "ts": 1710000400.35,
+                "line_no": 6,
+                "type": "net_connect",
+                "pid": 100,
+                "dest": "127.0.0.1:8899",
+                "transport": "tcp",
+                "family": "AF_INET",
+                "ok": True,
+            },
+            {
+                "ts": 1710000400.4,
+                "line_no": 7,
+                "type": "net_connect",
+                "pid": 200,
+                "dest": "127.0.0.1:8899",
+                "transport": "tcp",
+                "family": "AF_INET",
+                "ok": True,
+            },
+            {
+                "ts": 1710000400.5,
+                "line_no": 8,
+                "type": "process_exit",
+                "pid": 200,
+            },
+            {
+                "ts": 1710000400.6,
+                "line_no": 9,
+                "type": "process_exit",
+                "pid": 100,
+            },
+            {
+                "ts": 1710000401.0,
+                "line_no": 10,
+                "type": "command_exec",
+                "pid": 300,
+                "ppid": 1,
+                "exec_path": "/usr/bin/cat",
+                "argv": ["cat", "README.md"],
+                "command": "cat README.md",
+            },
+            {
+                "ts": 1710000401.1,
+                "line_no": 11,
+                "type": "file_read",
+                "pid": 300,
+                "path": "/workspace/other_root.txt",
+            },
+        ]
+        (traces_dir / trace_id).write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+
+    def test_display_trace_timestamp_scope_reports_nested_metrics(self, tmp_path: Path):
+        obs = tmp_path / "obs"
+        traces_dir = obs / "traces"
+        events_dir = obs / "events"
+        traces_dir.mkdir(parents=True)
+        events_dir.mkdir(parents=True)
+
+        trace_id = "display_trace_scope.ebpf.jsonl"
+        self._write_scope_trace(traces_dir, trace_id)
+
+        store = TraceStore(trace_dir=traces_dir, events_dir=events_dir, proxy_dir=None)
+        asyncio.get_event_loop().run_until_complete(store.poll_once())
+
+        view = store.display_trace(
+            trace_id,
+            start_timestamp=1710000400.0,
+            end_timestamp=1710000400.9,
+        )
+
+        summary = view["summary"]
+        assert summary["totals"]["files_read"] == 2
+        assert summary["direct"]["files_read"] == 1
+        assert summary["nested"]["files_read"] == 1
+        assert summary["totals"]["network_calls"] == 2
+        assert summary["direct"]["network_calls"] == 1
+        assert summary["nested"]["network_calls"] == 1
+        assert summary["totals"]["process_spawns"] == 1
+
+    def test_display_trace_pid_scope_without_timestamps_uses_lifecycle(self, tmp_path: Path):
+        obs = tmp_path / "obs"
+        traces_dir = obs / "traces"
+        events_dir = obs / "events"
+        traces_dir.mkdir(parents=True)
+        events_dir.mkdir(parents=True)
+
+        trace_id = "display_trace_lifecycle.ebpf.jsonl"
+        self._write_scope_trace(traces_dir, trace_id)
+
+        store = TraceStore(trace_dir=traces_dir, events_dir=events_dir, proxy_dir=None)
+        asyncio.get_event_loop().run_until_complete(store.poll_once())
+
+        view = store.display_trace(trace_id, pid=100)
+
+        scope = view["scope"]
+        summary = view["summary"]
+        assert scope["pid"] == 100
+        assert scope["start_timestamp"] is not None
+        assert scope["end_timestamp"] is not None
+        assert summary["totals"]["files_read"] == 2
+        assert summary["direct"]["files_read"] == 1
+        assert summary["nested"]["files_read"] == 1
+        # Root pid lifecycle scope must not include the later unrelated root pid=300 read.
+        assert summary["totals"]["files_read"] != 3
 
 
 @pytest.mark.integration

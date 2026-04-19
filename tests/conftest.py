@@ -65,24 +65,7 @@ SAMPLE_EBPF_EVENTS: list[dict[str, Any]] = [
     },
 ]
 
-SAMPLE_MITM_REQUEST: dict[str, Any] = {
-    "ts": 1710000002.5,
-    "direction": "request",
-    "url": "https://api.openai.com/v1/chat/completions",
-    "method": "POST",
-    "pid": 1000,
-    "model": "gpt-4",
-    "request_body": {
-        "model": "gpt-4",
-        "messages": [
-            {"role": "system", "content": "You are a test assistant."},
-            {"role": "user", "content": "Say hello."},
-        ],
-        "tools": [],
-    },
-}
-
-SAMPLE_MITM_RESPONSE: dict[str, Any] = {
+SAMPLE_PROXY_RESPONSE: dict[str, Any] = {
     "ts": 1710000003.0,
     "direction": "response",
     "url": "https://api.openai.com/v1/chat/completions",
@@ -91,7 +74,14 @@ SAMPLE_MITM_RESPONSE: dict[str, Any] = {
     "status_code": 200,
     "model": "gpt-4",
     "duration_ms": 500,
-    "request_body": SAMPLE_MITM_REQUEST["request_body"],
+    "request_body": {
+        "model": "gpt-4",
+        "messages": [
+            {"role": "system", "content": "You are a test assistant."},
+            {"role": "user", "content": "Say hello."},
+        ],
+        "tools": [],
+    },
     "response_body": {
         "choices": [
             {
@@ -154,10 +144,10 @@ def obs_dir(tmp_path: Path) -> Path:
     """Create a temporary obs directory structure matching Mantle's expected layout."""
     traces_dir = tmp_path / "traces"
     events_dir = tmp_path / "events"
-    mitm_dir = tmp_path / "mitm"
+    proxy_dir = tmp_path / "proxy_logs"
     traces_dir.mkdir()
     events_dir.mkdir()
-    mitm_dir.mkdir()
+    proxy_dir.mkdir()
     return tmp_path
 
 
@@ -172,11 +162,10 @@ def populated_obs_dir(obs_dir: Path) -> Path:
         for event in SAMPLE_EBPF_EVENTS:
             f.write(json.dumps(event) + "\n")
 
-    # Write MITM capture
-    mitm_file = obs_dir / "mitm" / "test_trace_001.mitm.jsonl"
-    with mitm_file.open("w") as f:
-        f.write(json.dumps(SAMPLE_MITM_REQUEST) + "\n")
-        f.write(json.dumps(SAMPLE_MITM_RESPONSE) + "\n")
+    # Write proxy capture
+    proxy_file = obs_dir / "proxy_logs" / "test_trace_001.proxy.jsonl"
+    with proxy_file.open("w") as f:
+        f.write(json.dumps(SAMPLE_PROXY_RESPONSE) + "\n")
 
     # Write agent events
     events_file = obs_dir / "events" / "test_trace_001.events.jsonl"
@@ -193,7 +182,7 @@ def empty_store(obs_dir: Path) -> TraceStore:
     return TraceStore(
         trace_dir=obs_dir / "traces",
         events_dir=obs_dir / "events",
-        mitm_dir=obs_dir / "mitm",
+        proxy_dir=obs_dir / "proxy_logs",
     )
 
 
@@ -203,5 +192,5 @@ def populated_store(populated_obs_dir: Path) -> TraceStore:
     return TraceStore(
         trace_dir=populated_obs_dir / "traces",
         events_dir=populated_obs_dir / "events",
-        mitm_dir=populated_obs_dir / "mitm",
+        proxy_dir=populated_obs_dir / "proxy_logs",
     )

@@ -1,6 +1,6 @@
 """Protocol for LLM payload parsing and schema application.
 
-Abstracts the logic that converts raw MITM HTTP captures into structured
+Abstracts the logic that converts raw proxy capture logs into structured
 prompt/response records using configurable LLM API schemas.
 """
 
@@ -13,10 +13,10 @@ from typing import Any, Protocol, runtime_checkable
 class ILLMParser(Protocol):
     """Contract for LLM payload parsing operations."""
 
-    def parse_llm_calls_from_mitm(
-        self, trace: Any, llm_api_schemas: list[dict[str, Any]]
+    def parse_llm_calls_from_capture(
+        self, capture_path: Any, llm_api_schemas: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """Parse MITM logs into turn-level prompt/response records."""
+        """Parse capture logs into turn-level prompt/response records."""
         ...
 
     def section_values(

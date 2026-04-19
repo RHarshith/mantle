@@ -13,6 +13,7 @@ from mantle.analysis.llm_parser import (
     normalize_llm_schemas,
     normalize_response_body_for_sections,
     normalize_streaming_response_body,
+    parse_llm_calls_from_capture,
     parse_sse_data_events,
     section_values,
     sections_to_text,
@@ -301,3 +302,45 @@ class TestNormalizeLLMSchemas:
         ]
         result = normalize_llm_schemas(custom)
         assert len(result) == 1
+
+
+@pytest.mark.unit
+class TestParseLLMCallsFromCapture:
+    def test_response_only_records_produce_multiple_boundaries(self, tmp_path):
+        capture = tmp_path / "capture.jsonl"
+        capture.write_text(
+            "\n".join(
+                [
+                    '{"ts": 10.0, "direction": "response", "url": "https://api.openai.com/v1/chat/completions", "response_body": {"choices": [{"message": {"content": "first"}}]}}',
+                    '{"ts": 20.0, "direction": "response", "url": "https://api.openai.com/v1/chat/completions", "response_body": {"choices": [{"message": {"content": "second"}}]}}',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        calls = parse_llm_calls_from_capture(capture, builtin_llm_api_schemas())
+
+        assert len(calls) == 2
+        assert [float(item["ts"]) for item in calls] == [10.0, 20.0]
+        assert "first" in calls[0]["response_text"]
+        assert "second" in calls[1]["response_text"]
+
+    def test_request_response_pair_keeps_request_context(self, tmp_path):
+        capture = tmp_path / "capture.jsonl"
+        capture.write_text(
+            "\n".join(
+                [
+                    '{"ts": 10.0, "direction": "request", "url": "https://api.openai.com/v1/chat/completions", "request_body": {"messages": [{"role": "user", "content": "hello"}]}}',
+                    '{"ts": 11.0, "direction": "response", "url": "https://api.openai.com/v1/chat/completions", "response_body": {"choices": [{"message": {"content": "hi"}}]}}',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        calls = parse_llm_calls_from_capture(capture, builtin_llm_api_schemas())
+
+        assert len(calls) == 1
+        assert "hello" in calls[0]["prompt_text"]
+        assert "hi" in calls[0]["response_text"]

@@ -28,7 +28,7 @@ def dashboard_app(populated_obs_dir: Path):
     # Rewire the global store with our test data directory.
     store.trace_dir = populated_obs_dir / "traces"
     store.events_dir = populated_obs_dir / "events"
-    store.mitm_dir = populated_obs_dir / "mitm"
+    store.proxy_dir = populated_obs_dir / "proxy_logs"
     store.traces.clear()
     store.version = 0
 
@@ -69,6 +69,23 @@ class TestDashboardAPI:
     def test_get_settings(self, client):
         resp = client.get("/api/settings/llm-schemas")
         assert resp.status_code == 200
+
+    def test_display_trace_endpoint(self, client):
+        traces_resp = client.get("/api/traces")
+        assert traces_resp.status_code == 200
+        traces_data = traces_resp.json()
+        traces = traces_data.get("traces") if isinstance(traces_data, dict) else traces_data
+        assert isinstance(traces, list)
+        assert traces
+
+        trace_id = traces[0]["trace_id"]
+        resp = client.get(f"/api/traces/{trace_id}/display-trace")
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload.get("trace_id") == trace_id
+        assert "summary" in payload
+        assert "timeline" in payload
+        assert "scope" in payload
 
     def test_unknown_trace_returns_404_or_error(self, client):
         resp = client.get("/api/traces/nonexistent/graph")

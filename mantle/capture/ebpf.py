@@ -34,95 +34,114 @@ tracepoint:sched:sched_process_fork
 }
 
 tracepoint:sched:sched_process_exec
-/@tracked[pid]/
+/@tracked[tid]/
 {
-  $ppid = @parent[pid];
+    $ppid = @parent[tid];
   printf("EVT|%llu|exec|%d|%d|%s|%s\n", nsecs, pid, $ppid, comm, str(args->filename));
 }
 
 tracepoint:sched:sched_process_exit
-/@tracked[pid]/
+/@tracked[tid]/
 {
-  $ppid = @parent[pid];
+    $ppid = @parent[tid];
   printf("EVT|%llu|exit|%d|%d|%s\n", nsecs, pid, $ppid, comm);
-  delete(@tracked[pid]);
-  delete(@parent[pid]);
+    delete(@tracked[tid]);
+    delete(@parent[tid]);
 }
 
 tracepoint:syscalls:sys_enter_openat
-/@tracked[pid]/
+/@tracked[tid]/
 {
   printf("EVT|%llu|openat|%d|%s|%d\n", nsecs, pid, str(args->filename), args->flags);
 }
 
 tracepoint:syscalls:sys_exit_openat
-/@tracked[pid]/
+/@tracked[tid]/
 {
     printf("EVT|%llu|openat_ret|%d|%d\n", nsecs, pid, args->ret);
 }
 
 tracepoint:syscalls:sys_enter_unlinkat
-/@tracked[pid]/
+/@tracked[tid]/
 {
   printf("EVT|%llu|unlinkat|%d|%s\n", nsecs, pid, str(args->pathname));
 }
 
 tracepoint:syscalls:sys_enter_renameat
-/@tracked[pid]/
+/@tracked[tid]/
 {
   printf("EVT|%llu|renameat|%d|%s|%s\n", nsecs, pid, str(args->oldname), str(args->newname));
 }
 
 tracepoint:syscalls:sys_exit_renameat
-/@tracked[pid]/
+/@tracked[tid]/
 {
     printf("EVT|%llu|renameat_ret|%d|%d\n", nsecs, pid, args->ret);
 }
 
 tracepoint:syscalls:sys_enter_renameat2
-/@tracked[pid]/
+/@tracked[tid]/
 {
   printf("EVT|%llu|renameat2|%d|%s|%s\n", nsecs, pid, str(args->oldname), str(args->newname));
 }
 
 tracepoint:syscalls:sys_exit_renameat2
-/@tracked[pid]/
+/@tracked[tid]/
 {
     printf("EVT|%llu|renameat2_ret|%d|%d\n", nsecs, pid, args->ret);
 }
 
 tracepoint:syscalls:sys_enter_connect
-/@tracked[pid]/
+/@tracked[tid]/
 {
-  printf("EVT|%llu|connect|%d|%d\n", nsecs, pid, args->fd);
+    $sa = (struct sockaddr *)uptr(args->uservaddr);
+    if ($sa->sa_family == 2) {
+        $sin = (struct sockaddr_in *)uptr(args->uservaddr);
+        printf("EVT|%llu|connect4|%d|%d|%u|%u\n", nsecs, pid, args->fd, $sin->sin_addr.s_addr, $sin->sin_port);
+    } else if ($sa->sa_family == 10) {
+        $sin6 = (struct sockaddr_in6 *)uptr(args->uservaddr);
+        printf(
+            "EVT|%llu|connect6|%d|%d|%u|%u|%u|%u|%u\n",
+            nsecs,
+            pid,
+            args->fd,
+            $sin6->sin6_addr.in6_u.u6_addr32[0],
+            $sin6->sin6_addr.in6_u.u6_addr32[1],
+            $sin6->sin6_addr.in6_u.u6_addr32[2],
+            $sin6->sin6_addr.in6_u.u6_addr32[3],
+            $sin6->sin6_port
+        );
+    } else {
+        printf("EVT|%llu|connect|%d|%d\n", nsecs, pid, args->fd);
+    }
 }
 
 tracepoint:syscalls:sys_enter_sendto
-/@tracked[pid]/
+/@tracked[tid]/
 {
   printf("EVT|%llu|sendto|%d|%d|%d\n", nsecs, pid, args->fd, args->len);
 }
 
 tracepoint:syscalls:sys_enter_recvfrom
-/@tracked[pid]/
+/@tracked[tid]/
 {
   printf("EVT|%llu|recvfrom|%d|%d|%d\n", nsecs, pid, args->fd, args->size);
 }
 
 tracepoint:syscalls:sys_enter_write
-/@tracked[pid]/
+/@tracked[tid]/
 {
     printf("EVT|%llu|write|%d|%d|%d\n", nsecs, pid, args->fd, args->count);
 }
 
 tracepoint:syscalls:sys_exit_write
-/@tracked[pid]/
+/@tracked[tid]/
 {
     printf("EVT|%llu|write_ret|%d|%d\n", nsecs, pid, args->ret);
 }
 
 tracepoint:syscalls:sys_enter_close
-/@tracked[pid]/
+/@tracked[tid]/
 {
     printf("EVT|%llu|close|%d|%d\n", nsecs, pid, args->fd);
 }
@@ -162,6 +181,39 @@ def _decode_ipv6(hex_addr: str) -> str:
         # /proc/net/tcp6 stores each 32-bit word in little-endian order.
         w0, w1, w2, w3 = struct.unpack("<IIII", raw)
         packed = struct.pack(">IIII", w0, w1, w2, w3)
+        return socket.inet_ntop(socket.AF_INET6, packed)
+    except Exception:
+        return "unknown"
+
+
+def _bswap_u16(value: int) -> int:
+    v = int(value) & 0xFFFF
+    return ((v & 0x00FF) << 8) | ((v & 0xFF00) >> 8)
+
+
+def _bswap_u32(value: int) -> int:
+    v = int(value) & 0xFFFFFFFF
+    return ((v & 0x000000FF) << 24) | ((v & 0x0000FF00) << 8) | ((v & 0x00FF0000) >> 8) | ((v & 0xFF000000) >> 24)
+
+
+def _decode_ipv4_kernel_u32(value: int) -> str:
+    try:
+        packed = struct.pack("<I", int(value) & 0xFFFFFFFF)
+        return socket.inet_ntop(socket.AF_INET, packed)
+    except Exception:
+        return "unknown"
+
+
+def _decode_ipv6_kernel_words(words: tuple[int, int, int, int]) -> str:
+    try:
+        w0, w1, w2, w3 = words
+        packed = struct.pack(
+            ">IIII",
+            _bswap_u32(w0),
+            _bswap_u32(w1),
+            _bswap_u32(w2),
+            _bswap_u32(w3),
+        )
         return socket.inet_ntop(socket.AF_INET6, packed)
     except Exception:
         return "unknown"
@@ -472,6 +524,69 @@ def _event_from_line(
             "ok": ret == 0,
             "ret": ret,
             "label": f"rename ret={ret}",
+        }
+
+    if kind == "connect4":
+        if len(parts) < 7:
+            return None
+        pid = _safe_int(parts[3])
+        fd = _safe_int(parts[4], -1)
+        addr_raw = _safe_int(parts[5], 0)
+        port_raw = _safe_int(parts[6], 0)
+        dest = f"{_decode_ipv4_kernel_u32(addr_raw)}:{_bswap_u16(port_raw)}"
+        cached = {
+            "dest": dest,
+            "transport": "tcp",
+            "family": "AF_INET",
+            "source": "connect_sockaddr",
+        }
+        socket_cache[(pid, fd)] = cached
+        return {
+            "ts": ts,
+            "line_no": seq,
+            "type": "net_connect",
+            "pid": pid,
+            "fd": fd,
+            "dest": cached["dest"],
+            "transport": cached["transport"],
+            "family": cached["family"],
+            "ok": True,
+            "endpoint_source": cached["source"],
+            "label": f"connect {cached['dest']}",
+        }
+
+    if kind == "connect6":
+        if len(parts) < 10:
+            return None
+        pid = _safe_int(parts[3])
+        fd = _safe_int(parts[4], -1)
+        words = (
+            _safe_int(parts[5], 0),
+            _safe_int(parts[6], 0),
+            _safe_int(parts[7], 0),
+            _safe_int(parts[8], 0),
+        )
+        port_raw = _safe_int(parts[9], 0)
+        dest = f"{_decode_ipv6_kernel_words(words)}:{_bswap_u16(port_raw)}"
+        cached = {
+            "dest": dest,
+            "transport": "tcp",
+            "family": "AF_INET6",
+            "source": "connect_sockaddr",
+        }
+        socket_cache[(pid, fd)] = cached
+        return {
+            "ts": ts,
+            "line_no": seq,
+            "type": "net_connect",
+            "pid": pid,
+            "fd": fd,
+            "dest": cached["dest"],
+            "transport": cached["transport"],
+            "family": cached["family"],
+            "ok": True,
+            "endpoint_source": cached["source"],
+            "label": f"connect {cached['dest']}",
         }
 
     if kind == "connect":

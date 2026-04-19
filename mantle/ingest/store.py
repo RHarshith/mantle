@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 from mantle.analysis.llm_parser import (
     builtin_llm_api_schemas,
     normalize_llm_schemas,
-    parse_llm_calls_from_mitm,
+    parse_llm_calls_from_capture,
 )
 from mantle.errors import log_exception
 from mantle.analysis.replay import (
@@ -107,15 +107,15 @@ class TraceState:
     trace_offset: int = 0
     trace_line_no: int = 0
     events_offset: int = 0
-    mitm_offset: int = 0
-    mitm_path: Path | None = None
+    proxy_offset: int = 0
+    proxy_path: Path | None = None
     complete: bool = False
     root_pid: int | None = None
     pending_syscalls: dict[tuple[int, str], str] = field(default_factory=dict)
     process_parent: dict[int, int] = field(default_factory=dict)
     pid_fds: dict[tuple[int, int], dict[str, Any]] = field(default_factory=dict)  # (pid, fd) -> socket info
-    mitm_endpoints: set[str] = field(default_factory=set)
-    mitm_intervals: list[tuple[float, float, str]] = field(default_factory=list)  # (start_ts, end_ts, host:port) sorted by start_ts
+    payload_endpoints: set[str] = field(default_factory=set)
+    payload_intervals: list[tuple[float, float, str]] = field(default_factory=list)  # (start_ts, end_ts, host:port) sorted by start_ts
     sys_events: list[dict[str, Any]] = field(default_factory=list)
     agent_events: list[dict[str, Any]] = field(default_factory=list)
 
@@ -123,11 +123,25 @@ class TraceState:
 class TraceStore:
     """Stateful store for trace ingestion, correlation, and graph projection."""
 
-    def __init__(self, trace_dir: Path, events_dir: Path, mitm_dir: Path | None = None):
+    def __init__(
+        self,
+        trace_dir: Path,
+        events_dir: Path,
+        proxy_dir: Path | None = None,
+        llm_capture_source: str = "proxy",
+        proxy_log_file: Path | None = None,
+    ):
         """Initialize the trace store with watched directories and defaults."""
         self.trace_dir = trace_dir
         self.events_dir = events_dir
-        self.mitm_dir = mitm_dir
+        self.proxy_dir = proxy_dir
+        source = str(llm_capture_source or "proxy").strip().lower()
+        if source != "proxy":
+            raise ValueError(
+                f"Unsupported llm_capture_source={llm_capture_source!r}; only 'proxy' is supported"
+            )
+        self.llm_capture_source = source
+        self.proxy_log_file = proxy_log_file
         self.traces: dict[str, TraceState] = {}
         self.version = 0
         self._lock = asyncio.Lock()
@@ -491,9 +505,11 @@ class TraceStore:
 
         return response_body
 
-    def _parse_llm_calls_from_mitm(self, trace: TraceState) -> list[dict[str, Any]]:
-        """Parse MITM logs into turn-level prompt/response records."""
-        return parse_llm_calls_from_mitm(trace, self.llm_api_schemas)
+    def _parse_llm_calls_from_capture(self, trace: TraceState) -> list[dict[str, Any]]:
+        """Parse proxy logs into turn-level prompt/response records."""
+        if not trace.proxy_path or not trace.proxy_path.exists():
+            return []
+        return parse_llm_calls_from_capture(trace.proxy_path, self.llm_api_schemas)
 
     def _trace_to_event_candidates(self, trace_file: Path) -> list[Path]:
         name = trace_file.name
@@ -528,36 +544,40 @@ class TraceStore:
         for file_path in trace_files:
             trace_id = file_path.name
             if trace_id not in self.traces:
-                mitm_path = self._find_mitm_file(trace_id) if self.mitm_dir else None
+                proxy_path = self._find_proxy_file(trace_id) if self.proxy_dir or self.proxy_log_file else None
                 self.traces[trace_id] = TraceState(
                     trace_id=trace_id,
                     trace_path=file_path,
                     events_path_candidates=self._trace_to_event_candidates(file_path),
-                    mitm_path=mitm_path,
+                    proxy_path=proxy_path,
                 )
                 changed = True
 
         for state in self.traces.values():
-            if not state.mitm_path and self.mitm_dir:
-                state.mitm_path = self._find_mitm_file(state.trace_id)
+            if not state.proxy_path and (self.proxy_dir or self.proxy_log_file):
+                state.proxy_path = self._find_proxy_file(state.trace_id)
 
             if state.trace_path.exists():
                 changed = self._tail_ebpf_events(state) or changed
             has_native = self._tail_events(state)
             changed = has_native or changed
-            # If no native events FILE exists, continuously tail mitmproxy capture
+
+            active_capture = self._active_llm_capture_path(state)
+            if active_capture is None:
+                continue
+
+            # If no native events FILE exists, continuously tail proxy capture
             # (don't check `state.agent_events` — that becomes non-empty after the
-            #  first MITM read and would block all subsequent reads)
-            if state.mitm_path:
-                native_file_exists = any(
-                    c.exists() for c in state.events_path_candidates
-                )
-                if native_file_exists:
-                    # Native events provide agent events; only extract
-                    # network interval data from MITM for proxy resolution.
-                    changed = self._tail_mitm_events(state, intervals_only=True) or changed
-                else:
-                    changed = self._tail_mitm_events(state) or changed
+            # first payload read and would block all subsequent reads)
+            native_file_exists = any(
+                c.exists() for c in state.events_path_candidates
+            )
+            if native_file_exists:
+                # Native events provide agent events; only extract
+                # network interval data from the selected LLM capture.
+                changed = self._tail_litellm_capture_events(state, intervals_only=True) or changed
+            else:
+                changed = self._tail_litellm_capture_events(state) or changed
 
         if changed:
             for state in self.traces.values():
@@ -616,35 +636,88 @@ class TraceStore:
         state.events_offset = new_offset
         return True
 
-    def _find_mitm_file(self, trace_id: str) -> Path | None:
-        """Find a matching .mitm.jsonl file for the given trace_id."""
-        if not self.mitm_dir or not self.mitm_dir.exists():
+    def _find_proxy_file(self, trace_id: str) -> Path | None:
+        """Find a matching LiteLLM proxy JSONL file for one trace.
+
+        Deterministic matching priority:
+        1) explicit proxy_log_file override
+        2) trace-id keyed filenames in proxy_dir
+        3) when source is proxy-only and exactly one *.log exists, use it
+        """
+        if self.proxy_log_file is not None:
+            if self.proxy_log_file.exists():
+                return self.proxy_log_file
             return None
+
+        if not self.proxy_dir or not self.proxy_dir.exists():
+            return None
+
         stem = trace_id
         no_ext = Path(trace_id).stem
         candidates = [
-            self.mitm_dir / f"{stem}.mitm.jsonl",
-            self.mitm_dir / f"{no_ext}.mitm.jsonl",
+            self.proxy_dir / trace_id,
+            self.proxy_dir / f"{stem}.proxy.jsonl",
+            self.proxy_dir / f"{no_ext}.proxy.jsonl",
+            self.proxy_dir / f"{stem}.log",
+            self.proxy_dir / f"{no_ext}.log",
         ]
         if trace_id.endswith(".ebpf.jsonl"):
             base = trace_id[: -len(".ebpf.jsonl")]
-            candidates.append(self.mitm_dir / f"{base}.mitm.jsonl")
+            candidates.append(self.proxy_dir / f"{base}.proxy.jsonl")
+            candidates.append(self.proxy_dir / f"{base}.log")
+
         for cand in candidates:
             if cand.exists():
                 return cand
+
+        log_candidates = sorted(self.proxy_dir.glob("*.log"))
+        if len(log_candidates) == 1:
+            return log_candidates[0]
+        if len(log_candidates) > 1:
+            raise RuntimeError(
+                "Ambiguous proxy log selection: multiple *.log files exist and no trace-matched proxy log was found. "
+                "Set MANTLE_PROXY_LOG_FILE to choose one deterministically."
+            )
         return None
 
-    def _tail_mitm_events(self, state: TraceState, intervals_only: bool = False) -> bool:
-        """Parse mitmproxy capture JSONL into agent_events format.
+    def _active_llm_capture_path(self, state: TraceState) -> Path | None:
+        """Resolve which proxy payload capture file should be tailed for this trace."""
+        return state.proxy_path if state.proxy_path and state.proxy_path.exists() else None
+
+    def _tail_litellm_capture_events(self, state: TraceState, intervals_only: bool = False) -> bool:
+        """Tail active proxy capture file into canonical agent events."""
+        active_path = self._active_llm_capture_path(state)
+        if active_path is None:
+            return False
+        return self._tail_payload_events(
+            state,
+            intervals_only=intervals_only,
+            capture_path=state.proxy_path,
+            offset_attr="proxy_offset",
+            event_source="proxy",
+        )
+
+    def _tail_payload_events(
+        self,
+        state: TraceState,
+        intervals_only: bool = False,
+        capture_path: Path | None = None,
+        offset_attr: str = "proxy_offset",
+        event_source: str = "proxy",
+    ) -> bool:
+        """Parse proxy capture JSONL into agent events.
         
         When intervals_only=True, only extract network endpoint / interval
         data (for proxy resolution) without appending agent events (which
         would duplicate events already provided by native event files).
         """
-        if not state.mitm_path or not state.mitm_path.exists():
+        if capture_path is None:
+            capture_path = state.proxy_path
+        if not capture_path or not capture_path.exists():
             return False
 
-        lines, new_offset = self._read_new_lines(state.mitm_path, state.mitm_offset)
+        current_offset = int(getattr(state, offset_attr, 0) or 0)
+        lines, new_offset = self._read_new_lines(capture_path, current_offset)
         if not lines:
             return False
 
@@ -953,6 +1026,83 @@ class TraceStore:
                     )
             return parsed
 
+        def _parse_responses_object(resp: dict[str, Any]) -> dict[str, Any]:
+            parsed: dict[str, Any] = {
+                "assistant_messages": [],
+                "tool_calls": [],
+                "reasoning_summary": "",
+            }
+
+            output = resp.get("output")
+            if not isinstance(output, list):
+                output = []
+
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                item_type = str(item.get("type") or "")
+
+                if item_type == "message":
+                    content = _get_string_content(item.get("content"))
+                    if content.strip():
+                        parsed["assistant_messages"].append(
+                            {
+                                "role": item.get("role") or "assistant",
+                                "phase": item.get("phase") or "final",
+                                "content": content.strip(),
+                            }
+                        )
+                    continue
+
+                if item_type in {"function_call", "custom_tool_call"}:
+                    raw_args = item.get("arguments")
+                    if raw_args is None:
+                        raw_args = item.get("input")
+                    args_obj: Any = {}
+                    if isinstance(raw_args, str) and raw_args:
+                        try:
+                            args_obj = json.loads(raw_args)
+                        except json.JSONDecodeError:
+                            args_obj = {"_raw": raw_args}
+                    elif isinstance(raw_args, dict):
+                        args_obj = raw_args
+                    parsed["tool_calls"].append(
+                        {
+                            "tool_call_id": item.get("call_id") or item.get("id") or "",
+                            "tool_name": item.get("name") or "unknown",
+                            "arguments": args_obj,
+                        }
+                    )
+                    continue
+
+                if item_type == "reasoning":
+                    summary = item.get("summary")
+                    parts: list[str] = []
+                    if isinstance(summary, list):
+                        for node in summary:
+                            if isinstance(node, str) and node.strip():
+                                parts.append(node.strip())
+                                continue
+                            if isinstance(node, dict):
+                                text = _get_string_content(node.get("text") if "text" in node else node)
+                                if text.strip():
+                                    parts.append(text.strip())
+                    if parts:
+                        parsed["reasoning_summary"] = "\n".join(parts)
+
+            if not parsed["assistant_messages"] and isinstance(resp.get("output_text"), str):
+                txt = str(resp.get("output_text") or "").strip()
+                if txt:
+                    parsed["assistant_messages"].append(
+                        {
+                            "role": "assistant",
+                            "phase": "final",
+                            "content": txt,
+                        }
+                    )
+
+            return parsed
+
         for line in lines:
             line = line.strip()
             if not line:
@@ -962,7 +1112,7 @@ class TraceStore:
             except json.JSONDecodeError:
                 continue
 
-            # MITM logs can contain non-object JSON values from partial writes
+            # Proxy logs can contain non-object JSON values from partial writes
             # or external producers; skip anything that's not a mapping.
             if not isinstance(record, dict):
                 continue
@@ -989,9 +1139,9 @@ class TraceStore:
             if endpoint:
                 endpoint_label = self._endpoint_label_from_url(str(endpoint))
                 if endpoint_label:
-                    state.mitm_endpoints.add(endpoint_label)
+                    state.payload_endpoints.add(endpoint_label)
                 else:
-                    log_exception("Failed parsing MITM endpoint URL")
+                    log_exception("Failed parsing proxy endpoint URL")
 
             messages = req_body.get("messages", [])
             if not messages and "input" in req_body:
@@ -1025,10 +1175,17 @@ class TraceStore:
 
             sse_parsed = _parse_responses_sse(str(resp_body.get("_raw") or ""))
             chat_fallback = _parse_chat_completion_response(resp_body)
+            responses_fallback = _parse_responses_object(resp_body)
             if not sse_parsed.get("assistant_messages") and chat_fallback.get("assistant_messages"):
                 sse_parsed["assistant_messages"] = chat_fallback["assistant_messages"]
             if not sse_parsed.get("tool_calls") and chat_fallback.get("tool_calls"):
                 sse_parsed["tool_calls"] = chat_fallback["tool_calls"]
+            if not sse_parsed.get("assistant_messages") and responses_fallback.get("assistant_messages"):
+                sse_parsed["assistant_messages"] = responses_fallback["assistant_messages"]
+            if not sse_parsed.get("tool_calls") and responses_fallback.get("tool_calls"):
+                sse_parsed["tool_calls"] = responses_fallback["tool_calls"]
+            if not sse_parsed.get("reasoning_summary") and responses_fallback.get("reasoning_summary"):
+                sse_parsed["reasoning_summary"] = responses_fallback["reasoning_summary"]
             available_tools = _extract_available_tools(req_body)
 
             if not intervals_only:
@@ -1047,11 +1204,11 @@ class TraceStore:
                             "reasoning": (req_body.get("reasoning") or {}).get("effort"),
                             "available_tools": available_tools,
                         },
-                        "_source": "mitm",
+                        "_source": event_source,
                     }
                 )
 
-            # Build interval mapping: BPF traffic for this MITM call occurred
+            # Build interval mapping: BPF traffic for this proxy payload call occurred
             # between [response_ts - duration, response_ts].  We store these
             # sorted intervals so _with_inferred_net_dest can binary-search.
             if endpoint and ts > 0:
@@ -1059,9 +1216,9 @@ class TraceStore:
                 if dest_label:
                     dur_s = (float(duration_ms) / 1000.0) if duration_ms else 5.0
                     start_ts = ts - dur_s
-                    state.mitm_intervals.append((start_ts, ts, dest_label))
+                    state.payload_intervals.append((start_ts, ts, dest_label))
                 else:
-                    log_exception("Failed deriving MITM interval from endpoint")
+                    log_exception("Failed deriving proxy interval from endpoint")
 
             if not intervals_only:
                 instructions = req_body.get("instructions")
@@ -1075,7 +1232,7 @@ class TraceStore:
                             "payload": {
                                 "content": instructions,
                             },
-                            "_source": "mitm",
+                            "_source": event_source,
                         }
                     )
 
@@ -1091,7 +1248,7 @@ class TraceStore:
                                 "prompts": user_prompts,
                                 "count": len(user_prompts),
                             },
-                            "_source": "mitm",
+                            "_source": event_source,
                         }
                     )
 
@@ -1105,7 +1262,7 @@ class TraceStore:
                             "payload": {
                                 "content": sse_parsed.get("reasoning_summary", ""),
                             },
-                            "_source": "mitm",
+                            "_source": event_source,
                         }
                     )
 
@@ -1131,7 +1288,7 @@ class TraceStore:
                                 "tool_calls": calls,
                                 "tool_results": [],
                             },
-                            "_source": "mitm",
+                            "_source": event_source,
                         }
                     )
 
@@ -1143,11 +1300,11 @@ class TraceStore:
                             "seq": seq,
                             "event_type": "tool_call_started",
                             "payload": {
-                                "tool_call_id": tool_start.get("tool_call_id") or f"mitm_tc_{seq}",
+                                "tool_call_id": tool_start.get("tool_call_id") or f"{event_source}_tc_{seq}",
                                 "tool_name": tool_start.get("tool_name") or "unknown",
                                 "arguments": tool_start.get("arguments") or {},
                             },
-                            "_source": "mitm",
+                            "_source": event_source,
                         }
                     )
 
@@ -1215,6 +1372,14 @@ class TraceStore:
                             candidates.sort(key=lambda item: item[0])
                             canonical_tid = candidates[-1][1]
 
+                    if tool_name == "unknown":
+                        start_ev = start_event_by_id.get(canonical_tid) or start_event_by_id.get(str(tid))
+                        if isinstance(start_ev, dict):
+                            start_payload = start_ev.get("payload") or {}
+                            start_name = str(start_payload.get("tool_name") or "").strip()
+                            if start_name:
+                                tool_name = start_name
+
                     if canonical_tid in emitted_tool_results:
                         existing_finish = finish_event_by_id.get(canonical_tid) or finish_event_by_id.get(str(tid))
                         if existing_finish is not None:
@@ -1225,7 +1390,7 @@ class TraceStore:
                     emitted_tool_results.add(canonical_tid)
 
                     # Tool output is carried in this call's request payload, but we
-                    # ingest only response-direction MITM records. Reconstruct the
+                    # ingest only response-direction proxy records. Reconstruct the
                     # request-start timestamp so finishes stay in the originating turn.
                     finish_ts = float(ts or 0.0)
                     if finish_ts > 0:
@@ -1263,7 +1428,7 @@ class TraceStore:
                                 "duration_ms": duration_ms,
                                 "result": result,
                             },
-                            "_source": "mitm",
+                            "_source": event_source,
                         }
                     )
 
@@ -1281,11 +1446,11 @@ class TraceStore:
                                 "tool_calls": sse_parsed.get("tool_calls") or [],
                                 "tool_results": tool_results_for_turn,
                             },
-                            "_source": "mitm",
+                            "_source": event_source,
                         }
                     )
 
-        state.mitm_offset = new_offset
+        setattr(state, offset_attr, new_offset)
         return True
 
     def _tail_trace_log(self, state: TraceState) -> bool:
@@ -1459,34 +1624,35 @@ class TraceStore:
                 enriched["inferred_dest_source"] = "precomputed"
             return enriched
 
-        if not trace.mitm_endpoints:
+        if not trace.payload_endpoints:
             return enriched
 
         def _fallback_endpoint() -> str:
             non_llm = sorted(
-                ep for ep in trace.mitm_endpoints if ep.split(":", 1)[0] not in KNOWN_LLM_HOSTS
+                ep for ep in trace.payload_endpoints if ep.split(":", 1)[0] not in KNOWN_LLM_HOSTS
             )
-            return non_llm[0] if non_llm else sorted(trace.mitm_endpoints)[0]
+            return non_llm[0] if non_llm else sorted(trace.payload_endpoints)[0]
 
         def _best_endpoint_for_event_ts(ts: float) -> tuple[str, str, str, int]:
-            """Map a BPF timestamp to the MITM call whose active interval
-            contains it.  Falls back to nearest interval within 2 s, then
-            to global MITM endpoints."""
+            """Map a BPF timestamp to the proxy payload call active interval.
+
+            Falls back to nearest interval within 2s, then to global payload endpoints.
+            """
             if ts <= 0:
                 # No usable timestamp — fall back to global endpoints
-                return (_fallback_endpoint(), "mitm_no_timestamp", "tier2_payload_mapped", 2)
+                return (_fallback_endpoint(), "proxy_no_timestamp", "tier2_payload_mapped", 2)
 
-            intervals = trace.mitm_intervals
+            intervals = trace.payload_intervals
             if not intervals:
                 # No interval data yet — fall back to global endpoints
-                return (_fallback_endpoint(), "mitm_no_intervals", "tier2_payload_mapped", 2)
+                return (_fallback_endpoint(), "proxy_no_intervals", "tier2_payload_mapped", 2)
 
             # Ensure intervals are sorted by start_ts for binary search
             # (they are appended in chronological order during ingestion,
             #  but sort defensively on first use).
-            if not hasattr(trace, '_mitm_intervals_sorted'):
-                trace.mitm_intervals.sort(key=lambda x: x[0])
-                trace._mitm_intervals_sorted = True  # type: ignore[attr-defined]
+            if not hasattr(trace, '_payload_intervals_sorted'):
+                trace.payload_intervals.sort(key=lambda x: x[0])
+                trace._payload_intervals_sorted = True  # type: ignore[attr-defined]
 
             # Binary search: find intervals that could contain `ts`.
             # An interval (s, e, label) contains ts if s <= ts <= e.
@@ -1518,14 +1684,14 @@ class TraceStore:
                         best_near = label
 
             if best_exact:
-                return (best_exact, "mitm_interval_exact", "tier1_payload_exact", 1)
+                return (best_exact, "proxy_interval_exact", "tier1_payload_exact", 1)
             if best_near:
-                return (best_near, "mitm_interval_nearest", "tier2_payload_mapped", 2)
+                return (best_near, "proxy_interval_nearest", "tier2_payload_mapped", 2)
 
-            # Nothing within 2s — fall back to global MITM endpoints
-            return (_fallback_endpoint(), "mitm_global_fallback", "tier2_payload_mapped", 2)
+            # Nothing within 2s — fall back to global payload endpoints
+            return (_fallback_endpoint(), "proxy_global_fallback", "tier2_payload_mapped", 2)
 
-        # Map proxy-local traffic to known MITM upstream endpoints so users can
+        # Map proxy-local traffic to known upstream endpoints so users can
         # see where traffic really went (for example git clone -> github.com:443).
         proxy_dests = {"127.0.0.1:8899", "127.0.0.1:8898", "localhost:8899", "localhost:8898"}
         if dest in proxy_dests:
@@ -1821,7 +1987,7 @@ class TraceStore:
         """Return capture confidence metadata for one trace.
 
         Tier semantics:
-        - tier1_payload_exact: payload extracted and endpoint matched to exact MITM interval
+        - tier1_payload_exact: payload extracted and endpoint matched to exact proxy interval
         - tier2_payload_mapped: payload extracted but endpoint inferred heuristically
         - tier3_network_only: only baseline network destination data is available
         """
@@ -1906,15 +2072,28 @@ class TraceStore:
             uniq.append(cand)
         return uniq
 
-    def _candidate_mitm_paths(self, trace_id: str) -> list[Path]:
-        if not self.mitm_dir:
-            return []
-        candidates: list[Path] = [self.mitm_dir / f"{trace_id}.mitm.jsonl"]
-        no_ext = Path(trace_id).stem
-        candidates.append(self.mitm_dir / f"{no_ext}.mitm.jsonl")
-        if trace_id.endswith(".ebpf.jsonl"):
-            base = trace_id[: -len(".ebpf.jsonl")]
-            candidates.append(self.mitm_dir / f"{base}.mitm.jsonl")
+    def _candidate_payload_paths(self, trace_id: str) -> list[Path]:
+        # Proxy-only payload capture: no legacy payload files are tracked.
+        return []
+
+    def _candidate_proxy_paths(self, trace_id: str) -> list[Path]:
+        candidates: list[Path] = []
+        if self.proxy_log_file is not None:
+            candidates.append(self.proxy_log_file)
+        if self.proxy_dir:
+            stem = Path(trace_id).stem
+            base = trace_id[: -len(".ebpf.jsonl")] if trace_id.endswith(".ebpf.jsonl") else trace_id
+            candidates.extend(
+                [
+                    self.proxy_dir / trace_id,
+                    self.proxy_dir / f"{trace_id}.proxy.jsonl",
+                    self.proxy_dir / f"{stem}.proxy.jsonl",
+                    self.proxy_dir / f"{base}.proxy.jsonl",
+                    self.proxy_dir / f"{trace_id}.log",
+                    self.proxy_dir / f"{stem}.log",
+                    self.proxy_dir / f"{base}.log",
+                ]
+            )
 
         seen: set[Path] = set()
         uniq: list[Path] = []
@@ -1930,16 +2109,17 @@ class TraceStore:
 
         trace_paths = self._candidate_trace_paths(trace_id)
         events_paths = self._candidate_events_paths(trace_id)
-        mitm_paths = self._candidate_mitm_paths(trace_id)
+        payload_paths = self._candidate_payload_paths(trace_id)
+        proxy_paths = self._candidate_proxy_paths(trace_id)
 
         if trace is not None:
             trace_paths = [trace.trace_path] + [p for p in trace_paths if p != trace.trace_path]
             events_paths = trace.events_path_candidates + [p for p in events_paths if p not in trace.events_path_candidates]
-            if trace.mitm_path is not None:
-                mitm_paths = [trace.mitm_path] + [p for p in mitm_paths if p != trace.mitm_path]
+            if trace.proxy_path is not None:
+                proxy_paths = [trace.proxy_path] + [p for p in proxy_paths if p != trace.proxy_path]
 
         removed_files: list[str] = []
-        for path in trace_paths + events_paths + mitm_paths:
+        for path in trace_paths + events_paths + payload_paths + proxy_paths:
             if not path.exists():
                 continue
             if not path.is_file():
@@ -3851,7 +4031,7 @@ class TraceStore:
         )
         sys_events = sorted(list(trace.sys_events), key=lambda e: (self._event_ts(e), int(e.get("line_no") or 0)))
 
-        llm_calls = self._parse_llm_calls_from_mitm(trace)
+        llm_calls = self._parse_llm_calls_from_capture(trace)
         boundaries = sorted([float(c.get("ts") or 0.0) for c in llm_calls if float(c.get("ts") or 0.0) > 0.0])
 
         spans: list[tuple[str, float | None, float | None]] = []
@@ -3864,7 +4044,12 @@ class TraceStore:
                 end_ts = boundaries[i + 1] if i + 1 < len(boundaries) else None
                 spans.append((f"turn_{i + 1}", start_ts, end_ts))
         else:
-            spans.append(("setup", None, None))
+            # If we have captured activity but no LLM boundaries, expose it as T1
+            # instead of an implicit setup-only trace.
+            if agent_events or sys_events:
+                spans.append(("turn_1", None, None))
+            else:
+                spans.append(("setup", None, None))
 
         turns: list[dict[str, Any]] = []
         root_pid = int(trace.root_pid or 0) or None
@@ -3879,6 +4064,13 @@ class TraceStore:
 
             agent_slice = [e for e in agent_events if _in_span(self._event_ts(e))]
             sys_slice = [e for e in sys_events if _in_span(self._event_ts(e))]
+
+            # When span boundaries are open-ended (for example setup-only traces),
+            # use observed event timestamps so persisted turn windows cover real data.
+            slice_ts = [self._event_ts(e) for e in agent_slice] + [self._event_ts(e) for e in sys_slice]
+            valid_slice_ts = [ts for ts in slice_ts if ts > 0.0]
+            span_start_ts = start_ts if start_ts is not None else (min(valid_slice_ts) if valid_slice_ts else None)
+            span_end_ts = end_ts if end_ts is not None else (max(valid_slice_ts) if valid_slice_ts else None)
 
             tool_pairs = self._tool_pairs(agent_slice)
             files_read = {str(e.get("path") or "") for e in sys_slice if str(e.get("type") or "") == "file_read" and str(e.get("path") or "")}
@@ -4023,8 +4215,8 @@ class TraceStore:
                     "turn_id": turn_id,
                     "index": idx,
                     "label": "Setup" if turn_id == "setup" else f"T{idx if spans[0][0] == 'setup' else idx + 1}",
-                    "start_ts": start_ts,
-                    "end_ts": end_ts,
+                    "start_ts": span_start_ts,
+                    "end_ts": span_end_ts,
                     "tool_call_count": len(tool_pairs),
                     "tags": tags,
                     "dominant_summary": dominant,
@@ -5111,7 +5303,7 @@ class TraceStore:
                     bucket["count"] += 1
 
                     host = str(dest).split(" ")[-1].split(":", 1)[0].strip()
-                    if host and any(ep.split(":", 1)[0] == host for ep in trace.mitm_endpoints):
+                    if host and any(ep.split(":", 1)[0] == host for ep in trace.payload_endpoints):
                         bucket["full_capture"] = True
 
                 timeline.append(
@@ -5312,6 +5504,238 @@ class TraceStore:
             "start_ts_ns": start_ns,
             "end_ts_ns": end_ns,
             "events": events,
+        }
+
+    def _sorted_sys_events(self, trace: TraceState) -> list[dict[str, Any]]:
+        return sorted(trace.sys_events, key=lambda e: (self._event_ts(e), int(e.get("line_no") or 0)))
+
+    def _parent_map_for_events(self, trace: TraceState, events: list[dict[str, Any]]) -> dict[int, int]:
+        parent_map: dict[int, int] = {int(k): int(v) for k, v in trace.process_parent.items()}
+        for event in events:
+            et = str(event.get("type") or "")
+            if et == "process_spawn":
+                parent = int(event.get("pid") or 0)
+                child = int(event.get("child_pid") or 0)
+                if parent > 0 and child > 0 and parent != child:
+                    parent_map[child] = parent
+            elif et == "command_exec":
+                pid = int(event.get("pid") or 0)
+                ppid = int(event.get("ppid") or 0)
+                if pid > 0 and ppid > 0 and pid != ppid and pid not in parent_map:
+                    parent_map[pid] = ppid
+        return parent_map
+
+    def _pid_lifecycle_bounds(
+        self,
+        events: list[dict[str, Any]],
+        pid: int,
+    ) -> tuple[float | None, float | None]:
+        start_ts: float | None = None
+        end_ts: float | None = None
+
+        for event in events:
+            et = str(event.get("type") or "")
+            ets = self._event_ts(event)
+            if et == "command_exec" and int(event.get("pid") or 0) == pid:
+                start_ts = ets if start_ts is None else min(start_ts, ets)
+            if et == "process_spawn" and int(event.get("child_pid") or 0) == pid:
+                start_ts = ets if start_ts is None else min(start_ts, ets)
+            if et == "process_exit" and int(event.get("pid") or 0) == pid:
+                end_ts = ets if end_ts is None else max(end_ts, ets)
+
+        if start_ts is None:
+            for event in events:
+                if int(event.get("pid") or 0) == pid:
+                    start_ts = self._event_ts(event)
+                    break
+
+        return start_ts, end_ts
+
+    def _event_in_timestamp_window(
+        self,
+        event: dict[str, Any],
+        start_ts: float | None,
+        end_ts: float | None,
+    ) -> bool:
+        ts = self._event_ts(event)
+        if start_ts is not None and ts < float(start_ts):
+            return False
+        if end_ts is not None and ts > float(end_ts):
+            return False
+        return True
+
+    def _event_matches_pid_scope(self, trace: TraceState, event: dict[str, Any], pid: int) -> bool:
+        event_pid = int(event.get("pid") or 0)
+        if event_pid > 0 and self._is_descendant_or_same_pid(trace, event_pid, pid):
+            return True
+
+        if str(event.get("type") or "") == "process_spawn":
+            child_pid = int(event.get("child_pid") or 0)
+            if child_pid > 0 and self._is_descendant_or_same_pid(trace, child_pid, pid):
+                return True
+
+        return False
+
+    def _display_trace_summary(
+        self,
+        events: list[dict[str, Any]],
+        parent_map: dict[int, int],
+        pid: int | None,
+    ) -> dict[str, Any]:
+        pids_in_scope = {int(e.get("pid") or 0) for e in events if int(e.get("pid") or 0) > 0}
+
+        def _is_direct(event: dict[str, Any]) -> bool:
+            event_pid = int(event.get("pid") or 0)
+            if event_pid <= 0:
+                return True
+            if pid is not None:
+                return event_pid == pid
+            parent_pid = int(parent_map.get(event_pid, 0))
+            return parent_pid <= 0 or parent_pid not in pids_in_scope
+
+        direct = {
+            "files_read": 0,
+            "files_written": 0,
+            "network_calls": 0,
+            "process_spawns": 0,
+        }
+        nested = {
+            "files_read": 0,
+            "files_written": 0,
+            "network_calls": 0,
+            "process_spawns": 0,
+        }
+
+        for event in events:
+            et = str(event.get("type") or "")
+            target = direct if _is_direct(event) else nested
+            if et == "file_read":
+                target["files_read"] += 1
+            elif et in {"file_write", "file_delete", "file_rename"}:
+                target["files_written"] += 1
+            elif et == "net_connect":
+                target["network_calls"] += 1
+            elif et == "process_spawn":
+                target["process_spawns"] += 1
+
+        totals = {
+            "files_read": int(direct["files_read"] + nested["files_read"]),
+            "files_written": int(direct["files_written"] + nested["files_written"]),
+            "network_calls": int(direct["network_calls"] + nested["network_calls"]),
+            "process_spawns": int(direct["process_spawns"] + nested["process_spawns"]),
+        }
+
+        return {
+            "event_count": len(events),
+            "direct": direct,
+            "nested": nested,
+            "totals": totals,
+        }
+
+    def display_trace(
+        self,
+        trace_id: str,
+        *,
+        pid: int | None = None,
+        start_timestamp: float | None = None,
+        end_timestamp: float | None = None,
+    ) -> dict[str, Any]:
+        trace = self._get_trace(trace_id)
+        all_sys_events = self._sorted_sys_events(trace)
+
+        resolved_pid: int | None = None
+        if pid is not None:
+            resolved_pid = int(pid)
+            if resolved_pid <= 0:
+                raise KeyError("pid")
+
+        resolved_start = float(start_timestamp) if start_timestamp is not None else None
+        resolved_end = float(end_timestamp) if end_timestamp is not None else None
+        if resolved_start is not None and resolved_end is not None and resolved_start > resolved_end:
+            resolved_start, resolved_end = resolved_end, resolved_start
+
+        if resolved_pid is not None and resolved_start is None and resolved_end is None:
+            lifecycle_start, lifecycle_end = self._pid_lifecycle_bounds(all_sys_events, resolved_pid)
+            resolved_start = lifecycle_start
+            resolved_end = lifecycle_end
+
+        parent_map = self._parent_map_for_events(trace, all_sys_events)
+
+        scoped_events: list[dict[str, Any]] = []
+        for event in all_sys_events:
+            if not self._event_in_timestamp_window(event, resolved_start, resolved_end):
+                continue
+            if resolved_pid is not None and not self._event_matches_pid_scope(trace, event, resolved_pid):
+                continue
+            scoped_events.append(event)
+
+        timeline = self._build_unified_timeline(
+            trace,
+            scoped_events,
+            tool_pairs=[],
+            anchor_pid=resolved_pid,
+            strict_anchor_children=resolved_pid is not None,
+        )
+
+        summary = self._display_trace_summary(scoped_events, parent_map, resolved_pid)
+        totals = summary.get("totals") if isinstance(summary.get("totals"), dict) else {}
+
+        exec_commands: list[str] = []
+        command: str | None = None
+        parent_pid: int | None = None
+        duration_ms: float | None = None
+        exit_code: int | None = None
+        if resolved_pid is not None:
+            for event in scoped_events:
+                et = str(event.get("type") or "")
+                if et == "command_exec" and int(event.get("pid") or 0) == resolved_pid:
+                    cmd = str(event.get("command") or event.get("exec_path") or "").strip()
+                    if cmd and cmd not in exec_commands:
+                        exec_commands.append(cmd)
+                    if command is None and cmd:
+                        command = cmd
+                    candidate_ppid = int(event.get("ppid") or 0)
+                    if candidate_ppid > 0:
+                        parent_pid = candidate_ppid
+                if et == "process_exit" and int(event.get("pid") or 0) == resolved_pid and "exit_code" in event:
+                    try:
+                        exit_code = int(event.get("exit_code"))
+                    except (TypeError, ValueError):
+                        exit_code = None
+
+            if parent_pid is None:
+                inferred_parent = int(trace.process_parent.get(resolved_pid, 0))
+                parent_pid = inferred_parent if inferred_parent > 0 else None
+
+            if resolved_start is not None and resolved_end is not None and resolved_end >= resolved_start:
+                duration_ms = (resolved_end - resolved_start) * 1000.0
+
+        summary.update(
+            {
+                "pid": resolved_pid,
+                "command": command,
+                "exec_commands": exec_commands,
+                "parent_pid": parent_pid,
+                "duration_ms": duration_ms,
+                "exit_code": exit_code,
+                # Compatibility fields consumed by existing replay popup styling.
+                "files_read": int(totals.get("files_read") or 0),
+                "files_written": int(totals.get("files_written") or 0),
+                "network_calls": int(totals.get("network_calls") or 0),
+                "child_processes_spawned": int(totals.get("process_spawns") or 0),
+            }
+        )
+
+        return {
+            "trace_id": trace_id,
+            "scope": {
+                "pid": resolved_pid,
+                "start_timestamp": resolved_start,
+                "end_timestamp": resolved_end,
+                "has_timestamp_filter": resolved_start is not None or resolved_end is not None,
+            },
+            "summary": summary,
+            "timeline": timeline,
         }
 
     def process_subtrace(self, trace_id: str, turn_id: str, pid: int, full_lifecycle: bool = False) -> dict[str, Any]:
@@ -5862,7 +6286,7 @@ class TraceStore:
         """Compute correctness/safety/efficiency heuristics for one trace."""
         trace = self._get_trace(trace_id)
         turns = self._turns_for_trace(trace)
-        llm_calls = self._parse_llm_calls_from_mitm(trace)
+        llm_calls = self._parse_llm_calls_from_capture(trace)
 
         agent_events = sorted(
             list(trace.agent_events),

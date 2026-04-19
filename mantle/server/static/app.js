@@ -16,6 +16,19 @@ let currentReplayToolSourceIndex = [];
 let replaySourceByToolCallId = new Map();
 let replaySourceByResultText = new Map();
 let replaySourceMapTraceId = null;
+let replayRawTraceViewerState = { turnId: null, pid: null, stack: [] };
+let popupTraceViewerState = {
+  turnId: null,
+  pid: null,
+  stack: [],
+  startTimestamp: null,
+  endTimestamp: null,
+  title: "tool output",
+};
+const TRACE_HIDDEN_EVENT_TYPES_STORAGE_KEY = "mantle.trace.hiddenEventTypes";
+const DEFAULT_COMPACT_TRACE_HIDDEN_EVENT_TYPES = ["fd_open", "fd_close", "fd_write", "fd_write_ret"];
+let compactTraceHiddenEventTypes = [];
+let detailedTraceViewEnabled = false;
 let allDimensionMetrics = [];
 let traceProcessMap = {};
 let processNames = ["default"];
@@ -75,6 +88,276 @@ function formatMs(ms) {
   return `${(n / 1000).toFixed(2)}s`;
 }
 
+function loadCompactTraceHiddenEventTypes() {
+  try {
+    const raw = localStorage.getItem(TRACE_HIDDEN_EVENT_TYPES_STORAGE_KEY);
+    if (!raw) {
+      return [...DEFAULT_COMPACT_TRACE_HIDDEN_EVENT_TYPES];
+    }
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return [...DEFAULT_COMPACT_TRACE_HIDDEN_EVENT_TYPES];
+    }
+    const normalized = parsed
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter((value) => value.length > 0);
+    return normalized.length ? normalized : [];
+  } catch (_err) {
+    return [...DEFAULT_COMPACT_TRACE_HIDDEN_EVENT_TYPES];
+  }
+}
+
+function saveCompactTraceHiddenEventTypes(values) {
+  compactTraceHiddenEventTypes = Array.isArray(values)
+    ? values.map((value) => String(value || "").trim().toLowerCase()).filter((value) => value.length > 0)
+    : [];
+  localStorage.setItem(TRACE_HIDDEN_EVENT_TYPES_STORAGE_KEY, JSON.stringify(compactTraceHiddenEventTypes));
+}
+
+function activeHiddenTraceEventTypes() {
+  if (detailedTraceViewEnabled) {
+    return new Set();
+  }
+  return new Set(compactTraceHiddenEventTypes.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean));
+}
+
+function compactHiddenEventsLabel() {
+  if (!compactTraceHiddenEventTypes.length) {
+    return "none";
+  }
+  return compactTraceHiddenEventTypes.join(", ");
+}
+
+function editCompactTraceHiddenEventTypes() {
+  const current = compactTraceHiddenEventTypes.join(", ");
+  const next = window.prompt(
+    "Compact mode hidden event types (comma-separated). Example: fd_open, fd_close",
+    current
+  );
+  if (next == null) {
+    return false;
+  }
+  const parsed = String(next)
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+  saveCompactTraceHiddenEventTypes(parsed);
+  return true;
+}
+
+function entryEventType(entry) {
+  if (!entry || entry.entry_type !== "system_group" || entry.category !== "other") {
+    return "";
+  }
+  const event = entry.event || {};
+  return String(event.type || event.event_type || "").trim().toLowerCase();
+}
+
+function filterDisplayTraceTimeline(timeline, hiddenEventTypes) {
+  const hidden = hiddenEventTypes instanceof Set ? hiddenEventTypes : new Set();
+  if (!hidden.size) {
+    return Array.isArray(timeline) ? timeline : [];
+  }
+  const rows = Array.isArray(timeline) ? timeline : [];
+  return rows.filter((entry) => {
+    const type = entryEventType(entry);
+    if (!type) {
+      return true;
+    }
+    return !hidden.has(type);
+  });
+}
+
+function isFileSystemGroupEntry(entry) {
+  return Boolean(entry && entry.entry_type === "system_group" && entry.category === "file");
+}
+
+function mergeFileState(current, incoming) {
+  const a = String(current || "").trim();
+  const b = String(incoming || "").trim();
+  if (!a) return b || "read";
+  if (!b) return a;
+  if (a === b) return a;
+  if (a === "read_write" || b === "read_write") return "read_write";
+  if ((a === "read" && b === "write") || (a === "write" && b === "read")) return "read_write";
+  return a;
+}
+
+function cloneFileTreeNode(node) {
+  if (!node || typeof node !== "object") {
+    return node;
+  }
+  const cloned = { ...node };
+  if (node.counts && typeof node.counts === "object") {
+    cloned.counts = { ...node.counts };
+  }
+  if (Array.isArray(node.children)) {
+    cloned.children = node.children.map((child) => cloneFileTreeNode(child));
+  }
+  return cloned;
+}
+
+function mergeCountObjects(baseCounts, incomingCounts) {
+  const out = { ...(baseCounts || {}) };
+  const source = incomingCounts && typeof incomingCounts === "object" ? incomingCounts : {};
+  for (const [key, value] of Object.entries(source)) {
+    out[key] = Number(out[key] || 0) + Number(value || 0);
+  }
+  return out;
+}
+
+function mergeFileTreeInto(targetNode, sourceNode) {
+  if (!targetNode || !sourceNode || sourceNode.kind !== "dir") {
+    return;
+  }
+  targetNode.counts = mergeCountObjects(targetNode.counts, sourceNode.counts);
+  if (!Array.isArray(targetNode.children)) {
+    targetNode.children = [];
+  }
+
+  for (const child of sourceNode.children || []) {
+    if (!child || typeof child !== "object") {
+      continue;
+    }
+
+    if (child.kind === "file") {
+      const childPath = String(child.path || "");
+      const childName = String(child.name || "");
+      const existingFile = targetNode.children.find((node) =>
+        node && node.kind === "file" && (
+          (childPath && String(node.path || "") === childPath) ||
+          (!childPath && String(node.name || "") === childName)
+        )
+      );
+      if (!existingFile) {
+        targetNode.children.push(cloneFileTreeNode(child));
+      } else {
+        existingFile.state = mergeFileState(existingFile.state, child.state);
+      }
+      continue;
+    }
+
+    if (child.kind === "dir") {
+      const childName = String(child.name || "");
+      let existingDir = targetNode.children.find((node) =>
+        node && node.kind === "dir" && String(node.name || "") === childName
+      );
+      if (!existingDir) {
+        existingDir = {
+          kind: "dir",
+          name: childName,
+          counts: {},
+          children: [],
+        };
+        targetNode.children.push(existingDir);
+      }
+      mergeFileTreeInto(existingDir, child);
+    }
+  }
+
+  targetNode.children.sort((a, b) => {
+    const aIsDir = a && a.kind === "dir";
+    const bIsDir = b && b.kind === "dir";
+    if (aIsDir !== bIsDir) {
+      return aIsDir ? -1 : 1;
+    }
+    return String((a && a.name) || "").localeCompare(String((b && b.name) || ""));
+  });
+}
+
+function mergeFileTrees(trees) {
+  const validTrees = Array.isArray(trees) ? trees.filter((node) => node && node.kind === "dir") : [];
+  if (!validTrees.length) {
+    return null;
+  }
+  const mergedRoot = {
+    kind: "dir",
+    name: String(validTrees[0].name || "/"),
+    counts: {},
+    children: [],
+  };
+  for (const tree of validTrees) {
+    mergeFileTreeInto(mergedRoot, tree);
+  }
+  return mergedRoot;
+}
+
+function countFilesInTree(tree) {
+  if (!tree || typeof tree !== "object") {
+    return 0;
+  }
+  if (tree.kind === "file") {
+    return 1;
+  }
+  if (!Array.isArray(tree.children)) {
+    return 0;
+  }
+  let total = 0;
+  for (const child of tree.children) {
+    total += countFilesInTree(child);
+  }
+  return total;
+}
+
+function openDebugInfoPopup(title, data) {
+  openReplayMetricsPopup(String(title || "Debug Info"), "Rendered event payload", (body) => {
+    const pre = document.createElement("pre");
+    pre.className = "mono-block";
+    pre.textContent = JSON.stringify(data ?? {}, null, 2);
+    body.appendChild(pre);
+  });
+}
+
+function mergeConsecutiveFileGroups(groups) {
+  const entries = Array.isArray(groups) ? groups.filter(Boolean) : [];
+  if (!entries.length) {
+    return null;
+  }
+  if (entries.length === 1) {
+    return entries[0];
+  }
+
+  const first = entries[0];
+  const merged = {
+    ...first,
+    title: String(first.title || "File activity"),
+    counts: {},
+    tree: mergeFileTrees(entries.map((entry) => entry.tree).filter(Boolean)),
+    standalone: false,
+  };
+  for (const entry of entries) {
+    merged.counts = mergeCountObjects(merged.counts, entry.counts);
+  }
+  const mergedFileCount = countFilesInTree(merged.tree);
+  if (mergedFileCount > 0) {
+    merged.title = `${mergedFileCount} ${mergedFileCount === 1 ? "file" : "files"} touched`;
+  }
+  return merged;
+}
+
+function coalesceConsecutiveFileGroups(timeline) {
+  const rows = Array.isArray(timeline) ? timeline : [];
+  const out = [];
+  let run = [];
+
+  const flush = () => {
+    if (!run.length) return;
+    out.push(mergeConsecutiveFileGroups(run));
+    run = [];
+  };
+
+  for (const entry of rows) {
+    if (isFileSystemGroupEntry(entry)) {
+      run.push(entry);
+      continue;
+    }
+    flush();
+    out.push(entry);
+  }
+  flush();
+  return out;
+}
+
 function toneClass(tag) {
   if (tag === "read and plan") return "pill-amber";
   if (tag === "edit") return "pill-red";
@@ -83,6 +366,8 @@ function toneClass(tag) {
   if (tag === "response") return "pill-teal";
   return "pill-gray";
 }
+
+compactTraceHiddenEventTypes = loadCompactTraceHiddenEventTypes();
 
 function systemTone(category) {
   if (category === "file") return "row-file";
@@ -727,17 +1012,25 @@ function renderToolEntry(entry, turnId) {
       <div>
         <div class="mini-label">Return value</div>
         <pre class="mono-block result-block">${escapeHtml(t.short)}</pre>
-        ${t.truncated ? '<button class="inline-btn">Expand</button>' : ""}
+        ${t.truncated ? '<button class="inline-btn tool-expand-btn">Expand</button>' : ""}
       </div>
+      <div class="replay-value-head"><button class="inline-btn debug-btn tool-debug-btn">Debug Info</button></div>
     </div>`;
 
-  const btn = card.querySelector(".inline-btn");
+  const btn = card.querySelector(".tool-expand-btn");
   if (btn) {
     const pre = card.querySelector(".result-block");
     btn.addEventListener("click", () => {
       const expanded = btn.textContent === "Collapse";
       pre.textContent = expanded ? t.short : t.long;
       btn.textContent = expanded ? "Expand" : "Collapse";
+    });
+  }
+
+  const debugBtn = card.querySelector(".tool-debug-btn");
+  if (debugBtn) {
+    debugBtn.addEventListener("click", () => {
+      openDebugInfoPopup(`Tool Event: ${String(entry.tool_name || "unknown")}`, entry);
     });
   }
 
@@ -760,10 +1053,23 @@ function createFileTreeNode(node, turnId, options = {}) {
     const state = String(node.state || "read");
     const stateText = state === "read_write" ? "read/write" : state;
     row.className = `tree-file tree-${state}`;
-    row.innerHTML = `<span class="tree-name">${escapeHtml(node.name)}</span><span class="tree-state">${escapeHtml(stateText)}</span>`;
+    row.innerHTML = `
+      <span class="tree-name">${escapeHtml(node.name)}</span>
+      <span class="tree-meta">
+        <span class="tree-state">${escapeHtml(stateText)}</span>
+        <button class="inline-btn debug-btn tree-debug-btn" type="button">Debug Info</button>
+      </span>`;
     if (!disableDrilldown && turnId) {
       row.addEventListener("click", async () => {
         await loadRawResource(turnId, "file", node.path, `${node.path} (${stateText})`);
+      });
+    }
+    const debugBtn = row.querySelector(".tree-debug-btn");
+    if (debugBtn) {
+      debugBtn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        openDebugInfoPopup(`File Node: ${String(node.path || node.name || "file")}`, node);
       });
     }
     return row;
@@ -773,8 +1079,17 @@ function createFileTreeNode(node, turnId, options = {}) {
   details.className = "tree-dir";
   details.open = true;
   const summary = document.createElement("summary");
-  summary.innerHTML = `<span>${escapeHtml(node.name || "/")}</span><span class="tree-pills">${renderCountPills(node.counts)}</span>`;
+  summary.innerHTML = `<span>${escapeHtml(node.name || "/")}</span><span class="tree-pills">${renderCountPills(node.counts)}</span><button class="inline-btn debug-btn tree-debug-btn" type="button">Debug Info</button>`;
   details.appendChild(summary);
+
+  const debugBtn = summary.querySelector(".tree-debug-btn");
+  if (debugBtn) {
+    debugBtn.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openDebugInfoPopup(`Folder Node: ${String(node.name || "/")}`, node);
+    });
+  }
 
   for (const child of node.children || []) {
     details.appendChild(createFileTreeNode(child, turnId, options));
@@ -786,6 +1101,7 @@ function renderSystemGroup(entry, turnId, options = {}) {
   const row = document.createElement("div");
   row.className = `timeline-row ${systemTone(entry.category)}`;
   const groupPills = entry.category === "file" ? renderCountPills(entry.counts) : "";
+  const displayTraceContext = options.displayTraceContext || null;
   const disableResourceDrilldown = Boolean(options.disableResourceDrilldown);
   const disableProcessDrilldown = Boolean(options.disableProcessDrilldown);
   const recursiveProcessExpand = Boolean(options.recursiveProcessExpand);
@@ -799,11 +1115,20 @@ function renderSystemGroup(entry, turnId, options = {}) {
       <span class="row-title">${escapeHtml(entry.title)}</span>
       <span class="row-sub">${escapeHtml(entry.category)}</span>
       ${groupPills ? `<span class="group-pills">${groupPills}</span>` : ""}
+      <button class="inline-btn debug-btn event-debug-btn">Debug Info</button>
       ${hasExpand ? '<button class="inline-btn group-toggle">Expand</button>' : ""}
     </div>
     <div class="row-content" style="display:${hasExpand ? "none" : "block"};"></div>`;
 
   const content = row.querySelector(".row-content");
+  const debugBtn = row.querySelector(".event-debug-btn");
+  if (debugBtn) {
+    debugBtn.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openDebugInfoPopup(`System Group: ${String(entry.category || "event")}`, entry);
+    });
+  }
 
   if (entry.category === "file") {
     const tree = createFileTreeNode(entry.tree, turnId, options);
@@ -815,71 +1140,115 @@ function renderSystemGroup(entry, turnId, options = {}) {
     hints.textContent = cmds || "No command strings captured";
     content.appendChild(hints);
 
+    const childProcesses = Array.isArray(entry.process_tree) ? entry.process_tree : [];
     const list = document.createElement("div");
     list.className = "proc-list";
-    const childProcesses = entry.process_tree || [];
-    let loaded = false;
-
-    const loadChildTimelines = async () => {
-      if (loaded) return;
-      loaded = true;
-
-      for (const p of childProcesses) {
-        const block = document.createElement("div");
-        block.className = "proc-inline-body";
-        block.innerHTML = `
-          <div class="mini-label">PID ${escapeHtml(String(p.pid))} · ${escapeHtml(p.command || "(unknown)")}</div>
-          <div class="proc-inline-timeline"><div class="mono-text">Loading process activity...</div></div>`;
-        list.appendChild(block);
-
-        const nested = block.querySelector(".proc-inline-timeline");
-        try {
-          const lifecycleQuery = fullLifecycle ? "?full_lifecycle=1" : "";
-          const payload = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/process-subtrace/${encodeURIComponent(turnId)}/${encodeURIComponent(p.pid)}${lifecycleQuery}`);
-          const s = payload.summary || {};
-          nested.innerHTML = "";
-
-          const summary = document.createElement("div");
-          summary.className = "mono-text";
-          summary.textContent = `pid=${String(s.pid || p.pid)} ppid=${String(s.parent_pid || "-")} files_read=${formatNumber(s.files_read)} files_written=${formatNumber(s.files_written)} child_spawns=${formatNumber(s.child_processes_spawned)} network_calls=${formatNumber(s.network_calls)} exit=${s.exit_code == null ? "-" : String(s.exit_code)}`;
-          nested.appendChild(summary);
-
-          for (const subEntry of payload.timeline || []) {
-            nested.appendChild(renderSystemGroup(subEntry, turnId, options));
-          }
-        } catch (_err) {
-          nested.innerHTML = '<div class="mono-text">Failed to load process activity for this PID.</div>';
-        }
-      }
-    };
-
     content.appendChild(list);
 
-    if (disableProcessDrilldown) {
-      content.style.display = "block";
-      const toggle = row.querySelector(".group-toggle");
-      if (toggle) {
-        toggle.style.display = "none";
+    if (displayTraceContext) {
+      if (!childProcesses.length) {
+        const empty = document.createElement("div");
+        empty.className = "mono-text";
+        empty.textContent = "No spawned child processes in this scope.";
+        list.appendChild(empty);
       }
-    } else if (recursiveProcessExpand) {
-      content.style.display = "block";
-      const toggle = row.querySelector(".group-toggle");
-      if (toggle) {
-        toggle.style.display = "none";
+      for (const p of childProcesses) {
+        const pid = Number((p && p.pid) || 0);
+        if (!pid) continue;
+        const btn = document.createElement("button");
+        btn.className = "proc-node";
+        btn.innerHTML = `pid ${escapeHtml(String(pid))} · ${escapeHtml(String((p && p.command) || "(unknown)"))}`;
+        btn.addEventListener("click", () => {
+          if (typeof displayTraceContext.onSelectPid === "function") {
+            displayTraceContext.onSelectPid(pid);
+          }
+        });
+        list.appendChild(btn);
       }
-      loadChildTimelines();
-    } else if (!hasExpand) {
-      loadChildTimelines();
-    } else {
-      const toggle = row.querySelector(".group-toggle");
-      toggle.addEventListener("click", async () => {
-        const expanded = content.style.display !== "none";
-        content.style.display = expanded ? "none" : "block";
-        toggle.textContent = expanded ? "Expand" : "Collapse";
-        if (!expanded) {
-          await loadChildTimelines();
+
+      if (disableProcessDrilldown) {
+        content.style.display = "block";
+        const toggle = row.querySelector(".group-toggle");
+        if (toggle) {
+          toggle.style.display = "none";
         }
-      });
+      } else if (recursiveProcessExpand) {
+        content.style.display = "block";
+        const toggle = row.querySelector(".group-toggle");
+        if (toggle) {
+          toggle.style.display = "none";
+        }
+      } else {
+        const toggle = row.querySelector(".group-toggle");
+        if (toggle) {
+          toggle.addEventListener("click", () => {
+            const expanded = content.style.display !== "none";
+            content.style.display = expanded ? "none" : "block";
+            toggle.textContent = expanded ? "Expand" : "Collapse";
+          });
+        }
+      }
+    } else {
+      let loaded = false;
+      const loadChildTimelines = async () => {
+        if (loaded) return;
+        loaded = true;
+
+        for (const p of childProcesses) {
+          const block = document.createElement("div");
+          block.className = "proc-inline-body";
+          block.innerHTML = `
+            <div class="mini-label">PID ${escapeHtml(String(p.pid))} · ${escapeHtml(p.command || "(unknown)")}</div>
+            <div class="proc-inline-timeline"><div class="mono-text">Loading process activity...</div></div>`;
+          list.appendChild(block);
+
+          const nested = block.querySelector(".proc-inline-timeline");
+          try {
+            const lifecycleQuery = fullLifecycle ? "?full_lifecycle=1" : "";
+            const payload = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/process-subtrace/${encodeURIComponent(turnId)}/${encodeURIComponent(p.pid)}${lifecycleQuery}`);
+            const s = payload.summary || {};
+            nested.innerHTML = "";
+
+            const summary = document.createElement("div");
+            summary.className = "mono-text";
+            summary.textContent = `pid=${String(s.pid || p.pid)} ppid=${String(s.parent_pid || "-")} files_read=${formatNumber(s.files_read)} files_written=${formatNumber(s.files_written)} child_spawns=${formatNumber(s.child_processes_spawned)} network_calls=${formatNumber(s.network_calls)} exit=${s.exit_code == null ? "-" : String(s.exit_code)}`;
+            nested.appendChild(summary);
+
+            for (const subEntry of payload.timeline || []) {
+              nested.appendChild(renderSystemGroup(subEntry, turnId, options));
+            }
+          } catch (_err) {
+            nested.innerHTML = '<div class="mono-text">Failed to load process activity for this PID.</div>';
+          }
+        }
+      };
+
+      if (disableProcessDrilldown) {
+        content.style.display = "block";
+        const toggle = row.querySelector(".group-toggle");
+        if (toggle) {
+          toggle.style.display = "none";
+        }
+      } else if (recursiveProcessExpand) {
+        content.style.display = "block";
+        const toggle = row.querySelector(".group-toggle");
+        if (toggle) {
+          toggle.style.display = "none";
+        }
+        loadChildTimelines();
+      } else if (!hasExpand) {
+        loadChildTimelines();
+      } else {
+        const toggle = row.querySelector(".group-toggle");
+        toggle.addEventListener("click", async () => {
+          const expanded = content.style.display !== "none";
+          content.style.display = expanded ? "none" : "block";
+          toggle.textContent = expanded ? "Expand" : "Collapse";
+          if (!expanded) {
+            await loadChildTimelines();
+          }
+        });
+      }
     }
   } else if (entry.category === "network") {
     const calls = document.createElement("div");
@@ -949,18 +1318,189 @@ function ensureProcessTracePopup() {
   return overlay;
 }
 
-function renderProcessTracePopup(payload, turnId, toolName) {
+function renderDisplayTraceSummary(summary) {
+  const direct = summary && typeof summary.direct === "object" ? summary.direct : {};
+  const nested = summary && typeof summary.nested === "object" ? summary.nested : {};
+  const totals = summary && typeof summary.totals === "object" ? summary.totals : {};
+  const command = String((summary && summary.command) || "").trim();
+
+  return `
+    <div class="turn-exec-summary display-trace-summary">
+      <div class="mini-card"><div class="k">Files Read</div><div class="v">${formatNumber(totals.files_read)} <span class="mono-small">(${formatNumber(direct.files_read)} direct · ${formatNumber(nested.files_read)} nested)</span></div></div>
+      <div class="mini-card"><div class="k">Files Written</div><div class="v">${formatNumber(totals.files_written)} <span class="mono-small">(${formatNumber(direct.files_written)} direct · ${formatNumber(nested.files_written)} nested)</span></div></div>
+      <div class="mini-card"><div class="k">Network Calls</div><div class="v">${formatNumber(totals.network_calls)} <span class="mono-small">(${formatNumber(direct.network_calls)} direct · ${formatNumber(nested.network_calls)} nested)</span></div></div>
+      <div class="mini-card"><div class="k">Process Spawns</div><div class="v">${formatNumber(totals.process_spawns)} <span class="mono-small">(${formatNumber(direct.process_spawns)} direct · ${formatNumber(nested.process_spawns)} nested)</span></div></div>
+      <div class="mini-card"><div class="k">Sys Events</div><div class="v">${formatNumber(summary.event_count || 0)}</div></div>
+      ${command ? `<div class="mini-card"><div class="k">Command</div><div class="v mono-small">${escapeHtml(command)}</div></div>` : ""}
+    </div>`;
+}
+
+function renderDisplayTracePayload(payload, container, options = {}) {
+  const timeline = Array.isArray(payload && payload.timeline) ? payload.timeline : [];
+  const hiddenEventTypes = options.hiddenEventTypes instanceof Set ? options.hiddenEventTypes : new Set();
+  const visibleTimeline = coalesceConsecutiveFileGroups(
+    filterDisplayTraceTimeline(timeline, hiddenEventTypes)
+  );
+  const scope = payload && payload.scope ? payload.scope : {};
+  const summary = payload && payload.summary ? payload.summary : {};
+  const onSelectPid = typeof options.onSelectPid === "function" ? options.onSelectPid : null;
+
+  const wrap = document.createElement("div");
+  wrap.className = "process-trace-content";
+  wrap.innerHTML = renderDisplayTraceSummary(summary);
+
+  const timelineWrap = document.createElement("div");
+  timelineWrap.className = "timeline-wrap";
+  if (!visibleTimeline.length) {
+    timelineWrap.innerHTML = '<div class="mono-text">No events captured for this scope.</div>';
+  } else {
+    for (const entry of visibleTimeline) {
+      timelineWrap.appendChild(
+        renderSystemGroup(entry, null, {
+          disableResourceDrilldown: true,
+          displayTraceContext: {
+            onSelectPid,
+            startTimestamp: scope.start_timestamp,
+            endTimestamp: scope.end_timestamp,
+          },
+        })
+      );
+    }
+  }
+
+  if (Number(scope.pid || 0) > 0) {
+    const details = document.createElement("details");
+    details.className = "timeline-root-collapsed";
+    details.innerHTML = `<summary>PID ${escapeHtml(String(scope.pid))} trace events</summary>`;
+    details.appendChild(timelineWrap);
+    wrap.appendChild(details);
+  } else {
+    wrap.appendChild(timelineWrap);
+  }
+
+  container.innerHTML = "";
+  container.appendChild(wrap);
+}
+
+async function display_trace(pid = null, start_timestamp = null, end_timestamp = null, options = {}) {
+  if (!selectedTraceId) return;
+
+  const params = new URLSearchParams();
+  if (pid != null) params.set("pid", String(pid));
+  if (start_timestamp != null) params.set("start_timestamp", String(start_timestamp));
+  if (end_timestamp != null) params.set("end_timestamp", String(end_timestamp));
+
+  let targetEl = options.targetEl || null;
+  if (options.popup) {
+    const overlay = ensureProcessTracePopup();
+    const titleEl = overlay.querySelector("#processTraceTitle");
+    const subtitleEl = overlay.querySelector("#processTraceSubtitle");
+    const bodyEl = overlay.querySelector("#processTraceBody");
+    titleEl.textContent = String(options.title || "Process Trace");
+    subtitleEl.textContent = String(options.subtitle || "");
+    bodyEl.innerHTML = '<div class="mono-text">Loading process trace...</div>';
+    overlay.classList.add("open");
+    targetEl = bodyEl;
+  }
+
+  if (!targetEl) return;
+
+  try {
+    let payload;
+    try {
+      payload = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/display-trace?${params.toString()}`);
+    } catch (err) {
+      if (typeof options.fallbackFetch === "function") {
+        payload = await options.fallbackFetch(err);
+      } else {
+        throw err;
+      }
+    }
+    const controls = document.createElement("div");
+    controls.className = "group-pills";
+    if (typeof options.onBack === "function") {
+      const backBtn = document.createElement("button");
+      backBtn.className = "inline-btn";
+      backBtn.textContent = "Back";
+      backBtn.addEventListener("click", () => {
+        options.onBack();
+      });
+      controls.appendChild(backBtn);
+    }
+
+    targetEl.innerHTML = "";
+    if (controls.childElementCount > 0) {
+      targetEl.appendChild(controls);
+    }
+    const body = document.createElement("div");
+    targetEl.appendChild(body);
+    renderDisplayTracePayload(payload, body, {
+      onSelectPid: options.onSelectPid,
+      hiddenEventTypes: options.hiddenEventTypes,
+    });
+  } catch (_err) {
+    targetEl.innerHTML = '<div class="mono-text">Failed to load trace events for this scope.</div>';
+  }
+}
+
+function renderProcessTracePopup(payload, turnId, toolName, options = {}) {
   const overlay = ensureProcessTracePopup();
   const titleEl = overlay.querySelector("#processTraceTitle");
   const subtitleEl = overlay.querySelector("#processTraceSubtitle");
   const bodyEl = overlay.querySelector("#processTraceBody");
   const s = payload.summary || {};
+  const hiddenEventTypes = options.hiddenEventTypes instanceof Set ? options.hiddenEventTypes : new Set();
+  const visibleTimeline = coalesceConsecutiveFileGroups(
+    filterDisplayTraceTimeline(payload.timeline || [], hiddenEventTypes)
+  );
 
   titleEl.textContent = `Process Trace · pid ${String(s.pid || payload.pid || "-")}`;
-  subtitleEl.textContent = `Tool: ${String(toolName || "unknown")} · lifecycle ${payload.full_lifecycle ? "full" : "turn"}`;
+  subtitleEl.textContent = String(options.subtitle || `Source: ${String(toolName || "tool output")}`);
 
   const wrap = document.createElement("div");
   wrap.className = "process-trace-content";
+
+  const controls = document.createElement("div");
+  controls.className = "group-pills";
+  if (typeof options.onBack === "function") {
+    const backBtn = document.createElement("button");
+    backBtn.className = "inline-btn";
+    backBtn.textContent = "Back";
+    backBtn.addEventListener("click", () => {
+      options.onBack();
+    });
+    controls.appendChild(backBtn);
+  }
+  const detailBtn = document.createElement("button");
+  detailBtn.className = "inline-btn";
+  detailBtn.textContent = detailedTraceViewEnabled ? "Detailed: On" : "Detailed: Off";
+  detailBtn.addEventListener("click", () => {
+    if (typeof options.onToggleDetail === "function") {
+      options.onToggleDetail();
+    }
+  });
+  controls.appendChild(detailBtn);
+
+  const filterBtn = document.createElement("button");
+  filterBtn.className = "inline-btn";
+  filterBtn.textContent = "Edit Hidden Events";
+  filterBtn.addEventListener("click", () => {
+    if (typeof options.onEditFilters === "function") {
+      options.onEditFilters();
+    }
+  });
+  controls.appendChild(filterBtn);
+
+  const filterLabel = document.createElement("span");
+  filterLabel.className = "row-sub";
+  filterLabel.textContent = detailedTraceViewEnabled
+    ? "Showing all event types"
+    : `Hidden in compact: ${compactHiddenEventsLabel()}`;
+  controls.appendChild(filterLabel);
+
+  if (controls.childElementCount > 0) {
+    wrap.appendChild(controls);
+  }
 
   const meta = document.createElement("div");
   meta.className = "group-pills";
@@ -987,133 +1527,19 @@ function renderProcessTracePopup(payload, turnId, toolName) {
     processTree.appendChild(cmds);
   }
 
-  const renderProcessNode = (node, parentEl, depth = 0) => {
-    const row = document.createElement("div");
-    row.className = "timeline-row row-process";
-    row.style.marginLeft = `${Math.max(0, depth) * 16}px`;
-    row.innerHTML = `
-      <div class="timeline-head">
-        <span class="row-title">pid ${escapeHtml(String(node.pid))}</span>
-        <span class="row-sub mono-small">${escapeHtml(node.command || "(command unknown)")}</span>
-        <span class="group-pills"></span>
-        <button class="inline-btn group-toggle">Expand</button>
-      </div>
-      <div class="row-content" style="display:none;"><div class="mono-text">Loading process activity...</div></div>`;
-
-    const toggle = row.querySelector(".group-toggle");
-    const content = row.querySelector(".row-content");
-    const pillsHost = row.querySelector(".group-pills");
-    let loaded = false;
-
-    toggle.addEventListener("click", async () => {
-      const expanded = content.style.display !== "none";
-      content.style.display = expanded ? "none" : "block";
-      toggle.textContent = expanded ? "Expand" : "Collapse";
-      if (expanded || loaded) return;
-      loaded = true;
-
-      try {
-        const childPayload = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/process-subtrace/${encodeURIComponent(turnId)}/${encodeURIComponent(node.pid)}?full_lifecycle=1`);
-        const cs = childPayload.summary || {};
-        const childPills = [];
-        if (Number(cs.child_processes_spawned || 0) > 0) childPills.push(`${formatNumber(cs.child_processes_spawned)} process${Number(cs.child_processes_spawned) === 1 ? "" : "es"} spawned`);
-        if (Number(cs.files_read || 0) > 0) childPills.push(`reads ${formatNumber(cs.files_read)}`);
-        if (Number(cs.files_written || 0) > 0) childPills.push(`writes ${formatNumber(cs.files_written)}`);
-        if (Number(cs.network_calls || 0) > 0) childPills.push(`network ${formatNumber(cs.network_calls)}`);
-        pillsHost.innerHTML = childPills.map((label) => `<span class="op-pill op-rename">${escapeHtml(label)}</span>`).join("");
-
-        content.innerHTML = "";
-        renderTimelineSequence(childPayload.timeline || [], content, depth + 1);
-        if (!content.children.length) {
-          content.innerHTML = '<div class="mono-text">No child activity.</div>';
-          return;
-        }
-      } catch (_err) {
-        content.innerHTML = '<div class="mono-text">Failed to load process activity for this PID.</div>';
-      }
-    });
-
-    parentEl.appendChild(row);
-  };
-
-  const renderCommandRow = (command, parentEl, depth = 0) => {
-    const row = document.createElement("div");
-    row.className = "timeline-row row-process";
-    row.style.marginLeft = `${Math.max(0, depth) * 16}px`;
-    row.innerHTML = `
-      <div class="timeline-head">
-        <span class="row-title">command_exec</span>
-        <span class="row-sub mono-small">${escapeHtml(command || "(command unknown)")}</span>
-      </div>`;
-    parentEl.appendChild(row);
-  };
-
-  const renderFileRow = (entry, parentEl, depth = 0) => {
-    const row = document.createElement("div");
-    row.className = "timeline-row row-file";
-    row.style.marginLeft = `${Math.max(0, depth) * 16}px`;
-    row.innerHTML = `
-      <div class="timeline-head">
-        <span class="row-title">${escapeHtml(entry.title || "files touched")}</span>
-        <span class="group-pills">${renderCountPills(entry.counts)}</span>
-      </div>
-      <div class="row-content" style="display:block;"></div>`;
-    const content = row.querySelector(".row-content");
-    content.appendChild(createFileTreeNode(entry.tree, null, { disableResourceDrilldown: true }));
-    parentEl.appendChild(row);
-  };
-
-  const renderNetworkRow = (entry, parentEl, depth = 0) => {
-    const row = document.createElement("div");
-    row.className = "timeline-row row-network";
-    row.style.marginLeft = `${Math.max(0, depth) * 16}px`;
-    const calls = Array.isArray(entry.calls) ? entry.calls : [];
-    const parts = [];
-    for (const call of calls) {
-      const sent = Number(call.bytes_sent || 0);
-      const recv = Number(call.bytes_recv || 0);
-      parts.push(`${call.dest} (tx ${sent}B rx ${recv}B)`);
-    }
-    row.innerHTML = `
-      <div class="timeline-head">
-        <span class="row-title">${escapeHtml(entry.title || "network")}</span>
-        <span class="row-sub mono-small">${escapeHtml(parts.join(" | ") || "No network details")}</span>
-      </div>`;
-    parentEl.appendChild(row);
-  };
-
-  const renderTimelineSequence = (timeline, parentEl, depth = 0) => {
-    for (const entry of timeline || []) {
-      if (!entry) continue;
-      const category = String(entry.category || "");
-
-      if (category === "file") {
-        renderFileRow(entry, parentEl, depth);
-        continue;
-      }
-
-      if (category === "process") {
-        const commands = Array.isArray(entry.commands) ? entry.commands : [];
-        for (const cmd of commands) {
-          renderCommandRow(String(cmd || ""), parentEl, depth);
-        }
-
-        const children = Array.isArray(entry.process_tree) ? entry.process_tree : [];
-        for (const child of children) {
-          const pid = Number(child && child.pid);
-          if (!pid) continue;
-          renderProcessNode({ pid, command: String((child && child.command) || "") }, parentEl, depth);
-        }
-        continue;
-      }
-
-      if (category === "network") {
-        renderNetworkRow(entry, parentEl, depth);
-      }
-    }
-  };
-
-  renderTimelineSequence(payload.timeline || [], processTree, 0);
+  for (const entry of visibleTimeline) {
+    processTree.appendChild(
+      renderSystemGroup(entry, null, {
+        disableResourceDrilldown: true,
+        recursiveProcessExpand: true,
+        displayTraceContext: {
+          onSelectPid: options.onSelectPid,
+          startTimestamp: options.startTimestamp,
+          endTimestamp: options.endTimestamp,
+        },
+      })
+    );
+  }
 
   wrap.appendChild(meta);
   wrap.appendChild(processTree);
@@ -1122,16 +1548,70 @@ function renderProcessTracePopup(payload, turnId, toolName) {
   overlay.classList.add("open");
 }
 
-async function openSourceTracePopup(turnId, pid, toolName) {
+async function openSourceTracePopup(turnId, pid, toolName, startTimestamp = null, endTimestamp = null, retainStack = false) {
   if (!selectedTraceId || !turnId || !pid) return;
+
+  if (!retainStack) {
+    popupTraceViewerState = {
+      turnId,
+      pid,
+      stack: [],
+      startTimestamp,
+      endTimestamp,
+      title: String(toolName || "tool output"),
+    };
+  } else {
+    popupTraceViewerState.pid = pid;
+  }
+
+  const state = popupTraceViewerState;
   const overlay = ensureProcessTracePopup();
   const bodyEl = overlay.querySelector("#processTraceBody");
   bodyEl.innerHTML = '<div class="mono-text">Loading process trace...</div>';
   overlay.classList.add("open");
 
+  const params = new URLSearchParams();
+  params.set("pid", String(state.pid));
+  if (state.startTimestamp != null) params.set("start_timestamp", String(state.startTimestamp));
+  if (state.endTimestamp != null) params.set("end_timestamp", String(state.endTimestamp));
+
   try {
-    const payload = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/process-subtrace/${encodeURIComponent(turnId)}/${encodeURIComponent(pid)}?full_lifecycle=1`);
-    renderProcessTracePopup(payload, turnId, toolName);
+    let payload;
+    try {
+      payload = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/display-trace?${params.toString()}`);
+    } catch (err) {
+      // Fallback for server instances that have not reloaded display-trace route yet.
+      payload = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/process-subtrace/${encodeURIComponent(turnId)}/${encodeURIComponent(state.pid)}?full_lifecycle=1`);
+    }
+
+    const scopeText = state.startTimestamp == null && state.endTimestamp == null ? "full lifecycle" : "turn window";
+    renderProcessTracePopup(payload, turnId, state.title, {
+      subtitle: `Source: ${String(state.title)} · ${scopeText}`,
+      startTimestamp: state.startTimestamp,
+      endTimestamp: state.endTimestamp,
+      hiddenEventTypes: activeHiddenTraceEventTypes(),
+      onToggleDetail: async () => {
+        detailedTraceViewEnabled = !detailedTraceViewEnabled;
+        await openSourceTracePopup(turnId, state.pid, state.title, state.startTimestamp, state.endTimestamp, true);
+      },
+      onEditFilters: async () => {
+        const changed = editCompactTraceHiddenEventTypes();
+        if (!changed) return;
+        await openSourceTracePopup(turnId, state.pid, state.title, state.startTimestamp, state.endTimestamp, true);
+      },
+      onBack: state.stack.length
+        ? async () => {
+            const previousPid = state.stack.pop();
+            if (!previousPid) return;
+            await openSourceTracePopup(turnId, previousPid, state.title, state.startTimestamp, state.endTimestamp, true);
+          }
+        : null,
+      onSelectPid: async (childPid) => {
+        if (!childPid || Number(childPid) <= 0) return;
+        state.stack.push(state.pid);
+        await openSourceTracePopup(turnId, childPid, state.title, state.startTimestamp, state.endTimestamp, true);
+      },
+    });
   } catch (_err) {
     bodyEl.innerHTML = '<div class="mono-text">Failed to load process trace for this source PID.</div>';
   }
@@ -1335,6 +1815,7 @@ function renderReplayDetail(payload) {
   const isContext = currentReplayPaneTab === "context";
   const isAction = currentReplayPaneTab === "action";
   const isSummary = currentReplayPaneTab === "summary";
+  const isRawEvents = currentReplayPaneTab === "raw_events";
 
   let title = "Summary";
   let contentHtml = "";
@@ -1370,6 +1851,13 @@ function renderReplayDetail(payload) {
         <div class="replay-summary-metric"><div class="k">Network Calls</div><div class="v">${formatNumber(replaySummary.network_calls)}</div></div>
         <div class="replay-summary-metric"><div class="k">Context/Action Sections</div><div class="v">${formatNumber(replaySummary.context_sections)} / ${formatNumber(replaySummary.action_sections)}</div></div>
       </div>`;
+  } else if (isRawEvents) {
+    title = "Raw Events";
+    contentHtml = `
+      <div class="replay-raw-pane">
+        <div class="replay-raw-controls" id="replayRawControls"></div>
+        <div class="replay-raw-host" id="replayRawEventsHost"><div class="replay-empty">Loading raw event trace...</div></div>
+      </div>`;
   }
 
   const right = graphCanvas.querySelector("#replayRightPane");
@@ -1383,6 +1871,7 @@ function renderReplayDetail(payload) {
       <button class="replay-subtab ${isContext ? "active" : ""}" id="replayContextTab">Context</button>
       <button class="replay-subtab ${isAction ? "active" : ""}" id="replayActionTab">Action</button>
       <button class="replay-subtab ${isSummary ? "active" : ""}" id="replaySummaryTab">Summary</button>
+      <button class="replay-subtab ${isRawEvents ? "active" : ""}" id="replayRawEventsTab">Raw Events</button>
     </div>
     <div class="replay-sections">${contentHtml}</div>`;
 
@@ -1392,7 +1881,7 @@ function renderReplayDetail(payload) {
     btn.addEventListener("click", async () => {
       const pid = Number(btn.getAttribute("data-source-pid") || "0");
       if (!pid || !payload.turn_id) return;
-      await openSourceTracePopup(payload.turn_id, pid, "tool output");
+      await openSourceTracePopup(payload.turn_id, pid, "tool output", payload.start_ts, payload.end_ts);
     });
   });
 
@@ -1409,6 +1898,11 @@ function renderReplayDetail(payload) {
   $("replaySummaryTab").addEventListener("click", () => {
     if (currentReplayPaneTab === "summary") return;
     currentReplayPaneTab = "summary";
+    renderReplayDetail(payload);
+  });
+  $("replayRawEventsTab").addEventListener("click", () => {
+    if (currentReplayPaneTab === "raw_events") return;
+    currentReplayPaneTab = "raw_events";
     renderReplayDetail(payload);
   });
 
@@ -1429,7 +1923,7 @@ function renderReplayDetail(payload) {
             sourceBtn.addEventListener("click", async () => {
               const pid = Number(sourceBtn.getAttribute("data-source-pid") || "0");
               if (!pid || !payload.turn_id) return;
-              await openSourceTracePopup(payload.turn_id, pid, "tool output");
+              await openSourceTracePopup(payload.turn_id, pid, "tool output", payload.start_ts, payload.end_ts);
             });
           });
         });
@@ -1489,12 +1983,83 @@ function renderReplayDetail(payload) {
             treeBtn.addEventListener("click", async () => {
               const pid = Number(treeBtn.getAttribute("data-pid") || "0");
               if (!pid || !payload.turn_id) return;
-              await openSourceTracePopup(payload.turn_id, pid, "subprocess");
+              await openSourceTracePopup(payload.turn_id, pid, "subprocess", payload.start_ts, payload.end_ts);
             });
           });
         });
       }
     });
+  });
+
+  if (isRawEvents) {
+    renderReplayRawEventsPane(payload);
+  }
+}
+
+async function renderReplayRawEventsPane(payload) {
+  const controls = graphCanvas.querySelector("#replayRawControls");
+  const host = graphCanvas.querySelector("#replayRawEventsHost");
+  if (!controls || !host) return;
+
+  if (replayRawTraceViewerState.turnId !== payload.turn_id) {
+    replayRawTraceViewerState = { turnId: payload.turn_id, pid: null, stack: [] };
+  }
+  const state = replayRawTraceViewerState;
+
+  controls.innerHTML = "";
+  if (state.stack.length > 0) {
+    const backBtn = document.createElement("button");
+    backBtn.className = "inline-btn";
+    backBtn.textContent = "Back";
+    backBtn.addEventListener("click", async () => {
+      state.pid = state.stack.pop();
+      await renderReplayRawEventsPane(payload);
+    });
+    controls.appendChild(backBtn);
+  }
+
+  const detailBtn = document.createElement("button");
+  detailBtn.className = "inline-btn";
+  detailBtn.textContent = detailedTraceViewEnabled ? "Detailed: On" : "Detailed: Off";
+  detailBtn.addEventListener("click", async () => {
+    detailedTraceViewEnabled = !detailedTraceViewEnabled;
+    await renderReplayRawEventsPane(payload);
+  });
+  controls.appendChild(detailBtn);
+
+  const editFiltersBtn = document.createElement("button");
+  editFiltersBtn.className = "inline-btn";
+  editFiltersBtn.textContent = "Edit Hidden Events";
+  editFiltersBtn.addEventListener("click", async () => {
+    const changed = editCompactTraceHiddenEventTypes();
+    if (!changed) return;
+    await renderReplayRawEventsPane(payload);
+  });
+  controls.appendChild(editFiltersBtn);
+
+  const scopeLabel = document.createElement("span");
+  scopeLabel.className = "row-sub";
+  scopeLabel.textContent = state.pid == null
+    ? "All processes in turn window"
+    : `PID ${String(state.pid)} in turn window`;
+  controls.appendChild(scopeLabel);
+
+  const filterLabel = document.createElement("span");
+  filterLabel.className = "row-sub";
+  filterLabel.textContent = detailedTraceViewEnabled
+    ? "Showing all event types"
+    : `Hidden in compact: ${compactHiddenEventsLabel()}`;
+  controls.appendChild(filterLabel);
+
+  await display_trace(state.pid, payload.start_ts, payload.end_ts, {
+    targetEl: host,
+    hiddenEventTypes: activeHiddenTraceEventTypes(),
+    onSelectPid: async (childPid) => {
+      if (!childPid || Number(childPid) <= 0) return;
+      state.stack.push(state.pid);
+      state.pid = childPid;
+      await renderReplayRawEventsPane(payload);
+    },
   });
 }
 
@@ -1707,6 +2272,7 @@ function renderReplayShell(overview) {
 async function loadReplayTurnDetail(turnId) {
   if (!selectedTraceId) return;
   replayViewMode = "turn";
+  replayRawTraceViewerState = { turnId, pid: null, stack: [] };
   await primeReplaySourceMaps();
   const [payload, turnDetail] = await Promise.all([
     api(`/api/traces/${encodeURIComponent(selectedTraceId)}/replay-turns/${encodeURIComponent(turnId)}`),
@@ -2088,6 +2654,9 @@ function installStyles() {
 
     .inline-btn { border:1px solid var(--border); background:var(--slate-50); border-radius:6px; padding:3px 7px; font-size:11px; cursor:pointer; margin-left:auto; }
     .inline-btn:hover { background: var(--slate-100); }
+    .debug-btn { margin-left:0; }
+    .event-debug-btn { margin-left:auto; }
+    .group-toggle { margin-left:0; }
 
     .mono-block, .mono-text, .raw-json pre { font-family:Consolas, Monaco, monospace; font-size:11px; white-space:pre-wrap; word-break:break-word; background:var(--slate-50); border:1px solid var(--border); border-radius:6px; padding:8px; }
     .mini-label { font-size:10px; text-transform:uppercase; font-weight:700; color:var(--text-muted); margin-bottom:4px; }
@@ -2097,6 +2666,7 @@ function installStyles() {
     .tree-pills { display:flex; gap:6px; }
     .tree-file { margin-left: 18px; display:flex; justify-content:space-between; font-size:12px; border:1px solid var(--border-light); border-radius:6px; padding:4px 8px; cursor:pointer; }
     .tree-file:hover { background: var(--slate-50); }
+    .tree-meta { display:flex; align-items:center; gap:8px; }
     .tree-read { border-left:3px solid #d97706; }
     .tree-write { border-left:3px solid #dc2626; }
     .tree-read_write { border-left:3px solid #b45309; }
@@ -2148,6 +2718,10 @@ function installStyles() {
     .replay-subtab.active { background:var(--blue-50); color:var(--blue-600); border-color:var(--blue-100); }
 
     .replay-sections { padding:10px 12px 14px; overflow-y:auto; overflow-x:hidden; display:flex; flex-direction:column; gap:10px; flex:1; }
+    .replay-raw-pane { display:grid; gap:10px; }
+    .replay-raw-controls { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+    .replay-raw-host { display:grid; gap:10px; }
+    .timeline-root-collapsed > summary { cursor:pointer; font-size:12px; font-weight:700; color:var(--text-secondary); padding:6px 0; }
     .replay-card { border:1px solid var(--border); border-radius:8px; overflow:visible; }
     .replay-card > summary { list-style: none; cursor: pointer; display:flex; align-items:center; justify-content:space-between; gap:8px; }
     .replay-card > summary::-webkit-details-marker { display: none; }
