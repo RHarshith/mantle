@@ -7,11 +7,11 @@ Boundary: ebpf parser/writer -> ingest tailer (_tail_ebpf_events)
 
 ## Purpose
 
-Define the line-by-line JSON schema written to `obs/traces/<trace_id>.ebpf.jsonl` and strictly validated during ingestion.
+Define the line-by-line JSON schema written to `.mantle/obs/traces/<trace_id>.ebpf.jsonl` and strictly validated during ingestion.
 
 ## File Contract
 
-- Path convention: `obs/traces/<trace_id>.ebpf.jsonl`
+- Path convention: `.mantle/obs/traces/<trace_id>.ebpf.jsonl`
 - Encoding: UTF-8 JSONL
 - One JSON object per line
 - Writer: `json.dumps(..., ensure_ascii=False)`

@@ -57,8 +57,6 @@ Narrow down to a failing unit test [optional]
 
 4. **Verify** — all tests pass, including regression
 
-5. **Cleanup** — delete the RCA document
-
 ## Why This Matters
 
 Without RCA, agents tend to:

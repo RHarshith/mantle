@@ -10,6 +10,9 @@ import traceback
 
 from openai import OpenAI
 
+from mantle.runtime.bootstrap import bootstrap_runtime
+from mantle.runtime.logging import bind_correlation, get_component_logger
+
 try:
     # Works when invoked as `python -m mantle_agent.cli_agent`.
     from mantle_agent.agent_observability import build_event_sink
@@ -474,6 +477,9 @@ def run_single_turn(
 
 
 def main() -> None:
+    _, layout = bootstrap_runtime("agent")
+    logger = get_component_logger("agent", layout=layout)
+
     parser = argparse.ArgumentParser(description="Simple CLI LLM agent")
     parser.add_argument(
         "prompt",
@@ -524,6 +530,9 @@ def main() -> None:
 
     client = OpenAI(api_key=api_key, base_url=base_url)
     sink = build_event_sink()
+
+    bind_correlation(trace_id=os.getenv("AGENT_TRACE_ID", ""))
+    logger.info("cli agent runtime initialized", extra={"model": model, "base_url": base_url})
 
     messages = []
     shared_globals = {"__builtins__": __builtins__}

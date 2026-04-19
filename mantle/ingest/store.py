@@ -4527,12 +4527,11 @@ class TraceStore:
         return str(snapshot.get("content") or "")
 
     def _trace_repo_root(self, trace: TraceState) -> Path | None:
-        # Trace layout is typically <repo>/obs/traces/<trace_id>.ebpf.jsonl.
+        # Trace layout is typically <repo>/.mantle/obs/traces/<trace_id>.ebpf.jsonl.
         try:
-            if len(trace.trace_path.parents) >= 3:
-                root = trace.trace_path.parents[2]
-                if (root / ".git").exists():
-                    return root
+            for parent in trace.trace_path.parents:
+                if (parent / ".git").exists():
+                    return parent
         except Exception:
             return None
         return None

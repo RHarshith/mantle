@@ -65,37 +65,13 @@ if [[ "$INTERCEPT_MODE" != "none" ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-OBS_ROOT_DEFAULT="$SCRIPT_DIR/obs"
-OBS_ROOT_ENV="${AGENT_OBS_ROOT:-}"
-OBS_ROOT="$OBS_ROOT_DEFAULT"
-PROXY_LOG_DIR="${MANTLE_PROXY_LOG_DIR:-$SCRIPT_DIR/litellm_proxy/bpf_logs}"
+LOGS_ROOT="$SCRIPT_DIR/.mantle/logs"
+OBS_ROOT="$SCRIPT_DIR/.mantle/obs"
+CONFIG_ROOT="$SCRIPT_DIR/.mantle/config"
+RUNTIME_ROOT="$LOGS_ROOT/runtime"
+PROXY_LOG_DIR="$OBS_ROOT/proxy"
+MANTLE_BPF_RUNTIME_DIR="${MANTLE_BPF_RUNTIME_DIR:-$RUNTIME_ROOT/bpf_collector}"
 PROXY_CONTROL_URL="${MANTLE_PROXY_CONTROL_URL:-http://127.0.0.1:4000/mantle/active-trace}"
-
-# If AGENT_OBS_ROOT is set but points to stale/empty data while this repo has
-# logs, prefer the repo-local obs folder to avoid silent trace loss after renames.
-if [[ -n "$OBS_ROOT_ENV" ]]; then
-    env_score=0
-    repo_score=0
-    if [[ -d "$OBS_ROOT_ENV/traces" ]]; then
-        env_score=$((env_score + $(find "$OBS_ROOT_ENV/traces" -maxdepth 1 -type f -name '*.ebpf.jsonl' 2>/dev/null | wc -l)))
-    fi
-    if [[ -d "$OBS_ROOT_ENV/events" ]]; then
-        env_score=$((env_score + $(find "$OBS_ROOT_ENV/events" -maxdepth 1 -type f -name '*.events.jsonl' 2>/dev/null | wc -l)))
-    fi
-    if [[ -d "$OBS_ROOT_DEFAULT/traces" ]]; then
-        repo_score=$((repo_score + $(find "$OBS_ROOT_DEFAULT/traces" -maxdepth 1 -type f -name '*.ebpf.jsonl' 2>/dev/null | wc -l)))
-    fi
-    if [[ -d "$OBS_ROOT_DEFAULT/events" ]]; then
-        repo_score=$((repo_score + $(find "$OBS_ROOT_DEFAULT/events" -maxdepth 1 -type f -name '*.events.jsonl' 2>/dev/null | wc -l)))
-    fi
-
-    if [[ "$env_score" -eq 0 && "$repo_score" -gt 0 ]]; then
-        OBS_ROOT="$OBS_ROOT_DEFAULT"
-        echo "[mantle] AGENT_OBS_ROOT has no logs; using repo obs root: $OBS_ROOT" >&2
-    else
-        OBS_ROOT="$OBS_ROOT_ENV"
-    fi
-fi
 
 AGENT_TAG="$(basename "$AGENT_BIN")"
 [[ -z "$TRACE_ID" ]] && TRACE_ID="${AGENT_TAG}_$(date +%Y%m%d_%H%M%S).ebpf.jsonl"
@@ -119,12 +95,23 @@ if [[ ${#TASK[@]} -eq 0 ]]; then
     fi
 fi
 
-mkdir -p "$OBS_ROOT/traces" "$OBS_ROOT/events" "$OBS_ROOT/mitm"
+mkdir -p "$OBS_ROOT/traces" "$OBS_ROOT/events" "$OBS_ROOT/mitm" "$PROXY_LOG_DIR" "$MANTLE_BPF_RUNTIME_DIR" "$CONFIG_ROOT"
+
+export MANTLE_LOGS_DIR="$LOGS_ROOT"
+export MANTLE_CONFIG_DIR="$CONFIG_ROOT"
+export MANTLE_PROXY_LOG_DIR="$PROXY_LOG_DIR"
+export AGENT_OBS_ROOT="$OBS_ROOT"
+export OBS_TRACE_DIR="$OBS_ROOT/traces"
+export OBS_EVENTS_DIR="$OBS_ROOT/events"
 
 TRACE_BASENAME="${TRACE_ID%.ebpf.jsonl}"
 EBPF_FILE="$OBS_ROOT/traces/$TRACE_ID"
 ROOT_PID_FILE="$OBS_ROOT/mitm/${TRACE_BASENAME}.root.pid"
 PID_WRAPPER_SCRIPT=""
+RUNTIME_LOG_FILE="$MANTLE_BPF_RUNTIME_DIR/${TRACE_BASENAME}.log"
+
+# Capture watch runner lifecycle logs in runtime/bpf_collector.
+exec > >(tee -a "$RUNTIME_LOG_FILE") 2>&1
 
 EBPF_CAPTURE_SCRIPT="$SCRIPT_DIR/mantle/capture/ebpf.py"
 if [[ ! -f "$EBPF_CAPTURE_SCRIPT" ]]; then
@@ -144,7 +131,7 @@ make_pid_wrapper() {
     local wrapper
     local preserve_env
     wrapper="$(mktemp /tmp/mantle-agent-launch.XXXXXX.sh)"
-    preserve_env="PATH,OPENAI_API_KEY,OAK1,OPENAI_BASE_URL,OPENAI_MODEL,AGENT_TRACE_ID,AGENT_OBS_ENABLED,AGENT_OBS_ROOT,RTRACE_VENV,RTRACE_INTERCEPT_MODE,RTRACE_FORCE_OPENAI_BASE,MANTLE_VENV,MANTLE_INTERCEPT_MODE,MANTLE_FORCE_OPENAI_BASE,XDG_CONFIG_HOME,XDG_STATE_HOME,XDG_CACHE_HOME,XDG_DATA_HOME,XDG_RUNTIME_DIR,DBUS_SESSION_BUS_ADDRESS,GITHUB_TOKEN,GH_TOKEN,GITHUB_COPILOT_TOKEN,COPILOT_TOKEN"
+    preserve_env="PATH,OPENAI_API_KEY,OAK1,OPENAI_BASE_URL,OPENAI_MODEL,AGENT_TRACE_ID,AGENT_OBS_ENABLED,AGENT_OBS_ROOT,OBS_TRACE_DIR,OBS_EVENTS_DIR,MANTLE_LOGS_DIR,MANTLE_CONFIG_DIR,MANTLE_PROXY_LOG_DIR,RTRACE_VENV,RTRACE_INTERCEPT_MODE,RTRACE_FORCE_OPENAI_BASE,MANTLE_VENV,MANTLE_INTERCEPT_MODE,MANTLE_FORCE_OPENAI_BASE,XDG_CONFIG_HOME,XDG_STATE_HOME,XDG_CACHE_HOME,XDG_DATA_HOME,XDG_RUNTIME_DIR,DBUS_SESSION_BUS_ADDRESS,GITHUB_TOKEN,GH_TOKEN,GITHUB_COPILOT_TOKEN,COPILOT_TOKEN"
     {
         echo "#!/usr/bin/env bash"
         echo "set -euo pipefail"

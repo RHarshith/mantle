@@ -136,6 +136,20 @@ SAMPLE_AGENT_EVENTS: list[dict[str, Any]] = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def runtime_env_isolation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep tests isolated from stale folder env overrides."""
+    for var_name in (
+        "MANTLE_DEV",
+        "MANTLE_LOGS_DIR",
+        "MANTLE_CONFIG_DIR",
+        "AGENT_OBS_ROOT",
+        "OBS_TRACE_DIR",
+        "OBS_EVENTS_DIR",
+    ):
+        monkeypatch.delenv(var_name, raising=False)
+
+
 # ── Fixtures ─────────────────────────────────────────────────────
 
 

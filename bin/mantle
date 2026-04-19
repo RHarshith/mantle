@@ -19,7 +19,7 @@ VENV_PATH="${MANTLE_VENV:-${RTRACE_VENV:-$REPO_ROOT/.venv}}"
 usage() {
     cat <<'EOF'
 Usage:
-  mantle serve [--host <host>] [--port <port>] [--obs-root <path>]
+    mantle serve [--host <host>] [--port <port>]
         mantle watch [--trace-id <id>] [--interactive-ebpf] <executable> [args...]
 
 Commands:
@@ -35,15 +35,13 @@ EOF
 }
 
 serve_cmd() {
-    local host port obs_root python_bin
-    local cli_obs_root repo_obs_root env_obs_root env_score repo_score
+    local host port obs_root python_bin logs_root config_root
 
     host="127.0.0.1"
     port="8099"
-    cli_obs_root=""
-    repo_obs_root="$REPO_ROOT/obs"
-    env_obs_root="${AGENT_OBS_ROOT:-}"
-    obs_root="$repo_obs_root"
+    logs_root="$REPO_ROOT/.mantle/logs"
+    obs_root="$REPO_ROOT/.mantle/obs"
+    config_root="$REPO_ROOT/.mantle/config"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -53,10 +51,6 @@ serve_cmd() {
                 ;;
             --port)
                 port="$2"
-                shift 2
-                ;;
-            --obs-root)
-                cli_obs_root="$2"
                 shift 2
                 ;;
             -h|--help|help)
@@ -71,51 +65,37 @@ serve_cmd() {
         esac
     done
 
-    # --obs-root should always win. Otherwise, guard against stale AGENT_OBS_ROOT
-    # values left behind after repository moves/renames.
-    if [[ -n "$cli_obs_root" ]]; then
-        obs_root="$cli_obs_root"
-    elif [[ -n "$env_obs_root" ]]; then
-        env_score=0
-        repo_score=0
-        if [[ -d "$env_obs_root/traces" ]]; then
-            env_score=$((env_score + $(find "$env_obs_root/traces" -maxdepth 1 -type f -name '*.ebpf.jsonl' 2>/dev/null | wc -l)))
-        fi
-        if [[ -d "$env_obs_root/events" ]]; then
-            env_score=$((env_score + $(find "$env_obs_root/events" -maxdepth 1 -type f -name '*.events.jsonl' 2>/dev/null | wc -l)))
-        fi
-        if [[ -d "$repo_obs_root/traces" ]]; then
-            repo_score=$((repo_score + $(find "$repo_obs_root/traces" -maxdepth 1 -type f -name '*.ebpf.jsonl' 2>/dev/null | wc -l)))
-        fi
-        if [[ -d "$repo_obs_root/events" ]]; then
-            repo_score=$((repo_score + $(find "$repo_obs_root/events" -maxdepth 1 -type f -name '*.events.jsonl' 2>/dev/null | wc -l)))
-        fi
-
-        if [[ "$env_score" -eq 0 && "$repo_score" -gt 0 ]]; then
-            obs_root="$repo_obs_root"
-            echo "[mantle] AGENT_OBS_ROOT has no logs; using repo obs root: $obs_root" >&2
-        else
-            obs_root="$env_obs_root"
-        fi
-    fi
-
     python_bin="$VENV_PATH/bin/python"
     if [[ ! -x "$python_bin" ]]; then
         echo "Error: $python_bin not found. Run scripts/install_mantle.sh first." >&2
         exit 1
     fi
 
+    export MANTLE_LOGS_DIR="$logs_root"
+    export MANTLE_CONFIG_DIR="$config_root"
     export AGENT_OBS_ROOT="$obs_root"
     export OBS_TRACE_DIR="$obs_root/traces"
     export OBS_EVENTS_DIR="$obs_root/events"
 
-    mkdir -p "$obs_root/traces" "$obs_root/events" "$obs_root/mitm"
+    mkdir -p \
+        "$obs_root/traces" \
+        "$obs_root/events" \
+        "$obs_root/mitm" \
+        "$obs_root/proxy" \
+        "$logs_root/runtime/bpf_collector" \
+        "$logs_root/runtime/proxy" \
+        "$logs_root/runtime/post_processing" \
+        "$logs_root/runtime/server" \
+        "$logs_root/runtime/frontend" \
+        "$logs_root/runtime/agent" \
+        "$config_root"
 
     exec "$python_bin" -m uvicorn mantle.server.app:app --host "$host" --port "$port"
 }
 
 watch_cmd() {
     local runner executable resolved_executable preserve_env
+    local logs_root obs_root config_root
     local -a runner_args passthrough task_args
 
     runner="$REPO_ROOT/run_intercepted_agent.sh"
@@ -196,13 +176,36 @@ watch_cmd() {
     # Forward all arguments after <executable> exactly as provided.
     task_args=("$@")
 
+    logs_root="$REPO_ROOT/.mantle/logs"
+    obs_root="$REPO_ROOT/.mantle/obs"
+    config_root="$REPO_ROOT/.mantle/config"
+
+    export MANTLE_LOGS_DIR="$logs_root"
+    export MANTLE_CONFIG_DIR="$config_root"
+    export AGENT_OBS_ROOT="$obs_root"
+    export OBS_TRACE_DIR="$obs_root/traces"
+    export OBS_EVENTS_DIR="$obs_root/events"
+
+    mkdir -p \
+        "$obs_root/traces" \
+        "$obs_root/events" \
+        "$obs_root/mitm" \
+        "$obs_root/proxy" \
+        "$logs_root/runtime/bpf_collector" \
+        "$logs_root/runtime/proxy" \
+        "$logs_root/runtime/post_processing" \
+        "$logs_root/runtime/server" \
+        "$logs_root/runtime/frontend" \
+        "$logs_root/runtime/agent" \
+        "$config_root"
+
     runner_args=("${passthrough[@]}" --agent "$resolved_executable")
     if [[ ${#task_args[@]} -gt 0 ]]; then
         runner_args+=(-- "${task_args[@]}")
     fi
 
     if [[ "${EUID}" -ne 0 ]]; then
-        preserve_env="PATH,OPENAI_API_KEY,OAK1,OPENAI_BASE_URL,OPENAI_MODEL,AGENT_TRACE_ID,AGENT_OBS_ENABLED,AGENT_OBS_ROOT,RTRACE_VENV,RTRACE_INTERCEPT_MODE,RTRACE_FORCE_OPENAI_BASE,MANTLE_VENV,MANTLE_INTERCEPT_MODE,MANTLE_FORCE_OPENAI_BASE"
+        preserve_env="PATH,OPENAI_API_KEY,OAK1,OPENAI_BASE_URL,OPENAI_MODEL,AGENT_TRACE_ID,AGENT_OBS_ENABLED,AGENT_OBS_ROOT,OBS_TRACE_DIR,OBS_EVENTS_DIR,MANTLE_LOGS_DIR,MANTLE_CONFIG_DIR,MANTLE_PROXY_LOG_DIR,RTRACE_VENV,RTRACE_INTERCEPT_MODE,RTRACE_FORCE_OPENAI_BASE,MANTLE_VENV,MANTLE_INTERCEPT_MODE,MANTLE_FORCE_OPENAI_BASE"
         exec sudo --preserve-env="$preserve_env" "$runner" "${runner_args[@]}"
     fi
 

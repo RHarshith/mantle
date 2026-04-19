@@ -6,6 +6,7 @@ import asyncio
 import os
 from pathlib import Path
 from typing import Any
+import uuid
 
 from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
@@ -14,9 +15,15 @@ from fastapi.staticfiles import StaticFiles
 from mantle.ingest.config import resolve_observability_paths
 from mantle.errors import log_exception
 from mantle.ingest.store import TraceStore
+from mantle.runtime.bootstrap import bootstrap_runtime
+from mantle.runtime.logging import bind_correlation, get_component_logger
 
 
 app = FastAPI(title="Agent System Observability Dashboard")
+
+_RUNTIME_ENV, _RUNTIME_LAYOUT = bootstrap_runtime("server")
+SERVER_LOGGER = get_component_logger("server", layout=_RUNTIME_LAYOUT)
+FRONTEND_LOGGER = get_component_logger("frontend", layout=_RUNTIME_LAYOUT)
 
 
 @app.middleware("http")
@@ -37,12 +44,10 @@ def _resolve_paths() -> tuple[Path, Path]:
 
 
 WATCH_DIR, EVENTS_DIR = _resolve_paths()
-_DEFAULT_PROXY_DIR = WATCH_DIR.parent.parent / "litellm_proxy" / "bpf_logs" if WATCH_DIR else None
+_DEFAULT_PROXY_DIR = _RUNTIME_LAYOUT.proxy_obs_dir
 LLM_CAPTURE_SOURCE = str(os.getenv("MANTLE_LLM_CAPTURE_SOURCE", "proxy")).strip().lower() or "proxy"
-PROXY_DIR_ENV = str(os.getenv("MANTLE_PROXY_LOG_DIR", "")).strip()
-PROXY_LOG_FILE_ENV = str(os.getenv("MANTLE_PROXY_LOG_FILE", "")).strip()
-PROXY_DIR = Path(PROXY_DIR_ENV).expanduser() if PROXY_DIR_ENV else _DEFAULT_PROXY_DIR
-PROXY_LOG_FILE = Path(PROXY_LOG_FILE_ENV).expanduser() if PROXY_LOG_FILE_ENV else None
+PROXY_DIR = _DEFAULT_PROXY_DIR
+PROXY_LOG_FILE = None
 
 store = TraceStore(
 	trace_dir=WATCH_DIR,
@@ -50,6 +55,16 @@ store = TraceStore(
 	proxy_dir=PROXY_DIR,
 	llm_capture_source=LLM_CAPTURE_SOURCE,
 	proxy_log_file=PROXY_LOG_FILE,
+)
+
+SERVER_LOGGER.info(
+	"server runtime initialized",
+	extra={
+		"watch_dir": str(WATCH_DIR),
+		"events_dir": str(EVENTS_DIR),
+		"proxy_dir": str(PROXY_DIR) if PROXY_DIR else "",
+		"logs_root": str(_RUNTIME_LAYOUT.logs_root),
+	},
 )
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -69,6 +84,7 @@ async def startup() -> None:
 			except asyncio.CancelledError:
 				raise
 			except Exception:
+				bind_correlation(correlation_id=str(uuid.uuid4()))
 				log_exception("Dashboard poll loop failed")
 
 			try:
@@ -123,8 +139,23 @@ def config() -> dict[str, Any]:
 	return {
 		"watch_dir": str(WATCH_DIR),
 		"events_dir": str(EVENTS_DIR),
+		"runtime_logs_root": str(_RUNTIME_LAYOUT.runtime_root),
 		"trace_count": len(store.traces),
 	}
+
+
+@app.post("/api/frontend-log")
+def frontend_log(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+	"""Persist browser runtime errors into frontend runtime logs."""
+	correlation_id = str(payload.get("correlation_id") or uuid.uuid4())
+	bind_correlation(correlation_id=correlation_id, request_id=str(payload.get("request_id") or ""))
+	message = str(payload.get("message") or "frontend runtime event")
+	level = str(payload.get("level") or "error").strip().lower()
+	if level == "warning":
+		FRONTEND_LOGGER.warning(message, extra={"frontend_payload": payload})
+	else:
+		FRONTEND_LOGGER.error(message, extra={"frontend_payload": payload})
+	return {"ok": True, "correlation_id": correlation_id}
 
 
 @app.get("/api/settings/llm-schemas")

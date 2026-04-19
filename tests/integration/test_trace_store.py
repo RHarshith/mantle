@@ -329,10 +329,10 @@ class TestTraceStoreGraphAndViews:
     def test_replay_turn_two_tool_outputs_include_sources(self):
         """Regression: context tool outputs in later turns should carry source metadata."""
         repo_root = Path(__file__).resolve().parents[2]
-        obs_root = repo_root / "obs"
+        obs_root = repo_root / ".mantle" / "obs"
         traces_dir = obs_root / "traces"
         events_dir = obs_root / "events"
-        proxy_dir = obs_root / "proxy_logs"
+        proxy_dir = obs_root / "proxy"
 
         if not traces_dir.exists() or not events_dir.exists() or not proxy_dir.exists():
             pytest.skip("Local obs fixtures not available")

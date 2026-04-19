@@ -1,6 +1,8 @@
 import contextvars
 import json
 import os
+from pathlib import Path
+import shutil
 import threading
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
@@ -9,9 +11,21 @@ from pydantic import BaseModel
 import litellm
 from litellm.integrations.custom_logger import CustomLogger
 
+from mantle.runtime.bootstrap import bootstrap_runtime
+from mantle.runtime.logging import get_component_logger
+
+
+_, _RUNTIME_LAYOUT = bootstrap_runtime("proxy")
+PROXY_LOGGER = get_component_logger("proxy", layout=_RUNTIME_LAYOUT)
+
 # Set LiteLLM config path before importing the proxy app.
 # This LiteLLM build reads CONFIG_FILE_PATH / WORKER_CONFIG.
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+_LOCAL_CONFIG_TEMPLATE = Path(__file__).with_name("config.yaml")
+if not _RUNTIME_LAYOUT.proxy_config_path.exists():
+    shutil.copy2(_LOCAL_CONFIG_TEMPLATE, _RUNTIME_LAYOUT.proxy_config_path)
+    PROXY_LOGGER.info("created default proxy config scaffold", extra={"config_path": str(_RUNTIME_LAYOUT.proxy_config_path)})
+
+_CONFIG_PATH = str(_RUNTIME_LAYOUT.proxy_config_path)
 os.environ["CONFIG_FILE_PATH"] = _CONFIG_PATH
 os.environ["WORKER_CONFIG"] = _CONFIG_PATH
 
@@ -86,14 +100,14 @@ async def capture_port_middleware(request: Request, call_next):
 
 # 3. LiteLLM Custom Logger: Safely grab the request and reconstructed response
 class PortBasedFileLogger(CustomLogger):
-    def __init__(self, log_dir="./bpf_logs"):
-        if os.path.isabs(log_dir):
-            self.log_dir = log_dir
+    def __init__(self, log_dir: str | None = None):
+        configured_dir = log_dir or str(_RUNTIME_LAYOUT.proxy_obs_dir)
+        if os.path.isabs(configured_dir):
+            self.log_dir = configured_dir
         else:
-            # Resolve relative path against this file so logs do not depend on cwd.
-            self.log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), log_dir)
-        if not os.path.exists(self.log_dir):
-            os.makedirs(self.log_dir)
+            self.log_dir = str(Path(configured_dir).expanduser())
+        os.makedirs(self.log_dir, exist_ok=True)
+        PROXY_LOGGER.info("proxy payload log directory configured", extra={"proxy_log_dir": self.log_dir})
 
     def _extract_port(self, kwargs: Dict[str, Any]) -> str:
         if not isinstance(kwargs, dict):
@@ -142,7 +156,7 @@ class PortBasedFileLogger(CustomLogger):
             if hasattr(value, "model_dump_json"):
                 return json.loads(value.model_dump_json())
         except Exception:
-            pass
+            PROXY_LOGGER.exception("Failed model_dump_json conversion in proxy serializer")
 
         try:
             if hasattr(value, "model_dump"):
@@ -150,12 +164,13 @@ class PortBasedFileLogger(CustomLogger):
                 json.dumps(dumped)
                 return dumped
         except Exception:
-            pass
+            PROXY_LOGGER.exception("Failed model_dump conversion in proxy serializer")
 
         try:
             json.dumps(value)
             return value
         except Exception:
+            PROXY_LOGGER.exception("Failed JSON serialization in proxy serializer; using string fallback")
             return {"_raw": str(value)}
 
     def _request_url(self, kwargs: Dict[str, Any], has_messages: bool) -> str:
@@ -292,6 +307,6 @@ class PortBasedFileLogger(CustomLogger):
         )
 
 # 4. Register the logger with LiteLLM
-litellm.callbacks = [PortBasedFileLogger()]
+litellm.callbacks = [PortBasedFileLogger(log_dir=str(_RUNTIME_LAYOUT.proxy_obs_dir))]
 
 # (The app is automatically exposed via the litellm.proxy.proxy_server import)

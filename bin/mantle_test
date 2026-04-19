@@ -112,7 +112,7 @@ TRACE_ID="${SCENARIO_NAME}_$(date +%Y%m%d_%H%M%S)"
 
 if [[ "$AGENT" == "mantle" ]]; then
     echo "  Running mantle agent..."
-    AGENT_OBS_ROOT="${AGENT_OBS_ROOT:-$REPO_ROOT/obs}"
+    AGENT_OBS_ROOT="$REPO_ROOT/.mantle/obs"
     AGENT_OBS_ENABLED=1 \
     AGENT_TRACE_ID="$TRACE_ID" \
     AGENT_AUTO_APPROVE=1 \

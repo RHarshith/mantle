@@ -164,8 +164,7 @@ proxy: ## Start LiteLLM proxy on port 4000 (stops existing server first)
 	  fi; \
 	  exit 1; \
 	fi; \
-	cd $(REPO_ROOT)/litellm_proxy; \
-	$(PYTHON_BIN) -m uvicorn proxy:app --host 0.0.0.0 --port 4000
+	$(PYTHON_BIN) -m uvicorn mantle.litellm_proxy.proxy:app --host 0.0.0.0 --port 4000
 
 clean: ## Remove caches and temp files
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

@@ -47,7 +47,7 @@ Agent Runtime
 			-> MITM capture (API/network payload view)
 			-> agent event sink (structured JSONL)
 
-Captured data (obs/)
+Captured data (.mantle/obs/)
 	-> traces/*.ebpf.jsonl
 	-> mitm/*.mitm.jsonl
 	-> events/*.events.jsonl
@@ -123,7 +123,7 @@ See `docs/api-tracing-limitations.md` for capture guarantees and limitations.
 `mantle serve`
 
 - Starts the FastAPI dashboard server.
-- Usage: `mantle serve [--host <host>] [--port <port>] [--obs-root <path>]`
+- Usage: `mantle serve [--host <host>] [--port <port>]`
 
 `mantle watch`
 
@@ -158,11 +158,12 @@ mantlecli trace_001.ebpf.jsonl/replay/turn_2/context/system_prompt/0
 
 ## Data Artifacts
 
-Mantle writes trace outputs to `obs/`:
+Mantle writes trace outputs to a fixed repo-local layout under `.mantle/obs/`:
 
-- `obs/traces/<trace_id>.ebpf.jsonl`
-- `obs/mitm/<trace_id>.mitm.jsonl`
-- `obs/events/<trace_id>.events.jsonl`
+- `.mantle/obs/traces/<trace_id>.ebpf.jsonl`
+- `.mantle/obs/mitm/<trace_id>.mitm.jsonl`
+- `.mantle/obs/events/<trace_id>.events.jsonl`
+- `.mantle/obs/proxy/<trace_id>.ebpf.jsonl` (LiteLLM proxy payload capture)
 
 These files are the source of truth for replay, debugging, and analysis.
 
@@ -186,7 +187,11 @@ These files are the source of truth for replay, debugging, and analysis.
 ├── trace_scenarios/
 ├── scripts/
 ├── run_intercepted_agent.sh
-└── obs/
+└── .mantle/
+	├── obs/
+	├── config/
+	└── logs/
+	    └── runtime/
 ```
 
 ## Engineering Highlights
@@ -198,10 +203,11 @@ These files are the source of truth for replay, debugging, and analysis.
 ## Environment Variables
 
 - `OPENAI_API_KEY`: API credential
-- `AGENT_OBS_ROOT`: output root (default `<repo>/obs`)
 - `MANTLE_VENV`: Python venv path used by wrappers
 - `MANTLE_INTERCEPT_MODE`: default intercept mode (`proxy` or `transparent`)
 - `MANTLE_FORCE_OPENAI_BASE=1`: debug override for base URL behavior
+
+Folder locations are fixed to `<repo>/.mantle/{obs,config,logs}`.
 
 Compatibility fallback variables (`RTRACE_*`) are supported.
 

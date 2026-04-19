@@ -10,8 +10,9 @@ Run with: python -m pytest tests/e2e/test_full_trace_pipeline.py -v
 
 import asyncio
 import os
-import tempfile
+import uuid
 
+from openai import OpenAI
 import pytest
 
 pytestmark = pytest.mark.e2e
@@ -38,41 +39,49 @@ class TestFullTracePipeline:
 
     def test_agent_trace_produces_events(self, has_api_key, tmp_path):
         """Verify that running the agent produces event files."""
-        # Set up obs directory
-        obs_root = tmp_path / "obs"
-        traces_dir = obs_root / "traces"
-        events_dir = obs_root / "events"
-        traces_dir.mkdir(parents=True)
-        events_dir.mkdir(parents=True)
+        del has_api_key, tmp_path
 
-        os.environ["AGENT_OBS_ROOT"] = str(obs_root)
+        from mantle.runtime.paths import ensure_runtime_layout, resolve_runtime_layout
+
+        layout = resolve_runtime_layout()
+        ensure_runtime_layout(layout, require_writable=False)
+        events_dir = layout.events_dir
 
         # Import agent after setting env vars
-        from mantle_agent.cli_agent import run_single_turn, build_client
-        from mantle_agent.agent_observability import JsonlEventSink
+        from mantle_agent.cli_agent import run_single_turn
+        from mantle_agent.agent_observability import build_event_sink
 
         # Create event sink
-        sink = JsonlEventSink(events_dir=events_dir)
+        trace_id = f"e2e-test-{uuid.uuid4().hex[:12]}"
+        os.environ["AGENT_TRACE_ID"] = trace_id
+        sink = build_event_sink()
 
         # Run a minimal agent turn
         # This tests the real pipeline: agent -> events -> store -> dashboard
         try:
-            client = build_client()
-            # A simple prompt that should complete in one turn
-            asyncio.get_event_loop().run_until_complete(
-                run_single_turn(
-                    client=client,
-                    prompt="Say exactly 'test complete' and nothing else.",
-                    sink=sink,
-                    auto_approve=True,
-                )
+            model = os.getenv("OPENAI_MODEL", "protected.gpt-5.2")
+            api_key = os.getenv("OAK1") or os.getenv("OPENAI_API_KEY")
+            assert api_key, "Expected OAK1 or OPENAI_API_KEY for e2e test"
+            base_url = os.getenv("OPENAI_BASE_URL", "https://chat-api.tamu.ai/api")
+            client = OpenAI(api_key=api_key, base_url=base_url)
+
+            messages = [{"role": "user", "content": "Say exactly 'test complete' and nothing else."}]
+            shared_globals = {"__builtins__": __builtins__}
+
+            run_single_turn(
+                client=client,
+                model=model,
+                messages=messages,
+                shared_globals=shared_globals,
+                sink=sink,
+                auto_approve=True,
             )
         finally:
             sink.close()
 
         # Verify events were written
-        event_files = list(events_dir.glob("*.events.jsonl"))
-        assert len(event_files) >= 1, "Agent should have produced event files"
+        event_file = events_dir / f"{trace_id}.events.jsonl"
+        assert event_file.exists(), "Agent should have produced an event file"
 
     def test_dashboard_ingests_agent_trace(self, has_api_key, tmp_path):
         """Verify the dashboard can ingest agent-produced trace data."""

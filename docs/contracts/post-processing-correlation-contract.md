@@ -11,9 +11,9 @@ Define how raw capture inputs are merged, normalized, correlated into turn seman
 
 ## Input Sources
 
-- System capture: `obs/traces/<trace_id>.ebpf.jsonl`
-- Native agent events (optional): `obs/events/<trace_id>.events.jsonl`
-- LiteLLM proxy traffic (optional): `litellm_proxy/bpf_logs/*.log` (or configured proxy log file)
+- System capture: `.mantle/obs/traces/<trace_id>.ebpf.jsonl`
+- Native agent events (optional): `.mantle/obs/events/<trace_id>.events.jsonl`
+- LiteLLM proxy traffic (optional): `.mantle/obs/proxy/*.log` (or configured proxy log file)
 
 ## Source Priority Rules
 

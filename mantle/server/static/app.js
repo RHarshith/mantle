@@ -60,6 +60,37 @@ const zoomInBtn = $("zoomInBtn");
 const zoomOutBtn = $("zoomOutBtn");
 const fitBtn = $("fitBtn");
 
+function postFrontendRuntimeLog(level, message, details) {
+  const payload = {
+    level: String(level || "error"),
+    message: String(message || "frontend runtime error"),
+    request_id: `${Date.now()}`,
+    details: details || {},
+  };
+
+  fetch("/api/frontend-log", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }).catch(() => {
+    // Avoid recursive logging on network failures.
+  });
+}
+
+window.addEventListener("error", (event) => {
+  postFrontendRuntimeLog("error", event.message || "window.error", {
+    file: event.filename || "",
+    line: event.lineno || 0,
+    column: event.colno || 0,
+  });
+});
+
+window.addEventListener("unhandledrejection", (event) => {
+  const reason = event.reason;
+  const message = reason && reason.message ? reason.message : String(reason || "unhandled rejection");
+  postFrontendRuntimeLog("error", message, { source: "unhandledrejection" });
+});
+
 function escapeHtml(value) {
   const div = document.createElement("div");
   div.textContent = String(value ?? "");

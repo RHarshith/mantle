@@ -10,3 +10,5 @@ trace_scenarios/*/.runtime/
 commands
 run_codex.sh
 experiments/*
+logs/*
+.mantle/*
