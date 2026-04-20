@@ -270,7 +270,7 @@ class TestTraceStoreLiteLLMProxyIngest:
         assert len(traces) == 1
         assert traces[0]["agent_event_count"] >= 1
 
-    def test_proxy_source_raises_when_log_selection_is_ambiguous(self, tmp_path: Path):
+    def test_proxy_source_ambiguous_unmatched_logs_do_not_block_ingest(self, tmp_path: Path):
         obs = tmp_path / "obs"
         traces_dir = obs / "traces"
         events_dir = obs / "events"
@@ -291,8 +291,12 @@ class TestTraceStoreLiteLLMProxyIngest:
             llm_capture_source="proxy",
         )
 
-        with pytest.raises(RuntimeError, match="Ambiguous proxy log selection"):
-            asyncio.get_event_loop().run_until_complete(store.poll_once())
+        asyncio.get_event_loop().run_until_complete(store.poll_once())
+        traces = store.list_traces()
+        assert len(traces) == 1
+        assert traces[0]["trace_id"] == trace_id
+        assert traces[0]["sys_event_count"] >= 1
+        assert traces[0]["agent_event_count"] == 0
 
 
 @pytest.mark.integration

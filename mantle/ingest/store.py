@@ -674,10 +674,10 @@ class TraceStore:
         if len(log_candidates) == 1:
             return log_candidates[0]
         if len(log_candidates) > 1:
-            raise RuntimeError(
-                "Ambiguous proxy log selection: multiple *.log files exist and no trace-matched proxy log was found. "
-                "Set MANTLE_PROXY_LOG_FILE to choose one deterministically."
-            )
+            # Multiple unmatched shared logs can exist when traces do not use
+            # proxy capture (for example local smoke traces). Do not block
+            # ingestion of eBPF/native events for those traces.
+            return None
         return None
 
     def _active_llm_capture_path(self, state: TraceState) -> Path | None:

@@ -1,0 +1,52 @@
+services:
+  daemon:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    privileged: true
+    pid: "host"
+    volumes:
+      - /sys/kernel/debug:/sys/kernel/debug:rw
+      - /sys/fs/bpf:/sys/fs/bpf:rw
+      - /sys/fs/cgroup:/sys/fs/cgroup:ro
+      - /var/run/mantle:/var/run/mantle:rw
+      - ${MANTLE_HOST_HOME}/.mantle:/app/.mantle:rw
+      - .:/app:ro  # Mount the core application code in read-only mode so devs can iterate real-time 
+    working_dir: /app
+    environment:
+      - MANTLE_REPO_ROOT=/app
+    command: python3 -m mantle.daemon.daemon
+
+  proxy:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    ports:
+      - "4000:4000"
+    volumes:
+      - ${MANTLE_HOST_HOME}/.mantle:/app/.mantle:rw
+      - .:/app:ro
+    working_dir: /app
+    environment:
+      - MANTLE_REPO_ROOT=/app
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    command: python3 -m uvicorn mantle.litellm_proxy.proxy:app --host 0.0.0.0 --port 4000
+
+  server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8099:8099"
+    volumes:
+      - ${MANTLE_HOST_HOME}/.mantle:/app/.mantle:rw
+      - .:/app:ro
+    working_dir: /app
+    environment:
+      - MANTLE_REPO_ROOT=/app
+      - MANTLE_LOGS_DIR=/app/.mantle/logs
+      - MANTLE_CONFIG_DIR=/app/.mantle/config
+      - AGENT_OBS_ROOT=/app/.mantle/obs
+      - OBS_TRACE_DIR=/app/.mantle/obs/traces
+      - OBS_EVENTS_DIR=/app/.mantle/obs/events
+    command: python3 -m uvicorn mantle.server.app:app --host 0.0.0.0 --port 8099

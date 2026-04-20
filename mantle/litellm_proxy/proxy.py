@@ -1,4 +1,5 @@
 import contextvars
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -6,6 +7,8 @@ import threading
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 from fastapi import Request
+from fastapi.responses import JSONResponse, Response
+import httpx
 from pydantic import BaseModel
 import litellm
 from litellm.integrations.custom_logger import CustomLogger
@@ -18,7 +21,8 @@ _, _RUNTIME_LAYOUT = bootstrap_runtime("proxy")
 PROXY_LOGGER = get_component_logger("proxy", layout=_RUNTIME_LAYOUT)
 
 # Set LiteLLM config path before importing the proxy app.
-# This LiteLLM build reads CONFIG_FILE_PATH / WORKER_CONFIG.
+# LiteLLM 1.9.x expects WORKER_CONFIG to match the initialize() schema,
+# while newer builds can load CONFIG_FILE_PATH directly.
 if not _RUNTIME_LAYOUT.proxy_config_path.exists():
     raise RuntimeError(
         f"Missing LiteLLM proxy config after runtime bootstrap: {_RUNTIME_LAYOUT.proxy_config_path}"
@@ -27,13 +31,115 @@ PROXY_LOGGER.info("using proxy config", extra={"config_path": str(_RUNTIME_LAYOU
 
 _CONFIG_PATH = str(_RUNTIME_LAYOUT.proxy_config_path)
 os.environ["CONFIG_FILE_PATH"] = _CONFIG_PATH
-os.environ["WORKER_CONFIG"] = _CONFIG_PATH
+try:
+    import yaml
+except Exception as exc:  # pragma: no cover - fail-fast for broken runtime deps
+    raise RuntimeError("PyYAML is required to prepare LiteLLM WORKER_CONFIG") from exc
+
+try:
+    with open(_CONFIG_PATH, "r", encoding="utf-8") as cfg_file:
+        parsed_config = yaml.safe_load(cfg_file) or {}
+except Exception as exc:
+    raise RuntimeError(f"Failed to parse LiteLLM config at {_CONFIG_PATH}") from exc
+
+default_model = "gpt-3.5-turbo"
+if isinstance(parsed_config, dict):
+    model_list = parsed_config.get("model_list")
+    if isinstance(model_list, list):
+        for entry in model_list:
+            if not isinstance(entry, dict):
+                continue
+            model_name = entry.get("model_name")
+            if isinstance(model_name, str) and model_name.strip():
+                default_model = model_name.strip()
+                break
+
+worker_config = {
+    "model": default_model,
+    "alias": None,
+    "api_base": None,
+    "api_version": None,
+    "debug": False,
+    "temperature": None,
+    "max_tokens": None,
+    "request_timeout": None,
+    "max_budget": None,
+    "telemetry": False,
+    "drop_params": False,
+    "add_function_to_prompt": False,
+    "headers": None,
+    "save": False,
+    "config": _CONFIG_PATH,
+    "use_queue": False,
+}
+os.environ["WORKER_CONFIG"] = json.dumps(worker_config)
 
 from litellm.proxy.proxy_server import app 
 
 
 _ACTIVE_TRACE_LOCK = threading.RLock()
 _ACTIVE_TRACE_FILE: str | None = None
+
+
+def _responses_upstream_url(request: Request) -> str:
+    """Resolve upstream OpenAI responses endpoint, preserving query params."""
+    raw_base = os.getenv("MANTLE_OPENAI_UPSTREAM_BASE_URL", "https://api.openai.com").rstrip("/")
+    if raw_base.endswith("/v1"):
+        url = f"{raw_base}/responses"
+    else:
+        url = f"{raw_base}/v1/responses"
+    if request.url.query:
+        url = f"{url}?{request.url.query}"
+    return url
+
+
+def _build_upstream_headers(request: Request) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    allowed = {
+        "authorization",
+        "content-type",
+        "accept",
+        "openai-organization",
+        "openai-project",
+        "openai-beta",
+        "idempotency-key",
+        "user-agent",
+        "x-stainless-lang",
+        "x-stainless-package-version",
+        "x-stainless-os",
+        "x-stainless-arch",
+        "x-stainless-runtime",
+        "x-stainless-runtime-version",
+        "x-stainless-async",
+        "x-stainless-retry-count",
+        "x-stainless-timeout",
+    }
+
+    for key, value in request.headers.items():
+        lowered = key.lower()
+        if lowered not in allowed:
+            continue
+        headers[key] = value
+
+    # Prefer server-side key when configured, else forward client auth.
+    env_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if env_key:
+        headers["Authorization"] = f"Bearer {env_key}"
+    elif "authorization" not in {k.lower() for k in headers}:
+        # Keep upstream error semantics explicit if neither key source is available.
+        pass
+
+    return headers
+
+
+def _filter_upstream_headers(upstream_headers: httpx.Headers) -> dict[str, str]:
+    filtered: dict[str, str] = {}
+    for key, value in upstream_headers.items():
+        lowered = key.lower()
+        if lowered in {"content-length", "connection", "transfer-encoding", "content-encoding"}:
+            continue
+        filtered[key] = value
+    return filtered
 
 
 class ActiveTracePayload(BaseModel):
@@ -77,6 +183,106 @@ async def set_active_trace(payload: ActiveTracePayload) -> dict[str, Any]:
 @app.get("/mantle/active-trace")
 async def get_active_trace() -> dict[str, Any]:
     return {"active_trace_file": _get_active_trace_file()}
+
+
+@app.post("/v1/responses")
+@app.post("/responses")
+async def proxy_responses_passthrough(request: Request) -> Response:
+    """Compatibility route for clients using OpenAI Responses API."""
+    start_time = datetime.now(timezone.utc)
+    request_body = await request.body()
+
+    request_payload: dict[str, Any] = {}
+    if request_body:
+        try:
+            parsed = json.loads(request_body.decode("utf-8"))
+            if isinstance(parsed, dict):
+                request_payload = parsed
+        except Exception:
+            request_payload = {}
+
+    upstream_url = _responses_upstream_url(request)
+    upstream_headers = _build_upstream_headers(request)
+    request_kwargs: Dict[str, Any] = {
+        "model": request_payload.get("model"),
+        "input": request_payload.get("input"),
+        "messages": request_payload.get("messages"),
+        "tools": request_payload.get("tools"),
+        "instructions": request_payload.get("instructions"),
+        "reasoning": request_payload.get("reasoning"),
+        "headers": dict(request.headers),
+        "base_url": upstream_url,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
+            upstream_response = await client.post(
+                upstream_url,
+                content=request_body,
+                headers=upstream_headers,
+            )
+    except httpx.HTTPError as exc:
+        end_time = datetime.now(timezone.utc)
+        _PROXY_EVENT_LOGGER._write_event(
+            status="failed",
+            kwargs=request_kwargs,
+            response_obj=None,
+            start_time=start_time,
+            end_time=end_time,
+            exception=f"responses passthrough failed: {exc}",
+        )
+        return JSONResponse(
+            status_code=502,
+            content={"error": {"message": f"upstream request failed: {exc}", "type": "proxy_error"}},
+        )
+
+    response_content_type = upstream_response.headers.get("content-type", "")
+    response_obj: Any
+    if "application/json" in response_content_type.lower():
+        try:
+            response_obj = upstream_response.json()
+        except ValueError:
+            response_obj = upstream_response.text
+    else:
+        response_obj = upstream_response.text
+
+    end_time = datetime.now(timezone.utc)
+    if upstream_response.is_success:
+        _PROXY_EVENT_LOGGER._write_event(
+            status="success",
+            kwargs=request_kwargs,
+            response_obj=response_obj,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    else:
+        status_code = upstream_response.status_code
+        response_snippet = ""
+        if isinstance(response_obj, dict):
+            try:
+                response_snippet = json.dumps(response_obj)[:800]
+            except Exception:
+                response_snippet = str(response_obj)[:800]
+        else:
+            response_snippet = str(response_obj)[:800]
+
+        _PROXY_EVENT_LOGGER._write_event(
+            status="failed",
+            kwargs=request_kwargs,
+            response_obj=response_obj,
+            start_time=start_time,
+            end_time=end_time,
+            exception=(
+                f"upstream status {status_code}; "
+                f"response={response_snippet}"
+            ),
+        )
+
+    return Response(
+        content=upstream_response.content,
+        status_code=upstream_response.status_code,
+        headers=_filter_upstream_headers(upstream_response.headers),
+    )
 
 # 1. Create a Context Variable to hold the ephemeral port natively in the async thread
 client_port_var = contextvars.ContextVar("client_port", default="unknown_port")
@@ -307,6 +513,7 @@ class PortBasedFileLogger(CustomLogger):
         )
 
 # 4. Register the logger with LiteLLM
-litellm.callbacks = [PortBasedFileLogger(log_dir=str(_RUNTIME_LAYOUT.proxy_obs_dir))]
+_PROXY_EVENT_LOGGER = PortBasedFileLogger(log_dir=str(_RUNTIME_LAYOUT.proxy_obs_dir))
+litellm.callbacks = [_PROXY_EVENT_LOGGER]
 
 # (The app is automatically exposed via the litellm.proxy.proxy_server import)

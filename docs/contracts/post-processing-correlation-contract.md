@@ -32,7 +32,7 @@ Deterministic proxy log resolution rules:
 - explicit configured proxy log file has highest priority
 - then trace-id keyed files (for example `<trace_id>` and `<trace>.proxy.jsonl`)
 - in `proxy` mode only, if exactly one `*.log` exists it is used
-- in `proxy` mode, multiple unmatched `*.log` files are an error (no silent fallback)
+- in `proxy` mode, multiple unmatched `*.log` files mean no proxy payload file is selected for that trace; eBPF/native ingest still proceeds (set `MANTLE_PROXY_LOG_FILE` for deterministic payload mapping)
 
 ## Agent Event Canonical Shape
 
@@ -223,7 +223,7 @@ tool_calls(
 - Invalid eBPF JSON/type errors raise and fail ingest (no silent failures).
 - Invalid proxy records are skipped when not parseable JSON object.
 - URL parsing failures and snapshot read failures are logged via `log_exception`.
-- Proxy log ambiguity in `proxy` mode is a hard error (must be resolved via explicit log file mapping).
+- Proxy log ambiguity without a trace-matched file does not block trace ingest; payload correlation is skipped for that trace unless `MANTLE_PROXY_LOG_FILE` is set.
 - Capture degradation must remain explicit through tier metadata and capture-quality endpoint.
 
 ## Change Gate Requirements
