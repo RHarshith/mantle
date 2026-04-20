@@ -1,240 +1,147 @@
 # Mantle
 
-An observability platform for coding agents.
+Mantle provides a non-invasive ecosystem for deploying verifiable, secure and capable AI agents.
 
-Mantle captures how an AI coding agent reasons, calls tools, touches files, and talks to networks, then reconstructs that execution into a live drilldown dashboard and a URL-driven CLI explorer.
+Mantle's core value is about bridging the gap between semantic decisions and the ground-truth of the system- it captures what an AI agent sees (the context), the actions it performs (reasoning, responses and tool calls) and the side-effects on the system (files read/written, API calls made, etc), all of which are combined to form a unified trajectory of the agent's interactions with the system.
+
+It does all of this without requiring any instrumentation of the agent- simply install mantle and run your agent of choice like you always do.
+
 
 ## Why This Project Exists
 
-AI coding agents are powerful, but most teams still treat their behavior as a black box. Mantle was built to answer practical engineering and security questions:
+AI agents are powerful, but most teams still treat their behavior as a black box. Mantle was built to answer practical engineering and security questions.
 
-- What exactly did the agent do over time?
-- Which tools and files were involved in each step?
-- Which network endpoints were contacted?
+### Correctness
+- Did the agent solve the task correctly, given a reference solution?
+- Did the agent follow the *right* steps to achieve its goal?
 
-The goal is to make agent behavior inspectable, testable, and reviewable.
+### Safety
+- Did the agent receive the right privileges to do the task efficiently *and* securely?
+- Did any of the agent's actions result in an unexpected side-effect on the system?
+- Did any sensitive information leak into the agent's context?
+
+### Efficiency
+- Relative to a baseline, how efficiently did the agent finish the task? This could include token usage, number of tool calls, system resource utilization and more.
+- Did the agent ingest redundant information already in the context, or did it perform an action with the same side-effect on the system multiple times?
+- How can we compare different agents and models to determine the best combination for our specific needs?
+
+The above questions are a small subset of many interesting usecases that mantle can solve. This is why mantle exists as a **extensible platform** that supports the development of such usecases by providing a robust infrastructure to **monitor** and **guardrail** agents.
 
 ## Core Capabilities
 
-- Multi-layer capture:
-	- API traffic via `mitmproxy`
-	- process/file/network activity via eBPF (`bpftrace`)
-	- agent-native events via JSONL instrumentation
-- Live observability dashboard (`mantle serve`):
-	- trace timeline
-	- tool and process drilldowns
-	- file/network activity panels
-	- websocket-driven updates
-- Observability CLI (`mantle cli` / `mantlecli`):
-	- non-interactive URL-like routes for traces, turns, replay context/action, and summaries
-	- interactive arrow-key navigation across traces and turns
-	- pager-based drilldowns for long process trees and message bodies
-- Scenario-based validation:
-	- reproducible suites under `trace_scenarios/`
-	- setup, verify, and cleanup lifecycle
-- Tiered API tracing confidence:
-	- `tier1_payload_exact`: payload + exact endpoint match
-	- `tier2_payload_mapped`: payload + heuristic/mapped endpoint
-	- `tier3_network_only`: baseline network telemetry only
-	- per-trace quality endpoint: `/api/traces/{trace_id}/capture-quality`
+### Semantic and ground truth correlation
+Mantle links each system call (the ground truth) to its corresponding high level action that the agent took (the tool call). Today most monitoring tools exist to either monitor the semantic layer (langsmith, langfuse), or the system layer (Tetragon). Mantle bridges the gap.
 
-## Architecture At A Glance
+### Zero-instrumentation operations
+All of mantle's features rely on observing the agent from its system boundaries- its network interactions and system calls. network interactions allows us to capture the model's context and actions, whereas system calls allow us to capture the side-effects.
 
-```text
-Agent Runtime
-	-> mantle watch
-			-> eBPF syscall capture (process/file/network)
-			-> MITM capture (API/network payload view)
-			-> agent event sink (structured JSONL)
+### State reconstruction and replay
+Snapshots of the system resources(files) at tool call boundaries allows us to reconstruct the agent's past execution to debug wrong behavior and optimize tool usage.
 
-Captured data (.mantle/obs/)
-	-> traces/*.ebpf.jsonl
-	-> mitm/*.mitm.jsonl
-	-> events/*.events.jsonl
+### Sandboxing [Upcoming]
+Most agents have their own sandboxes with primitive exclusion policies. Mantle's unified sandbox allows teams to switch agents on the fly and provides a rich policy language that dynamically switches policies based on task requirements.
 
-mantle serve
-	-> FastAPI backend
-	-> static UI + websocket updates
-	-> timeline and drilldown views
-
-mantle cli / mantlecli
-	-> trace/replay route explorer
-	-> interactive and non-interactive terminal navigation
-```
 
 ## Quickstart
 
-### Native Setup (Linux/macOS)
+### System Requirements
+
+Mantle currently requires a **Linux** environment (kernel version >= 5.15 recommended for eBPF observability features).
+
+Please ensure you have the following prerequisite tools installed on your system:
+- **git**
+- **make**
+- **docker**
+- **docker compose v2 plugin** (recommended) or **docker-compose v1** (supported fallback)
+- **systemd user session support** (`systemd-run --user`) for eBPF watch mode
+- **codex CLI** (current Mantle flow expects `codex exec ...`)
+
+On Ubuntu/Debian, you can install these requirements by running:
 
 ```bash
-git clone <your-repo-url>
+sudo apt-get update
+sudo apt-get install -y git make docker.io docker-compose-v2 systemd
+```
+
+If your distro does not provide `docker-compose-v2`, Mantle can use the
+standalone `docker-compose` binary (v1) as a fallback.
+
+Quick verification checklist:
+
+```bash
+docker --version
+docker compose version || docker-compose --version
+systemd-run --user --scope -q true
+codex --version
+```
+
+If you see Docker daemon permission errors, either run with `sudo` or add your user
+to the `docker` group.
+
+To use OpenAI through Mantle's proxy, ensure your API key is exported:
+
+```bash
+export OPENAI_API_KEY="your_api_key_here"
+```
+
+### Step-by-Step Guide
+
+**1. Clone the repository**
+
+```bash
+git clone https://github.com/RHarshith/mantle
 cd mantle
-bash scripts/install_mantle.sh
-export PATH="$HOME/.local/bin:$PATH"
-export OPENAI_API_KEY="<your_key>"
 ```
 
-Verify installation:
+**2. Configure your coding agent**
+
+**Note**: Current version only supports OpenAI codex.
+Update its `config.toml` proxy settings to point to Mantle's proxy service:
+
+```toml
+model = "gpt-5.4-nano"
+model_reasoning_effort = "low"
+model_provider = "litellm-proxy"
+
+[model_providers.litellm-proxy]
+name = "Mantle Proxy"
+base_url = "http://127.0.0.1:4000/v1"
+env_key = "OPENAI_API_KEY" # Ensure this is set in your ENV
+wire_api = "responses"
+requires_openai_auth = false
+```
+
+If `codex` is not yet installed, install and authenticate it before continuing.
+
+**3. Build**
+
+Build and provision the containerized background services:
 
 ```bash
-mantle --help
-mantle serve --help
-mantle watch --help
-mantle cli --help
+sudo make build
 ```
+Mantle automatically prefers `docker compose` (v2) and falls back to `docker-compose` (v1) when needed.
 
-### Run A Live Trace
+**4. Run**
 
-Terminal 1 (dashboard):
+`make build` automatically starts the daemon, proxy, and server in the background. To run an agent with tracing enabled, you can run the `watch` command (you can optionally add `bin` to your `$PATH`):
 
 ```bash
-mantle serve --host 0.0.0.0 --port 8099
+bin/mantle watch codex exec "task here" --sandbox danger-full-access
 ```
 
-Terminal 2 (run and trace an agent command):
+**Note**: The `--sandbox` flag is optional. You can configure codex sandbox policy as required.
+If your environment does not support `systemd-run --user`, eBPF watch mode will not work.
+
+You can view the live trace dashboard by opening `http://127.0.0.1:8099` in your browser.
+
+**5. Clean up**
+
+To stop all background services and clean up the containers:
 
 ```bash
-mantle watch python3 -m mantle_agent.cli_agent "inspect this repository and summarize"
+make down
+make clean
 ```
 
-Open `http://127.0.0.1:8099`.
 
-## Demo Readiness Mode
-
-For client demos, run Mantle in hardening mode:
-
-- Freeze non-demo feature work for the sprint.
-- Validate runtime matrix:
-	- OpenAI Codex (latest)
-	- GitHub Copilot CLI
-	- `mantle_agent` with custom OpenAI-compatible endpoint
-- Require contract checks before behavior changes:
-	- frontend <-> API
-	- API <-> store
-	- store <-> capture
-	- userspace capture <-> kernel event ABI
-- Require test evidence before merge (`unit`, `integration`, and demo-relevant `e2e`).
-- Document micro decisions in `docs/micro-decisions.md`.
-
-See `docs/api-tracing-limitations.md` for capture guarantees and limitations.
-
-## CLI Reference
-
-`mantle serve`
-
-- Starts the FastAPI dashboard server.
-- Usage: `mantle serve [--host <host>] [--port <port>]`
-
-`mantle watch`
-
-- Runs an executable under MITM + eBPF capture.
-- Interactive mode (`mantle watch <agent>`) preserves TTY behavior and disables eBPF capture by default; use `--interactive-ebpf` to opt in to interactive eBPF tracing.
-- Usage: `mantle watch [--mode <proxy|transparent>] [--trace-id <id>] [--port <mitm_port>] [--interactive-ebpf] <executable> [exec] [prompt...]`
-
-Examples:
-
-```bash
-mantle watch python3 -m mantle_agent.cli_agent --interactive
-mantle watch --interactive-ebpf python3 -m mantle_agent.cli_agent --interactive
-mantle watch python3 -m mantle_agent.cli_agent "summarize this repository"
-mantle watch --mode transparent python3 -m mantle_agent.cli_agent "trace outbound API calls"
-mantle watch aider "fix failing tests"
-```
-
-`mantle cli`
-
-- Explore trace and replay data from terminal without opening the dashboard.
-- Usage: `mantle cli [-i|--interactive] [--obs-root <path>] [<route>]`
-
-Examples:
-
-```bash
-mantle cli --interactive
-mantle cli traces
-mantle cli trace_001.ebpf.jsonl/trace
-mantle cli trace_001.ebpf.jsonl/replay/turn_2/summary
-mantlecli trace_001.ebpf.jsonl/replay/turn_2/context/system_prompt/0
-```
-
-## Data Artifacts
-
-Mantle writes trace outputs to a fixed repo-local layout under `.mantle/obs/`:
-
-- `.mantle/obs/traces/<trace_id>.ebpf.jsonl`
-- `.mantle/obs/mitm/<trace_id>.mitm.jsonl`
-- `.mantle/obs/events/<trace_id>.events.jsonl`
-- `.mantle/obs/proxy/<trace_id>.ebpf.jsonl` (LiteLLM proxy payload capture)
-
-These files are the source of truth for replay, debugging, and analysis.
-
-## Project Structure
-
-```text
-.
-├── bin/
-│   ├── mantle
-│   └── mantle_test
-├── mantle/
-│   ├── dashboard/
-│   │   ├── app.py
-│   │   └── static/
-│   ├── cli/
-│   ├── ebpf_capture.py
-│   └── mitm_capture.py
-├── mantle_agent/
-│   ├── agent_observability.py
-│   └── cli_agent.py
-├── trace_scenarios/
-├── scripts/
-├── run_intercepted_agent.sh
-└── .mantle/
-	├── obs/
-	├── config/
-	└── logs/
-	    └── runtime/
-```
-
-## Engineering Highlights
-
-- End-to-end instrumentation design spanning agent-level and OS-level telemetry
-- Real-time UX with backend polling and websocket update flow
-- Reproducible scenario harness for validation and regression checks
-
-## Environment Variables
-
-- `OPENAI_API_KEY`: API credential
-- `MANTLE_VENV`: Python venv path used by wrappers
-- `MANTLE_INTERCEPT_MODE`: default intercept mode (`proxy` or `transparent`)
-- `MANTLE_FORCE_OPENAI_BASE=1`: debug override for base URL behavior
-
-Folder locations are fixed to `<repo>/.mantle/{obs,config,logs}`.
-
-Compatibility fallback variables (`RTRACE_*`) are supported.
-
-## Troubleshooting
-
-Dashboard unreachable from host:
-
-- Confirm `mantle serve` is running and bound to the expected host/port.
-- Check local firewall rules and ensure the selected port is available.
-
-No low-level syscall nodes in drilldown:
-
-- Ensure `bpftrace` is installed and runnable as root.
-- Confirm run output prints `eBPF trace: true` (`mantle watch <agent>` prints `false` unless `--interactive-ebpf` is provided).
-
-API credential issues:
-
-```bash
-printenv OPENAI_API_KEY | wc -c
-```
-
-## Demo And Portfolio Notes
-
-For recruiter or hiring panel review, include:
-
-- a short architecture diagram screenshot from the dashboard
-- one end-to-end trace walkthrough (input -> tool calls -> outputs)
-- one replay-turn drilldown walkthrough from terminal (`mantle cli`) and dashboard
-
-This makes both product thinking and systems engineering depth obvious in a quick review.
