@@ -12,7 +12,7 @@ REQUIRED_APT_PACKAGES := bpftrace iptables ca-certificates python3-venv python3-
 
 .PHONY: test test-unit test-integration test-e2e lint typecheck serve proxy check-architecture \
 	help build preflight-sudo preflight-foundation install-system-deps \
-	install-python-deps verify-mantle clean
+	install-python-deps verify-mantle clean daemon-start daemon-stop daemon-status
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -165,6 +165,20 @@ proxy: ## Start LiteLLM proxy on port 4000 (stops existing server first)
 	  exit 1; \
 	fi; \
 	$(PYTHON_BIN) -m uvicorn mantle.litellm_proxy.proxy:app --host 0.0.0.0 --port 4000
+
+daemon-start: ## Start the eBPF tracing daemon (requires sudo)
+	@set -euo pipefail; \
+	if [[ "$$EUID" -ne 0 ]]; then \
+		echo "Error: run with sudo: sudo make daemon-start" >&2; \
+		exit 1; \
+	fi; \
+	$(PYTHON_BIN) -m mantle.daemon.daemon
+
+daemon-stop: ## Stop the eBPF tracing daemon
+	@$(PYTHON_BIN) -m mantle.daemon.client shutdown
+
+daemon-status: ## Show daemon health and active traces
+	@$(PYTHON_BIN) -m mantle.daemon.client status
 
 clean: ## Remove caches and temp files
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

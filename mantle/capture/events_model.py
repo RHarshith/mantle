@@ -110,12 +110,15 @@ class AbstractEvent:
     trace_source: str
     label: str
     ppid: int | None = None
+    child_pid: int | None = None
     path: str | None = None
     src: str | None = None
     dest: str | None = None
     bytes_count: int | None = None
     exec_path: str | None = None
     command: str | None = None
+    fd: int | None = None
+    flags: int | None = None
     argv: list[str] = field(default_factory=list)
     payload: dict[str, Any] = field(default_factory=dict)
 
@@ -131,6 +134,8 @@ class AbstractEvent:
         }
         if self.ppid is not None:
             data["ppid"] = self.ppid
+        if self.child_pid is not None:
+            data["child_pid"] = self.child_pid
         if self.path:
             data["path"] = self.path
         if self.src:
@@ -143,6 +148,10 @@ class AbstractEvent:
             data["exec_path"] = self.exec_path
         if self.command:
             data["command"] = self.command
+        if self.fd is not None:
+            data["fd"] = self.fd
+        if self.flags is not None:
+            data["flags"] = self.flags
         if self.argv:
             data["argv"] = self.argv
         return data
@@ -160,12 +169,15 @@ def transform_bpf_record(record: dict[str, Any], fallback_line_no: int) -> dict[
         trace_source=str(raw.raw_payload.get("source") or "bpftrace"),
         label=str(raw.raw_payload.get("label") or raw.event_type.replace("_", " ")),
         ppid=int(raw.raw_payload.get("ppid")) if raw.raw_payload.get("ppid") is not None else None,
+        child_pid=int(raw.raw_payload.get("child_pid")) if raw.raw_payload.get("child_pid") is not None else None,
         path=str(raw.raw_payload.get("path")) if raw.raw_payload.get("path") is not None else None,
         src=str(raw.raw_payload.get("src")) if raw.raw_payload.get("src") is not None else None,
         dest=str(raw.raw_payload.get("dest")) if raw.raw_payload.get("dest") is not None else None,
         bytes_count=int(raw.raw_payload.get("bytes")) if raw.raw_payload.get("bytes") is not None else None,
         exec_path=str(raw.raw_payload.get("exec_path")) if raw.raw_payload.get("exec_path") is not None else None,
         command=str(raw.raw_payload.get("command")) if raw.raw_payload.get("command") is not None else None,
+        fd=int(raw.raw_payload.get("fd")) if raw.raw_payload.get("fd") is not None else None,
+        flags=int(raw.raw_payload.get("flags")) if raw.raw_payload.get("flags") is not None else None,
         argv=[str(x) for x in (raw.raw_payload.get("argv") or [])],
         payload=raw.raw_payload,
     )

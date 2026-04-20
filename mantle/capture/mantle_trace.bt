@@ -1,0 +1,136 @@
+/*
+ * mantle_trace.bt — cgroup-filtered eBPF tracing for Mantle agent observability.
+ *
+ * Usage:  sudo bpftrace mantle_trace.bt <cgroup_id>
+ *
+ * Traces syscalls for all processes within the specified cgroup v2 group.
+ * <cgroup_id> is the inode number of the target cgroup directory under
+ * /sys/fs/cgroup (obtainable via `stat --format=%i <path>`).
+ *
+ * Output format:  EVT|<nsecs>|<kind>|<fields...>
+ * Parsed by mantle/capture/ebpf.py.
+ */
+
+BEGIN
+{
+  printf("EVT|%llu|trace_start|0|0|cgroup_trace\n", nsecs);
+}
+
+tracepoint:sched:sched_process_fork
+/cgroup == $1/
+{
+  @parent[args->child_pid] = args->parent_pid;
+  printf("EVT|%llu|fork|%d|%d|%s\n", nsecs, args->parent_pid, args->child_pid, comm);
+}
+
+tracepoint:sched:sched_process_exec
+/cgroup == $1/
+{
+    $ppid = @parent[tid];
+  printf("EVT|%llu|exec|%d|%d|%s|%s\n", nsecs, pid, $ppid, comm, str(args->filename));
+}
+
+tracepoint:sched:sched_process_exit
+/cgroup == $1/
+{
+    $ppid = @parent[tid];
+  printf("EVT|%llu|exit|%d|%d|%s\n", nsecs, pid, $ppid, comm);
+    delete(@parent[tid]);
+}
+
+tracepoint:syscalls:sys_enter_openat
+/cgroup == $1/
+{
+  printf("EVT|%llu|openat|%d|%s|%d\n", nsecs, pid, str(args->filename), args->flags);
+}
+
+tracepoint:syscalls:sys_exit_openat
+/cgroup == $1/
+{
+    printf("EVT|%llu|openat_ret|%d|%d\n", nsecs, pid, args->ret);
+}
+
+tracepoint:syscalls:sys_enter_unlinkat
+/cgroup == $1/
+{
+  printf("EVT|%llu|unlinkat|%d|%s\n", nsecs, pid, str(args->pathname));
+}
+
+tracepoint:syscalls:sys_enter_renameat
+/cgroup == $1/
+{
+  printf("EVT|%llu|renameat|%d|%s|%s\n", nsecs, pid, str(args->oldname), str(args->newname));
+}
+
+tracepoint:syscalls:sys_exit_renameat
+/cgroup == $1/
+{
+    printf("EVT|%llu|renameat_ret|%d|%d\n", nsecs, pid, args->ret);
+}
+
+tracepoint:syscalls:sys_enter_renameat2
+/cgroup == $1/
+{
+  printf("EVT|%llu|renameat2|%d|%s|%s\n", nsecs, pid, str(args->oldname), str(args->newname));
+}
+
+tracepoint:syscalls:sys_exit_renameat2
+/cgroup == $1/
+{
+    printf("EVT|%llu|renameat2_ret|%d|%d\n", nsecs, pid, args->ret);
+}
+
+tracepoint:syscalls:sys_enter_connect
+/cgroup == $1/
+{
+    $sa = (struct sockaddr *)uptr(args->uservaddr);
+    if ($sa->sa_family == 2) {
+        $sin = (struct sockaddr_in *)uptr(args->uservaddr);
+        printf("EVT|%llu|connect4|%d|%d|%u|%u\n", nsecs, pid, args->fd, $sin->sin_addr.s_addr, $sin->sin_port);
+    } else if ($sa->sa_family == 10) {
+        $sin6 = (struct sockaddr_in6 *)uptr(args->uservaddr);
+        printf(
+            "EVT|%llu|connect6|%d|%d|%u|%u|%u|%u|%u\n",
+            nsecs,
+            pid,
+            args->fd,
+            $sin6->sin6_addr.in6_u.u6_addr32[0],
+            $sin6->sin6_addr.in6_u.u6_addr32[1],
+            $sin6->sin6_addr.in6_u.u6_addr32[2],
+            $sin6->sin6_addr.in6_u.u6_addr32[3],
+            $sin6->sin6_port
+        );
+    } else {
+        printf("EVT|%llu|connect|%d|%d\n", nsecs, pid, args->fd);
+    }
+}
+
+tracepoint:syscalls:sys_enter_sendto
+/cgroup == $1/
+{
+  printf("EVT|%llu|sendto|%d|%d|%d\n", nsecs, pid, args->fd, args->len);
+}
+
+tracepoint:syscalls:sys_enter_recvfrom
+/cgroup == $1/
+{
+  printf("EVT|%llu|recvfrom|%d|%d|%d\n", nsecs, pid, args->fd, args->size);
+}
+
+tracepoint:syscalls:sys_enter_write
+/cgroup == $1/
+{
+    printf("EVT|%llu|write|%d|%d|%d\n", nsecs, pid, args->fd, args->count);
+}
+
+tracepoint:syscalls:sys_exit_write
+/cgroup == $1/
+{
+    printf("EVT|%llu|write_ret|%d|%d\n", nsecs, pid, args->ret);
+}
+
+tracepoint:syscalls:sys_enter_close
+/cgroup == $1/
+{
+    printf("EVT|%llu|close|%d|%d\n", nsecs, pid, args->fd);
+}

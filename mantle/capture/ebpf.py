@@ -9,143 +9,13 @@ import socket
 import struct
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 MAX_SNAPSHOT_BYTES = 512 * 1024
 
-BPFTRACE_PROGRAM = r'''
-BEGIN
-{
-  @tracked[cpid] = 1;
-  @parent[cpid] = 0;
-  printf("EVT|%llu|root|%d|0|start\n", nsecs, cpid);
-}
-
-tracepoint:sched:sched_process_fork
-/@tracked[args->parent_pid]/
-{
-  @tracked[args->child_pid] = 1;
-  @parent[args->child_pid] = args->parent_pid;
-  printf("EVT|%llu|fork|%d|%d|%s\n", nsecs, args->parent_pid, args->child_pid, comm);
-}
-
-tracepoint:sched:sched_process_exec
-/@tracked[tid]/
-{
-    $ppid = @parent[tid];
-  printf("EVT|%llu|exec|%d|%d|%s|%s\n", nsecs, pid, $ppid, comm, str(args->filename));
-}
-
-tracepoint:sched:sched_process_exit
-/@tracked[tid]/
-{
-    $ppid = @parent[tid];
-  printf("EVT|%llu|exit|%d|%d|%s\n", nsecs, pid, $ppid, comm);
-    delete(@tracked[tid]);
-    delete(@parent[tid]);
-}
-
-tracepoint:syscalls:sys_enter_openat
-/@tracked[tid]/
-{
-  printf("EVT|%llu|openat|%d|%s|%d\n", nsecs, pid, str(args->filename), args->flags);
-}
-
-tracepoint:syscalls:sys_exit_openat
-/@tracked[tid]/
-{
-    printf("EVT|%llu|openat_ret|%d|%d\n", nsecs, pid, args->ret);
-}
-
-tracepoint:syscalls:sys_enter_unlinkat
-/@tracked[tid]/
-{
-  printf("EVT|%llu|unlinkat|%d|%s\n", nsecs, pid, str(args->pathname));
-}
-
-tracepoint:syscalls:sys_enter_renameat
-/@tracked[tid]/
-{
-  printf("EVT|%llu|renameat|%d|%s|%s\n", nsecs, pid, str(args->oldname), str(args->newname));
-}
-
-tracepoint:syscalls:sys_exit_renameat
-/@tracked[tid]/
-{
-    printf("EVT|%llu|renameat_ret|%d|%d\n", nsecs, pid, args->ret);
-}
-
-tracepoint:syscalls:sys_enter_renameat2
-/@tracked[tid]/
-{
-  printf("EVT|%llu|renameat2|%d|%s|%s\n", nsecs, pid, str(args->oldname), str(args->newname));
-}
-
-tracepoint:syscalls:sys_exit_renameat2
-/@tracked[tid]/
-{
-    printf("EVT|%llu|renameat2_ret|%d|%d\n", nsecs, pid, args->ret);
-}
-
-tracepoint:syscalls:sys_enter_connect
-/@tracked[tid]/
-{
-    $sa = (struct sockaddr *)uptr(args->uservaddr);
-    if ($sa->sa_family == 2) {
-        $sin = (struct sockaddr_in *)uptr(args->uservaddr);
-        printf("EVT|%llu|connect4|%d|%d|%u|%u\n", nsecs, pid, args->fd, $sin->sin_addr.s_addr, $sin->sin_port);
-    } else if ($sa->sa_family == 10) {
-        $sin6 = (struct sockaddr_in6 *)uptr(args->uservaddr);
-        printf(
-            "EVT|%llu|connect6|%d|%d|%u|%u|%u|%u|%u\n",
-            nsecs,
-            pid,
-            args->fd,
-            $sin6->sin6_addr.in6_u.u6_addr32[0],
-            $sin6->sin6_addr.in6_u.u6_addr32[1],
-            $sin6->sin6_addr.in6_u.u6_addr32[2],
-            $sin6->sin6_addr.in6_u.u6_addr32[3],
-            $sin6->sin6_port
-        );
-    } else {
-        printf("EVT|%llu|connect|%d|%d\n", nsecs, pid, args->fd);
-    }
-}
-
-tracepoint:syscalls:sys_enter_sendto
-/@tracked[tid]/
-{
-  printf("EVT|%llu|sendto|%d|%d|%d\n", nsecs, pid, args->fd, args->len);
-}
-
-tracepoint:syscalls:sys_enter_recvfrom
-/@tracked[tid]/
-{
-  printf("EVT|%llu|recvfrom|%d|%d|%d\n", nsecs, pid, args->fd, args->size);
-}
-
-tracepoint:syscalls:sys_enter_write
-/@tracked[tid]/
-{
-    printf("EVT|%llu|write|%d|%d|%d\n", nsecs, pid, args->fd, args->count);
-}
-
-tracepoint:syscalls:sys_exit_write
-/@tracked[tid]/
-{
-    printf("EVT|%llu|write_ret|%d|%d\n", nsecs, pid, args->ret);
-}
-
-tracepoint:syscalls:sys_enter_close
-/@tracked[tid]/
-{
-    printf("EVT|%llu|close|%d|%d\n", nsecs, pid, args->fd);
-}
-'''
 
 
 def _read_cmdline(pid: int) -> str:
@@ -325,49 +195,6 @@ def _resolve_socket_endpoint(pid: int, fd: int, retries: int = 4, delay_s: float
 
     return None
 
-
-def _command_for_bpftrace(command: list[str]) -> list[str]:
-    """Normalize command argv for bpftrace -c.
-
-    Some bpftrace builds fail to launch script entrypoints directly (for example,
-    a Node CLI script with a shebang). If argv[0] is a shebang script, run it via
-    its declared interpreter so child process launch is reliable.
-    """
-    if not command:
-        return command
-
-    exe = Path(command[0])
-    if not exe.exists() or not exe.is_file():
-        return command
-
-    try:
-        with exe.open("rb") as fh:
-            header = fh.read(4)
-            fh.seek(0)
-            first_line = fh.readline().decode("utf-8", errors="replace").strip()
-    except OSError:
-        return command
-
-    # Native binaries should run as-is.
-    if header == b"\x7fELF":
-        return command
-
-    if not first_line.startswith("#!"):
-        return command
-
-    shebang = first_line[2:].strip()
-    if not shebang:
-        return command
-
-    try:
-        interpreter_argv = shlex.split(shebang)
-    except ValueError:
-        return command
-
-    if not interpreter_argv:
-        return command
-
-    return interpreter_argv + [str(exe)] + command[1:]
 
 
 def _event_from_line(
@@ -711,23 +538,34 @@ def _event_from_line(
     return None
 
 
-def run_capture(output_file: Path, command: list[str]) -> int:
+def run_capture(
+    output_file: Path,
+    cgroup_id: int,
+    *,
+    agent_executable: str | None = None,
+    on_bpf_started: Callable[[subprocess.Popen], None] | None = None,
+) -> int:
+    """Run bpftrace-based eBPF capture for all processes in the given cgroup.
+
+    Args:
+        output_file: Path to write the .ebpf.jsonl trace output.
+        cgroup_id: Kernel cgroup ID (inode number) to filter on.
+        agent_executable: Optional agent binary name for filtering bootstrap
+            noise.  If provided, events are suppressed until the first exec
+            of this binary.  If None, all events are captured immediately.
+        on_bpf_started: Optional callback invoked with the bpftrace Popen
+            object right after launch, allowing the caller to store a
+            reference for external termination.
+
+    Returns:
+        The bpftrace process exit code.
+    """
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.NamedTemporaryFile("w", suffix=".bt", delete=False) as script_file:
-        script_file.write(BPFTRACE_PROGRAM)
-        script_path = Path(script_file.name)
-
-    launch_argv = _command_for_bpftrace(command)
-    # Run the target command through a tiny wrapper script so argv is preserved
-    # exactly, including arguments that contain spaces (for example --task text).
-    with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as launch_file:
-        launch_file.write("#!/usr/bin/env bash\n")
-        launch_file.write("set -euo pipefail\n")
-        launch_file.write(f"exec {shlex.join(launch_argv)}\n")
-        launch_script = Path(launch_file.name)
-    launch_script.chmod(0o700)
-    launch_cmd = f"/bin/bash {shlex.quote(str(launch_script))}"
+    bt_script = Path(__file__).parent / "mantle_trace.bt"
+    if not bt_script.exists():
+        print(f"Error: bpftrace script not found: {bt_script}", file=sys.stderr)
+        return 1
 
     # Calculate offset between bpf_ktime_get_ns() (CLOCK_MONOTONIC) and Epoch (time.time())
     time_offset = time.time() - time.clock_gettime(time.CLOCK_MONOTONIC)
@@ -740,8 +578,12 @@ def run_capture(output_file: Path, command: list[str]) -> int:
     path_before_snapshot: dict[str, dict[str, Any]] = {}
     pending_rename: dict[int, dict[str, str]] = {}
     seq = 0
-    expected_exec_basename = Path(launch_argv[0]).name
-    capture_started = False
+    if agent_executable is not None:
+        capture_started = False
+        expected_exec_basename = Path(agent_executable).name
+    else:
+        capture_started = True
+        expected_exec_basename = ""
 
     # Increase bpftrace str() buffer size to avoid path truncation.
     # Default is 64 bytes which truncates most real filesystem paths.
@@ -749,13 +591,16 @@ def run_capture(output_file: Path, command: list[str]) -> int:
     bpf_env.setdefault("BPFTRACE_STR_LEN", "200")
 
     proc = subprocess.Popen(
-        ["bpftrace", "-q", "-c", launch_cmd, str(script_path)],
+        ["bpftrace", "-q", str(bt_script), str(cgroup_id)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
         env=bpf_env,
     )
+
+    if on_bpf_started is not None:
+        on_bpf_started(proc)
 
     try:
         def _resolve_path_for_pid(pid: int, raw_path: str) -> str:
@@ -979,8 +824,7 @@ def run_capture(output_file: Path, command: list[str]) -> int:
 
                 out_fh.write(json.dumps(event, ensure_ascii=False) + "\n")
     finally:
-        script_path.unlink(missing_ok=True)
-        launch_script.unlink(missing_ok=True)
+        pass
 
     stderr = ""
     if proc.stderr is not None:
@@ -994,24 +838,21 @@ def run_capture(output_file: Path, command: list[str]) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Prototype eBPF capture wrapper for command execution.")
+    parser = argparse.ArgumentParser(description="eBPF capture for cgroup-based agent tracing.")
     parser.add_argument("--output", required=True, help="Path to output .ebpf.jsonl file")
-    parser.add_argument("command", nargs=argparse.REMAINDER, help="Command to execute (prefix with --)")
+    parser.add_argument("--cgroup-id", required=True, type=int, help="Kernel cgroup ID (inode number) to trace")
+    parser.add_argument("--agent-executable", default=None, help="Agent binary name for capture start filtering")
     args = parser.parse_args()
 
-    command = args.command
-    if command and command[0] == "--":
-        command = command[1:]
-    if not command:
-        print("No command provided for eBPF capture", file=sys.stderr)
-        return 2
-
-    output_file = Path(args.output)
     if os.geteuid() != 0:
-        print("ebpf_capture.py requires root privileges", file=sys.stderr)
+        print("ebpf capture requires root privileges", file=sys.stderr)
         return 1
 
-    return run_capture(output_file, command)
+    return run_capture(
+        Path(args.output),
+        args.cgroup_id,
+        agent_executable=args.agent_executable,
+    )
 
 
 if __name__ == "__main__":

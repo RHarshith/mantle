@@ -2,7 +2,6 @@ import contextvars
 import json
 import os
 from pathlib import Path
-import shutil
 import threading
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
@@ -20,10 +19,11 @@ PROXY_LOGGER = get_component_logger("proxy", layout=_RUNTIME_LAYOUT)
 
 # Set LiteLLM config path before importing the proxy app.
 # This LiteLLM build reads CONFIG_FILE_PATH / WORKER_CONFIG.
-_LOCAL_CONFIG_TEMPLATE = Path(__file__).with_name("config.yaml")
 if not _RUNTIME_LAYOUT.proxy_config_path.exists():
-    shutil.copy2(_LOCAL_CONFIG_TEMPLATE, _RUNTIME_LAYOUT.proxy_config_path)
-    PROXY_LOGGER.info("created default proxy config scaffold", extra={"config_path": str(_RUNTIME_LAYOUT.proxy_config_path)})
+    raise RuntimeError(
+        f"Missing LiteLLM proxy config after runtime bootstrap: {_RUNTIME_LAYOUT.proxy_config_path}"
+    )
+PROXY_LOGGER.info("using proxy config", extra={"config_path": str(_RUNTIME_LAYOUT.proxy_config_path)})
 
 _CONFIG_PATH = str(_RUNTIME_LAYOUT.proxy_config_path)
 os.environ["CONFIG_FILE_PATH"] = _CONFIG_PATH

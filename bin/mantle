@@ -20,19 +20,23 @@ usage() {
     cat <<'EOF'
 Usage:
     mantle serve [--host <host>] [--port <port>]
-        mantle watch [--trace-id <id>] [--interactive-ebpf] <executable> [args...]
+    mantle watch [--trace-id <id>] [--no-ebpf] <executable> [args...]
+    mantle daemon start|stop|status
 
 Commands:
     serve    Start the observability dashboard.
-    watch    Run an executable under eBPF capture (MITM disabled).
+    watch    Run an executable under cgroup-isolated eBPF capture.
+    daemon   Manage the eBPF tracing daemon (requires root).
 
 Examples:
-  mantle serve --host 0.0.0.0 --port 8099
+    mantle serve --host 0.0.0.0 --port 8099
     mantle watch aider
-        mantle watch aider "inspect this repo and summarize"
-  mantle watch aider "fix failing tests"
+    mantle watch aider "inspect this repo and summarize"
+    sudo mantle daemon start
 EOF
 }
+
+# ── serve ─────────────────────────────────────────────────────────
 
 serve_cmd() {
     local host port obs_root python_bin logs_root config_root
@@ -93,18 +97,50 @@ serve_cmd() {
     exec "$python_bin" -m uvicorn mantle.server.app:app --host "$host" --port "$port"
 }
 
-watch_cmd() {
-    local runner executable resolved_executable preserve_env
-    local logs_root obs_root config_root
-    local -a runner_args passthrough task_args
+# ── daemon ────────────────────────────────────────────────────────
 
-    runner="$REPO_ROOT/run_intercepted_agent.sh"
-    if [[ ! -x "$runner" ]]; then
-        echo "Error: $runner not found or not executable." >&2
+daemon_cmd() {
+    local action="${1:-}"
+    local python_bin="$VENV_PATH/bin/python"
+
+    if [[ ! -x "$python_bin" ]]; then
+        echo "Error: $python_bin not found. Run 'make build' first." >&2
         exit 1
     fi
 
-    passthrough=()
+    case "$action" in
+        start)
+            if [[ "${EUID}" -ne 0 ]]; then
+                echo "Error: 'mantle daemon start' requires root." >&2
+                echo "  sudo $SCRIPT_DIR/mantle daemon start" >&2
+                exit 1
+            fi
+            echo "[mantle] Starting eBPF daemon..."
+            exec "$python_bin" -m mantle.daemon.daemon
+            ;;
+        stop)
+            "$python_bin" -m mantle.daemon.client shutdown
+            ;;
+        status)
+            "$python_bin" -m mantle.daemon.client status
+            ;;
+        *)
+            echo "Usage: mantle daemon start|stop|status" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# ── watch ─────────────────────────────────────────────────────────
+
+watch_cmd() {
+    local executable resolved_executable trace_id python_bin
+    local logs_root obs_root config_root
+    local -a task_args
+    local enable_ebpf=true
+
+    trace_id=""
+
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --trace-id)
@@ -112,26 +148,11 @@ watch_cmd() {
                     echo "Error: $1 requires a value." >&2
                     exit 1
                 fi
-                passthrough+=("$1" "$2")
+                trace_id="$2"
                 shift 2
                 ;;
-            --mode)
-                if [[ $# -lt 2 ]]; then
-                    echo "Error: --mode requires a value." >&2
-                    exit 1
-                fi
-                if [[ "$2" != "none" ]]; then
-                    echo "Error: MITM interception is disabled. Only '--mode none' is allowed." >&2
-                    exit 1
-                fi
-                shift 2
-                ;;
-            --port)
-                echo "Error: --port is unavailable because MITM interception is disabled." >&2
-                exit 1
-                ;;
-            --interactive-ebpf)
-                passthrough+=("$1")
+            --no-ebpf)
+                enable_ebpf=false
                 shift
                 ;;
             -h|--help|help)
@@ -161,6 +182,7 @@ watch_cmd() {
 
     executable="$1"
     shift
+    task_args=("$@")
 
     # Resolve executables without requiring shell PATH/venv activation.
     if [[ "$executable" == */* ]]; then
@@ -173,9 +195,7 @@ watch_cmd() {
         resolved_executable="$executable"
     fi
 
-    # Forward all arguments after <executable> exactly as provided.
-    task_args=("$@")
-
+    # Setup directories and environment (done once, here only)
     logs_root="$REPO_ROOT/.mantle/logs"
     obs_root="$REPO_ROOT/.mantle/obs"
     config_root="$REPO_ROOT/.mantle/config"
@@ -185,6 +205,7 @@ watch_cmd() {
     export AGENT_OBS_ROOT="$obs_root"
     export OBS_TRACE_DIR="$obs_root/traces"
     export OBS_EVENTS_DIR="$obs_root/events"
+    export MANTLE_PROXY_LOG_DIR="$obs_root/proxy"
 
     mkdir -p \
         "$obs_root/traces" \
@@ -199,18 +220,101 @@ watch_cmd() {
         "$logs_root/runtime/agent" \
         "$config_root"
 
-    runner_args=("${passthrough[@]}" --agent "$resolved_executable")
-    if [[ ${#task_args[@]} -gt 0 ]]; then
-        runner_args+=(-- "${task_args[@]}")
+    # Generate trace ID
+    local agent_tag
+    agent_tag="$(basename "$resolved_executable")"
+    [[ -z "$trace_id" ]] && trace_id="${agent_tag}_$(date +%Y%m%d_%H%M%S).ebpf.jsonl"
+    local trace_basename="${trace_id%.ebpf.jsonl}"
+    local output_file="$obs_root/traces/$trace_id"
+
+    export AGENT_TRACE_ID="$trace_basename"
+
+    python_bin="$VENV_PATH/bin/python"
+    if [[ ! -x "$python_bin" ]]; then
+        echo "Error: $python_bin not found. Run 'make build' first." >&2
+        exit 1
     fi
 
-    if [[ "${EUID}" -ne 0 ]]; then
-        preserve_env="PATH,OPENAI_API_KEY,OAK1,OPENAI_BASE_URL,OPENAI_MODEL,AGENT_TRACE_ID,AGENT_OBS_ENABLED,AGENT_OBS_ROOT,OBS_TRACE_DIR,OBS_EVENTS_DIR,MANTLE_LOGS_DIR,MANTLE_CONFIG_DIR,MANTLE_PROXY_LOG_DIR,RTRACE_VENV,RTRACE_INTERCEPT_MODE,RTRACE_FORCE_OPENAI_BASE,MANTLE_VENV,MANTLE_INTERCEPT_MODE,MANTLE_FORCE_OPENAI_BASE"
-        exec sudo --preserve-env="$preserve_env" "$runner" "${runner_args[@]}"
+    # No eBPF? Just run the agent directly.
+    if ! $enable_ebpf; then
+        echo "[*] Running $executable (eBPF disabled)..."
+        "$resolved_executable" ${task_args[@]+"${task_args[@]}"}
+        exit $?
     fi
 
-    exec "$runner" "${runner_args[@]}"
+    # ── Cgroup-based eBPF tracing ──────────────────────────────────
+    #
+    # If not yet inside a cgroup scope, re-exec ourselves inside one.
+    # The _MANTLE_SCOPED guard prevents infinite re-exec.
+    if [[ -z "${_MANTLE_SCOPED:-}" ]]; then
+        export _MANTLE_SCOPED=1
+        exec systemd-run --user --scope -q --unit="mantle-watch-$$" \
+            "$SCRIPT_DIR/mantle" watch --trace-id "$trace_id" \
+            "$resolved_executable" \
+            ${task_args[@]+"${task_args[@]}"}
+    fi
+
+    # === We are now inside a cgroup scope ===
+
+    local cgroup_path
+    cgroup_path="/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)"
+
+    local proxy_control_url="${MANTLE_PROXY_CONTROL_URL:-http://127.0.0.1:4000/mantle/active-trace}"
+
+    # Ensure no inherited proxy vars accidentally reintroduce interception.
+    unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy ALL_PROXY all_proxy 2>/dev/null || true
+
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  Agent Trace (cgroup-isolated eBPF)"
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  Agent:   $executable"
+    echo "  Task:    ${task_args[*]:-<interactive>}"
+    echo "  Trace:   $trace_id"
+    echo "  Cgroup:  $cgroup_path"
+    echo "  Output:  $output_file"
+    echo "═══════════════════════════════════════════════════════════"
+
+    # Tell daemon to start tracing this cgroup
+    if ! "$python_bin" -m mantle.daemon.client trace-start \
+        --cgroup-path "$cgroup_path" \
+        --trace-id "$trace_id" \
+        --output-file "$output_file" \
+        --agent-executable "$agent_tag"; then
+        echo "Error: could not start eBPF trace." >&2
+        echo "Hint: start the daemon with: sudo mantle daemon start" >&2
+        exit 1
+    fi
+
+    # Notify proxy of active trace (best-effort)
+    curl -sf -X POST -H "Content-Type: application/json" \
+        -d "{\"trace_file\": \"$trace_id\"}" \
+        "$proxy_control_url" >/dev/null 2>&1 || true
+
+    # Export variables needed by the cleanup trap handler.
+    _MANTLE_CLEANUP_PYTHON="$python_bin"
+    _MANTLE_CLEANUP_TRACE_ID="$trace_id"
+    _MANTLE_CLEANUP_PROXY_URL="$proxy_control_url"
+    _MANTLE_CLEANUP_OUTPUT="$output_file"
+
+    # Cleanup on exit (normal, SIGINT, SIGTERM)
+    cleanup() {
+        "$_MANTLE_CLEANUP_PYTHON" -m mantle.daemon.client trace-stop \
+            --trace-id "$_MANTLE_CLEANUP_TRACE_ID" 2>/dev/null || true
+        curl -sf -X POST -H "Content-Type: application/json" \
+            -d '{"trace_file": null}' \
+            "$_MANTLE_CLEANUP_PROXY_URL" >/dev/null 2>&1 || true
+        echo ""
+        echo "[*] Done. Captured data:"
+        [[ -f "$_MANTLE_CLEANUP_OUTPUT" ]] && echo "    Trace: $_MANTLE_CLEANUP_OUTPUT ($(wc -l < "$_MANTLE_CLEANUP_OUTPUT") lines)"
+    }
+    trap cleanup EXIT
+
+    # Run the agent
+    echo "[*] Running $executable..."
+    "$resolved_executable" ${task_args[@]+"${task_args[@]}"}
 }
+
+# ── main dispatch ─────────────────────────────────────────────────
 
 if [[ $# -lt 1 ]]; then
     usage
@@ -225,6 +329,10 @@ case "$1" in
     watch)
         shift
         watch_cmd "$@"
+        ;;
+    daemon)
+        shift
+        daemon_cmd "$@"
         ;;
     *)
         echo "Unknown command: $1" >&2

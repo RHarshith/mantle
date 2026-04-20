@@ -18,6 +18,14 @@ RUNTIME_COMPONENTS = (
     "agent",
 )
 
+DEFAULT_PROXY_CONFIG_YAML = (
+    "model_list:\n"
+    "  - model_name: \"*\"\n"
+    "    litellm_params:\n"
+    "      model: \"*\"\n"
+    "      api_key: \"os.environ/OPENAI_API_KEY\"\n"
+)
+
 
 @dataclass(frozen=True)
 class RuntimeLayout:
@@ -97,20 +105,27 @@ def ensure_runtime_layout(layout: RuntimeLayout, require_writable: bool = True) 
 
 
 def ensure_runtime_config_scaffold(layout: RuntimeLayout) -> None:
-    """Create baseline runtime config scaffolding if absent."""
-    if layout.runtime_config_path.exists():
-        return
-    payload = {
-        "description": "Generated defaults scaffold for Mantle runtime.",
-        "notes": [
-            "Runtime paths are fixed to repo-local .mantle/{obs,config,logs}.",
-            "Do not rely on env folder overrides for capture/runtime directories.",
-        ],
-        "paths": {
-            "logs_root": str(layout.logs_root),
-            "obs_root": str(layout.obs_root),
-            "runtime_root": str(layout.runtime_root),
-            "config_root": str(layout.config_root),
-        },
-    }
-    layout.runtime_config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    """Create baseline runtime and proxy config scaffolding if absent."""
+    if not layout.runtime_config_path.exists():
+        payload = {
+            "description": "Generated defaults scaffold for Mantle runtime.",
+            "notes": [
+                "Runtime paths are fixed to repo-local .mantle/{obs,config,logs}.",
+                "Do not rely on env folder overrides for capture/runtime directories.",
+            ],
+            "paths": {
+                "logs_root": str(layout.logs_root),
+                "obs_root": str(layout.obs_root),
+                "runtime_root": str(layout.runtime_root),
+                "config_root": str(layout.config_root),
+            },
+        }
+        layout.runtime_config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    if not layout.proxy_config_path.exists():
+        try:
+            with layout.proxy_config_path.open("x", encoding="utf-8") as handle:
+                handle.write(DEFAULT_PROXY_CONFIG_YAML)
+        except FileExistsError:
+            # Guard against concurrent startup races; existing content wins.
+            pass

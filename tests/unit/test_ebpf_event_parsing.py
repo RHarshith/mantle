@@ -3,7 +3,6 @@
 import pytest
 
 from mantle.capture.ebpf import (
-    _command_for_bpftrace,
     _decode_ipv4,
     _decode_ipv6,
     _event_from_line,
@@ -167,26 +166,3 @@ class TestEventFromLine:
         assert event["endpoint_source"] == "connect_sockaddr"
 
 
-@pytest.mark.unit
-class TestCommandForBpftrace:
-    def test_empty_command(self):
-        assert _command_for_bpftrace([]) == []
-
-    def test_nonexistent_binary(self):
-        cmd = ["/nonexistent/binary", "--arg"]
-        assert _command_for_bpftrace(cmd) == cmd
-
-    def test_native_elf_unchanged(self, tmp_path):
-        binary = tmp_path / "test_bin"
-        binary.write_bytes(b"\x7fELF" + b"\x00" * 100)
-        cmd = [str(binary), "--flag"]
-        assert _command_for_bpftrace(cmd) == cmd
-
-    def test_shebang_script(self, tmp_path):
-        script = tmp_path / "test_script"
-        script.write_text("#!/usr/bin/env python3\nprint('hello')\n")
-        script.chmod(0o755)
-        result = _command_for_bpftrace([str(script)])
-        assert result[0] == "/usr/bin/env"
-        assert result[1] == "python3"
-        assert str(script) in result
