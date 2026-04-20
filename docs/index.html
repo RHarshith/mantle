@@ -5,9 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="Mantle is a deep observability and safety analysis layer for AI coding agents."
+      content="Mantle provides a non-invasive ecosystem for deploying verifiable, secure, and capable AI agents without instrumentation."
     />
-    <title>Mantle | Deep Observability</title>
+    <title>Mantle | The AI Agent Ecosystem</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -21,84 +21,85 @@
     <header class="topbar">
       <a class="brand" href="#">Mantle</a>
       <nav>
-        <a href="#layers">Layers</a>
-        <a href="#security">Security</a>
+        <a href="#capabilities">Capabilities</a>
+        <a href="#why-mantle">Why Mantle</a>
+        <a href="https://github.com/RHarshith/mantle" target="_blank" rel="noreferrer">Quickstart</a>
       </nav>
     </header>
 
     <main>
       <section class="hero reveal">
-        <p class="eyebrow">Deep observability for AI coding agents</p>
+        <p class="eyebrow">The unified ecosystem for AI agents</p>
         <h1>
-          Capability requires access.
-          <span>Access creates risk.</span>
-          Mantle closes the gap.
+          Deploy verifiable, secure,
+          <span>and capable AI agents.</span>
         </h1>
         <p class="lead">
-          Mantle gives teams a complete, evidence-backed record of what their AI agent did -
-          every tool call, file write, network request, and process spawn - so you can
-          investigate incidents, enforce policy, and ship with confidence.
+          Mantle bridges the gap between semantic decisions and system ground-truth.
+          Monitor agent reasoning, context, and side-effects in a single trajectory without
+          instrumenting your code.
         </p>
         <div class="cta-row">
           <a class="btn primary" href="https://github.com/RHarshith/mantle" target="_blank" rel="noreferrer">View Repository</a>
-          <a class="btn ghost" href="#layers">Explore Features</a>
+          <a class="btn ghost" href="#capabilities">Explore Platform</a>
         </div>
       </section>
 
-      <section id="layers" class="section reveal">
-        <h2>Main features</h2>
+      <section id="capabilities" class="section reveal">
+        <h2>A platform built for visibility and control</h2>
         <div class="layers-grid">
           <article class="card">
-            <h3>Multi-source capture</h3>
+            <h3>Semantic & Ground-Truth Correlation</h3>
             <p>
-              Collects eBPF system telemetry, MITM API/network traffic, and agent-native JSONL
-              events into a single correlated trace so nothing falls through the gaps between
-              layers.
+              Links every high-level tool call from your agent directly to the resulting ground-truth system calls. Monitor both the semantic layer and the system layer in one place.
             </p>
           </article>
           <article class="card">
-            <h3>Live dashboard</h3>
+            <h3>Zero-Instrumentation Operations</h3>
             <p>
-              Provides timeline and drilldown views to inspect tool calls, process activity,
-              file changes, and outbound connections in real time.
+              Run your agent exactly as you always do. Mantle observes from the system boundaries—capturing network interactions and system calls—requiring no modifications to your code.
             </p>
           </article>
           <article class="card">
-            <h3>Taint-based analysis</h3>
+            <h3>State Reconstruction & Replay</h3>
             <p>
-              Tracks how untrusted input moves through your system and flags dangerous paths -
-              like user data reaching a shell command or a sensitive file write.
+              Capture snapshots of system resources at tool call boundaries, allowing you perfectly reconstruct past executions to debug misbehavior and optimize tool usage.
+            </p>
+          </article>
+          <article class="card">
+            <h3>Unified Sandboxing [Upcoming]</h3>
+            <p>
+              Switch agents effortlessly with a unified sandbox that dynamically enforces rich, task-based exclusion policies.
             </p>
           </article>
         </div>
       </section>
 
-      <section id="security" class="section reveal split">
+      <section id="why-mantle" class="section reveal split">
         <div>
-          <h2>Why Mantle is needed</h2>
+          <h2>Open the Black Box</h2>
           <p>
-            AI coding agents are useful, but their runtime behavior is often opaque. Mantle makes
-            that behavior inspectable and testable, so teams can move from assumptions to
-            evidence-backed reviews.
+            AI agents are powerful, but their runtime behavior shouldn't be opaque. Mantle is built
+            to answer practical engineering and security questions so you can build with confidence.
           </p>
           <ul class="checks">
-            <li>Reconstruct exactly what happened, step by step, for any agent run</li>
-            <li>Surface high-risk operations with the context needed to evaluate them</li>
-            <li>Validate agent behavior against policy with repeatable, scriptable checks</li>
+            <li><strong>Correctness:</strong> Verify if the agent followed the optimal steps to achieve its goal.</li>
+            <li><strong>Safety:</strong> Ensure the agent only accessed necessary privileges and didn't trigger unexpected side-effects.</li>
+            <li><strong>Efficiency:</strong> Compare agents and models to measure token usage and system resource utilization.</li>
           </ul>
         </div>
         <aside class="status-panel">
-          <p class="status-title">What teams use it for</p>
-          <div class="status-line"><span>Incident Investigation</span><strong>Minutes, not days</strong></div>
-          <div class="status-line"><span>Reliability Reviews</span><strong>Evidence, not guesswork</strong></div>
-          <div class="status-line"><span>Security Validation</span><strong>Policy, not trust</strong></div>
+          <p class="status-title">Built for practical use cases</p>
+          <div class="status-line"><span>Monitor</span><strong>Semantic & System metrics</strong></div>
+          <div class="status-line"><span>Guardrail</span><strong>Enforce state policies</strong></div>
+          <div class="status-line"><span>Optimize</span><strong>Compare agent efficiency</strong></div>
         </aside>
       </section>
 
     </main>
 
     <footer>
-      <p>Mantle: explicit traces for safer and more reliable agent operations.</p>
+      <p>Mantle: Extensible infrastructure to monitor and guardrail AI agents.</p>
     </footer>
 
     <script src="app.js"></script>
