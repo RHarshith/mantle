@@ -11,7 +11,7 @@ MANTLE_HOST_HOME := $(shell if [ -n "$$MANTLE_HOST_HOME" ]; then echo "$$MANTLE_
 COMPOSE_RUN := MANTLE_HOST_HOME="$(MANTLE_HOST_HOME)" $(COMPOSE_CMD)
 
 .PHONY: serve proxy check-architecture \
-	help build down clean daemon-start daemon-stop daemon-status ensure-compose ensure-docker-access
+	help build down clean daemon-start daemon-stop daemon-status ensure-compose ensure-docker-access ensure-repo-mountpoint
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -33,7 +33,11 @@ ensure-docker-access: ## Ensure current user can reach Docker daemon
 		exit 1; \
 	fi
 
-build: ensure-compose ensure-docker-access ## Build and start Mantle services via docker compose
+ensure-repo-mountpoint: ## Ensure nested /app/.mantle bind target exists inside repo mount
+	@set -euo pipefail; \
+	mkdir -p "$(REPO_ROOT)/.mantle"
+
+build: ensure-compose ensure-docker-access ensure-repo-mountpoint ## Build and start Mantle services via docker compose
 	@echo "[mantle] Building and starting docker compose services..."
 	@set -euo pipefail; \
 	if [[ "$(COMPOSE_CMD)" == *"docker-compose"* ]]; then \
@@ -45,21 +49,21 @@ build: ensure-compose ensure-docker-access ## Build and start Mantle services vi
 down: ensure-compose ensure-docker-access ## Stop Mantle docker compose services
 	$(COMPOSE_RUN) -f "$(COMPOSE_FILE)" down
 
-serve: ensure-compose ensure-docker-access ## Start the dashboard server (via docker compose)
+serve: ensure-compose ensure-docker-access ensure-repo-mountpoint ## Start the dashboard server (via docker compose)
 	@set -euo pipefail; \
 	if [[ "$(COMPOSE_CMD)" == *"docker-compose"* ]]; then \
 		$(COMPOSE_RUN) -f "$(COMPOSE_FILE)" rm -fs server >/dev/null 2>&1 || true; \
 	fi; \
 	$(COMPOSE_RUN) -f "$(COMPOSE_FILE)" up -d server
 
-proxy: ensure-compose ensure-docker-access ## Start LiteLLM proxy (via docker compose)
+proxy: ensure-compose ensure-docker-access ensure-repo-mountpoint ## Start LiteLLM proxy (via docker compose)
 	@set -euo pipefail; \
 	if [[ "$(COMPOSE_CMD)" == *"docker-compose"* ]]; then \
 		$(COMPOSE_RUN) -f "$(COMPOSE_FILE)" rm -fs proxy >/dev/null 2>&1 || true; \
 	fi; \
 	$(COMPOSE_RUN) -f "$(COMPOSE_FILE)" up -d proxy
 
-daemon-start: ensure-compose ensure-docker-access ## Start the eBPF tracing daemon (via docker compose)
+daemon-start: ensure-compose ensure-docker-access ensure-repo-mountpoint ## Start the eBPF tracing daemon (via docker compose)
 	@set -euo pipefail; \
 	if [[ "$(COMPOSE_CMD)" == *"docker-compose"* ]]; then \
 		$(COMPOSE_RUN) -f "$(COMPOSE_FILE)" rm -fs daemon >/dev/null 2>&1 || true; \
@@ -72,7 +76,8 @@ daemon-stop: ensure-compose ensure-docker-access ## Stop the eBPF tracing daemon
 daemon-status: ensure-compose ensure-docker-access ## Show daemon health and active traces
 	$(COMPOSE_RUN) -f "$(COMPOSE_FILE)" exec -T daemon python3 -m mantle.daemon.client status
 
-clean: ## Remove caches and temp files
+clean: ensure-compose ensure-docker-access ## Remove caches, temp files, and docker containers
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name .pytest_cache -exec rm -rf {} + 2>/dev/null || true
 	rm -f tmp/rca_*.md
+	$(COMPOSE_RUN) -f "$(COMPOSE_FILE)" down -v --remove-orphans

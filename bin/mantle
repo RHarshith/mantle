@@ -58,6 +58,10 @@ compose_cmd() {
     local mantle_host_home
     mantle_host_home="$(compose_host_home)"
 
+    # When /app is mounted read-only from the repo root, nested bind mounts
+    # like /app/.mantle require the directory to exist in the repo tree.
+    mkdir -p "$REPO_ROOT/.mantle"
+
     if ! docker info >/dev/null 2>&1; then
         echo "Error: cannot access Docker daemon." >&2
         echo "Run with sudo (for example: sudo $SCRIPT_DIR/mantle serve) or add this user to the docker group." >&2

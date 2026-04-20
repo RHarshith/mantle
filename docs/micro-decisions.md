@@ -1,5 +1,6 @@
 # Micro Decisions
 
+- 2026-04-19: Added compose startup preflight in `Makefile` and `bin/mantle` to create `<repo>/.mantle` before `docker compose up`. Reason: with repo code mounted read-only at `/app`, nested bind mount target `/app/.mantle` must already exist in the mounted repo tree or container init fails with read-only mountpoint creation errors.
 - 2026-04-20: Preserved `mantle watch` wrapped-command exit status by returning the agent process code explicitly and forcing cleanup trap success. Reason: EXIT-trap postamble checks must not flip successful runs to exit code 1.
 - 2026-04-20: Updated proxy-log correlation fallback so multiple unmatched `*.log` files no longer fail `TraceStore.poll_once`; unmatched traces continue ingesting eBPF/native events without proxy payload mapping unless explicitly configured. Reason: ambiguous shared proxy logs should not block dashboard DB freshness for non-LLM traces.
 - 2026-04-20: Added `MANTLE_HOST_HOME` compose mount indirection and propagated it from `Makefile`/`bin/mantle` to keep `.mantle` bind mounts anchored to invoking user home under sudo flows. Reason: `${HOME}` under sudo resolves to `/root`, causing split trace/db roots and confusing watch/dashboard path mismatches.
