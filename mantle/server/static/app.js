@@ -24,6 +24,7 @@ let popupTraceViewerState = {
   startTimestamp: null,
   endTimestamp: null,
   title: "tool output",
+  anomaly: null,
 };
 const TRACE_HIDDEN_EVENT_TYPES_STORAGE_KEY = "mantle.trace.hiddenEventTypes";
 const DEFAULT_COMPACT_TRACE_HIDDEN_EVENT_TYPES = ["fd_open", "fd_close", "fd_write", "fd_write_ret"];
@@ -117,6 +118,48 @@ function formatMs(ms) {
   if (!Number.isFinite(n)) return "-";
   if (n < 1000) return `${Math.round(n)}ms`;
   return `${(n / 1000).toFixed(2)}s`;
+}
+
+function normalizeAnomaly(anomaly) {
+  const fallback = {
+    verdict: "CLEAN",
+    has_anomaly: false,
+    summary: "verified tool call",
+    total_violations: 0,
+    severity_counts: { LOW: 0, MEDIUM: 0, HIGH: 0 },
+  };
+  if (!anomaly || typeof anomaly !== "object") {
+    return fallback;
+  }
+
+  const verdict = String(anomaly.verdict || anomaly.anomaly_verdict || "CLEAN").toUpperCase();
+  const hasAnomaly = ("has_anomaly" in anomaly)
+    ? Boolean(anomaly.has_anomaly)
+    : (("anomaly_detected" in anomaly) ? Boolean(anomaly.anomaly_detected) : verdict !== "CLEAN");
+  const severityCounts = anomaly.severity_counts && typeof anomaly.severity_counts === "object"
+    ? {
+        LOW: Number(anomaly.severity_counts.LOW || 0),
+        MEDIUM: Number(anomaly.severity_counts.MEDIUM || 0),
+        HIGH: Number(anomaly.severity_counts.HIGH || 0),
+      }
+    : { LOW: 0, MEDIUM: 0, HIGH: 0 };
+
+  return {
+    verdict,
+    has_anomaly: hasAnomaly,
+    summary: String(anomaly.summary || (hasAnomaly ? "anomaly detected" : "verified tool call")),
+    total_violations: Number(anomaly.total_violations || 0),
+    severity_counts: severityCounts,
+  };
+}
+
+function anomalyIndicatorHtml(anomaly, extraClass = "") {
+  const normalized = normalizeAnomaly(anomaly);
+  const isAnomaly = Boolean(normalized.has_anomaly || normalized.verdict !== "CLEAN");
+  const title = isAnomaly ? "anomaly detected" : "verified tool call";
+  const tone = isAnomaly ? "anomaly" : "verified";
+  const classes = ["anomaly-indicator", tone, extraClass].filter(Boolean).join(" ");
+  return `<span class="${classes}" title="${title}" aria-label="${title}"></span>`;
 }
 
 function loadCompactTraceHiddenEventTypes() {
@@ -552,6 +595,11 @@ function renderTraceList(traces) {
       const row = document.createElement("div");
       row.className = `trace-item${t.trace_id === selectedTraceId ? " active" : ""}`;
       const statusClass = t.status === "completed" ? "completed" : "active";
+      const anomalyMeta = normalizeAnomaly(t.anomaly || {
+        anomaly_verdict: t.anomaly_verdict,
+        anomaly_detected: t.anomaly_detected,
+      });
+      const anomalyHtml = anomalyIndicatorHtml(anomalyMeta, "trace-anomaly-indicator");
       const moveOptions = processNames
         .map((name) => `<option value="${escapeHtml(name)}" ${name === processName ? "selected" : ""}>${escapeHtml(name)}</option>`)
         .join("");
@@ -562,7 +610,10 @@ function renderTraceList(traces) {
             <div class="trace-meta"><span class="trace-status ${statusClass}">${escapeHtml(t.status)}</span> agent: ${formatNumber(t.agent_event_count)} sys: ${formatNumber(t.sys_event_count)}</div>
             <div class="trace-meta">Move to: <select class="trace-move-select">${moveOptions}</select></div>
           </div>
-          <button class="trace-delete-btn" title="Delete trace">×</button>
+          <div class="trace-row-actions">
+            ${anomalyHtml}
+            <button class="trace-delete-btn" title="Delete trace">×</button>
+          </div>
         </div>`;
 
       row.addEventListener("click", () => selectTrace(t.trace_id));
@@ -793,11 +844,12 @@ function renderTurnTabs(turns) {
   for (const turn of turns) {
     const btn = document.createElement("button");
     btn.className = `turn-tab${turn.turn_id === currentTurnId ? " active" : ""}`;
+    const anomalyHtml = anomalyIndicatorHtml(turn.anomaly || null, "turn-anomaly-indicator");
     const tags = (turn.tags || []).map((tag) => `<span class="tag-pill ${toneClass(tag)}">${escapeHtml(tag)}</span>`).join("");
     btn.innerHTML = `
       <div class="turn-tab-top">
         <span class="turn-id">${escapeHtml(turn.label)}</span>
-        <span class="turn-tools">${formatNumber(turn.tool_call_count)} tools</span>
+        <span class="turn-tab-meta"><span class="turn-tools">${formatNumber(turn.tool_call_count)} tools</span>${anomalyHtml}</span>
       </div>
       <div class="turn-tags">${tags}</div>
       <div class="turn-summary">${escapeHtml(turn.dominant_summary || "")}</div>`;
@@ -1025,6 +1077,8 @@ function renderToolEntry(entry, turnId) {
 
   const resultText = entry.result ? JSON.stringify(entry.result, null, 2) : "No result captured";
   const t = truncateLines(resultText, 3);
+  const anomaly = entry && typeof entry.anomaly === "object" ? entry.anomaly : null;
+  const anomalyHtml = anomalyIndicatorHtml(anomaly, "tool-anomaly-indicator");
   const source = entry && typeof entry.source === "object" ? entry.source : {};
   const sourcePid = Number(source.pid || 0);
   const hasSource = sourcePid > 0;
@@ -1037,6 +1091,7 @@ function renderToolEntry(entry, turnId) {
       <span class="row-title">Tool: ${escapeHtml(entry.tool_name || "unknown")}</span>
       <span class="row-sub">${escapeHtml(entry.tool_call_id || "")}</span>
       ${sourceHtml}
+      ${anomalyHtml}
     </div>
     <div class="row-content">
       <div><div class="mini-label">Input arguments</div>${jsonBlock(entry.arguments)}</div>
@@ -1068,7 +1123,7 @@ function renderToolEntry(entry, turnId) {
   const sourceLink = card.querySelector(".source-link");
   if (sourceLink && turnId) {
     sourceLink.addEventListener("click", async () => {
-      await openSourceTracePopup(turnId, sourcePid, entry.tool_name || "unknown");
+      await openSourceTracePopup(turnId, sourcePid, entry.tool_name || "unknown", null, null, false, anomaly);
     });
   }
 
@@ -1533,6 +1588,42 @@ function renderProcessTracePopup(payload, turnId, toolName, options = {}) {
     wrap.appendChild(controls);
   }
 
+  const anomalyReport = options.anomaly && typeof options.anomaly === "object" ? options.anomaly : null;
+  const anomalyMeta = normalizeAnomaly(anomalyReport);
+  if (anomalyReport && anomalyMeta.has_anomaly) {
+    const panel = document.createElement("div");
+    panel.className = "timeline-row anomaly-panel";
+    const violations = Array.isArray(anomalyReport.violations) ? anomalyReport.violations : [];
+    const items = violations.slice(0, 20).map((violation) => {
+      const rule = String(violation?.rule || "unknown");
+      const severity = String(violation?.severity || "LOW");
+      const resource = String(
+        violation?.resource
+          || violation?.path
+          || ((violation?.dest_ip || violation?.dest_port)
+            ? `${String(violation?.dest_ip || "")}:${String(violation?.dest_port || 0)}`
+            : (violation?.child_binary || ""))
+      );
+      const operation = String(violation?.operation || violation?.reason || "");
+      return `
+        <div class="anomaly-row">
+          <div><span class="anomaly-rule">${escapeHtml(rule)}</span> <span class="row-sub">${escapeHtml(severity)}</span></div>
+          <div class="anomaly-text">${escapeHtml(resource || "(resource unavailable)")}${operation ? ` · ${escapeHtml(operation)}` : ""}</div>
+        </div>`;
+    }).join("");
+
+    panel.innerHTML = `
+      <div class="timeline-head">
+        <span class="row-title">Tool Anomaly</span>
+        ${anomalyIndicatorHtml(anomalyMeta, "tool-anomaly-indicator")}
+      </div>
+      <div class="row-content">
+        <div class="mono-text">${escapeHtml(String(anomalyMeta.summary || "anomaly detected"))}</div>
+        <div class="anomaly-list">${items || '<div class="mono-text">No violation details captured.</div>'}</div>
+      </div>`;
+    wrap.appendChild(panel);
+  }
+
   const meta = document.createElement("div");
   meta.className = "group-pills";
   const rootPills = [];
@@ -1579,7 +1670,7 @@ function renderProcessTracePopup(payload, turnId, toolName, options = {}) {
   overlay.classList.add("open");
 }
 
-async function openSourceTracePopup(turnId, pid, toolName, startTimestamp = null, endTimestamp = null, retainStack = false) {
+async function openSourceTracePopup(turnId, pid, toolName, startTimestamp = null, endTimestamp = null, retainStack = false, anomaly = null) {
   if (!selectedTraceId || !turnId || !pid) return;
 
   if (!retainStack) {
@@ -1590,9 +1681,13 @@ async function openSourceTracePopup(turnId, pid, toolName, startTimestamp = null
       startTimestamp,
       endTimestamp,
       title: String(toolName || "tool output"),
+      anomaly: anomaly && typeof anomaly === "object" ? anomaly : null,
     };
   } else {
     popupTraceViewerState.pid = pid;
+    if (anomaly && typeof anomaly === "object") {
+      popupTraceViewerState.anomaly = anomaly;
+    }
   }
 
   const state = popupTraceViewerState;
@@ -1620,27 +1715,28 @@ async function openSourceTracePopup(turnId, pid, toolName, startTimestamp = null
       subtitle: `Source: ${String(state.title)} · ${scopeText}`,
       startTimestamp: state.startTimestamp,
       endTimestamp: state.endTimestamp,
+      anomaly: state.anomaly,
       hiddenEventTypes: activeHiddenTraceEventTypes(),
       onToggleDetail: async () => {
         detailedTraceViewEnabled = !detailedTraceViewEnabled;
-        await openSourceTracePopup(turnId, state.pid, state.title, state.startTimestamp, state.endTimestamp, true);
+        await openSourceTracePopup(turnId, state.pid, state.title, state.startTimestamp, state.endTimestamp, true, state.anomaly);
       },
       onEditFilters: async () => {
         const changed = editCompactTraceHiddenEventTypes();
         if (!changed) return;
-        await openSourceTracePopup(turnId, state.pid, state.title, state.startTimestamp, state.endTimestamp, true);
+        await openSourceTracePopup(turnId, state.pid, state.title, state.startTimestamp, state.endTimestamp, true, state.anomaly);
       },
       onBack: state.stack.length
         ? async () => {
             const previousPid = state.stack.pop();
             if (!previousPid) return;
-            await openSourceTracePopup(turnId, previousPid, state.title, state.startTimestamp, state.endTimestamp, true);
+            await openSourceTracePopup(turnId, previousPid, state.title, state.startTimestamp, state.endTimestamp, true, state.anomaly);
           }
         : null,
       onSelectPid: async (childPid) => {
         if (!childPid || Number(childPid) <= 0) return;
         state.stack.push(state.pid);
-        await openSourceTracePopup(turnId, childPid, state.title, state.startTimestamp, state.endTimestamp, true);
+        await openSourceTracePopup(turnId, childPid, state.title, state.startTimestamp, state.endTimestamp, true, state.anomaly);
       },
     });
   } catch (_err) {
@@ -1749,10 +1845,13 @@ function replaySectionCard(section, turnId, options = {}) {
 }
 
 function replayToolPairCard(pair, turnId) {
+  const anomaly = pair && typeof pair.anomaly === "object" ? pair.anomaly : null;
+  const anomalyHtml = anomalyIndicatorHtml(anomaly, "tool-anomaly-indicator");
   const source = pair && typeof pair.source === "object" ? pair.source : { status: "source_not_found" };
   const sourcePid = Number(source.pid || 0);
+  const toolCallId = String(pair?.tool_call_id || "");
   const sourceHtml = sourcePid > 0
-    ? `<button class="replay-source-link" data-source-pid="${String(sourcePid)}">source: pid${String(sourcePid)}</button>`
+    ? `<button class="replay-source-link" data-source-pid="${String(sourcePid)}" data-source-tool-call-id="${escapeHtml(toolCallId)}">source: pid${String(sourcePid)}</button>`
     : '<span class="replay-source-missing">source: not found</span>';
 
   const responseText = typeof pair?.response === "string"
@@ -1764,6 +1863,7 @@ function replayToolPairCard(pair, turnId) {
     <details class="replay-card replay-tool_pair replay-tool-call-pair" open>
       <summary class="replay-band">
         <span class="replay-band-title">${escapeHtml(pair?.tool_name || "tool")} (${escapeHtml(pair?.tool_call_id || "")})</span>
+        ${anomalyHtml}
         <span class="replay-band-toggle" aria-hidden="true"></span>
       </summary>
       <div class="replay-card-body">
@@ -1906,13 +2006,25 @@ function renderReplayDetail(payload) {
     </div>
     <div class="replay-sections">${contentHtml}</div>`;
 
+  const toolPairAnomalyById = new Map();
+  const replayPairs = Array.isArray(payload.tool_call_response_pairs) ? payload.tool_call_response_pairs : [];
+  for (const pair of replayPairs) {
+    const toolCallId = String(pair?.tool_call_id || "").trim();
+    if (!toolCallId) continue;
+    if (pair && typeof pair.anomaly === "object") {
+      toolPairAnomalyById.set(toolCallId, pair.anomaly);
+    }
+  }
+
   wireReplayExpanders(right);
 
   right.querySelectorAll(".replay-source-link").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const pid = Number(btn.getAttribute("data-source-pid") || "0");
       if (!pid || !payload.turn_id) return;
-      await openSourceTracePopup(payload.turn_id, pid, "tool output", payload.start_ts, payload.end_ts);
+      const toolCallId = String(btn.getAttribute("data-source-tool-call-id") || "").trim();
+      const anomaly = toolCallId ? (toolPairAnomalyById.get(toolCallId) || null) : null;
+      await openSourceTracePopup(payload.turn_id, pid, "tool output", payload.start_ts, payload.end_ts, false, anomaly);
     });
   });
 
@@ -1954,7 +2066,9 @@ function renderReplayDetail(payload) {
             sourceBtn.addEventListener("click", async () => {
               const pid = Number(sourceBtn.getAttribute("data-source-pid") || "0");
               if (!pid || !payload.turn_id) return;
-              await openSourceTracePopup(payload.turn_id, pid, "tool output", payload.start_ts, payload.end_ts);
+              const toolCallId = String(sourceBtn.getAttribute("data-source-tool-call-id") || "").trim();
+              const anomaly = toolCallId ? (toolPairAnomalyById.get(toolCallId) || null) : null;
+              await openSourceTracePopup(payload.turn_id, pid, "tool output", payload.start_ts, payload.end_ts, false, anomaly);
             });
           });
         });
@@ -2258,11 +2372,12 @@ function renderReplayShell(overview) {
   const turns = (overview || {}).turns || [];
   const turnButtons = turns.map((turn) => {
     const active = turn.turn_id === currentReplayTurnId;
+    const anomalyHtml = anomalyIndicatorHtml(turn.anomaly || null, "replay-turn-anomaly-indicator");
     return `
       <button class="replay-turn-item ${active ? "active" : ""}" data-turn-id="${escapeHtml(turn.turn_id)}">
         <div class="replay-turn-top">
           <span class="replay-turn-name">${escapeHtml(turn.label || turn.turn_id)}</span>
-          <span class="replay-turn-tools">${formatNumber(turn.tool_call_count)} tools</span>
+          <span class="replay-turn-meta-wrap"><span class="replay-turn-tools">${formatNumber(turn.tool_call_count)} tools</span>${anomalyHtml}</span>
         </div>
         <div class="replay-turn-meta">ctx ${formatNumber(turn.context_section_count)} · act ${formatNumber(turn.action_section_count)}</div>
       </button>`;
@@ -2635,6 +2750,7 @@ function installStyles() {
     .turn-tab { width:100%; border:1px solid var(--border); border-radius:8px; background:var(--surface); text-align:left; padding:10px; cursor:pointer; }
     .turn-tab.active { box-shadow: inset 0 0 0 2px var(--blue-500); background: var(--blue-50); }
     .turn-tab-top { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
+    .turn-tab-meta { display:inline-flex; align-items:center; gap:6px; margin-left:auto; }
     .turn-id { font-weight:700; font-size:12px; }
     .turn-tools { font-size:11px; color:var(--text-muted); }
     .turn-tags { display:flex; gap:6px; flex-wrap:wrap; min-height:22px; }
@@ -2652,6 +2768,15 @@ function installStyles() {
     .trace-process-count { font-size:10px; color:var(--text-muted); }
     .trace-process-empty { padding:8px 12px; font-size:11px; color:var(--text-muted); }
     .trace-move-select { border:1px solid var(--border); border-radius:6px; font-size:11px; padding:2px 5px; margin-left:4px; }
+    .trace-row-actions { display:flex; flex-direction:column; align-items:flex-end; gap:8px; }
+    .trace-row-actions .trace-delete-btn { margin:0; }
+
+    .anomaly-indicator { width:16px; height:16px; border-radius:999px; display:inline-flex; align-items:center; justify-content:center; font-size:10px; font-weight:800; line-height:1; flex:0 0 16px; }
+    .anomaly-indicator::before { content:"!"; }
+    .anomaly-indicator.anomaly { background:var(--red-100); color:var(--red-600); border:1px solid var(--red-500); }
+    .anomaly-indicator.verified { background:var(--emerald-100); color:var(--emerald-600); border:1px solid var(--emerald-500); }
+    .anomaly-indicator.verified::before { content:"\\2713"; font-size:11px; }
+    .tool-anomaly-indicator { margin-left:4px; }
 
     .turn-exec-summary { display:grid; grid-template-columns: repeat(5, 1fr); gap:10px; margin: 8px 0 12px; }
     .mini-card { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:10px; }
@@ -2736,6 +2861,7 @@ function installStyles() {
     .replay-turn-item:hover { background:var(--slate-50); }
     .replay-turn-item.active { background:var(--blue-50); box-shadow: inset 3px 0 0 var(--blue-500); }
     .replay-turn-top { display:flex; justify-content:space-between; gap:6px; }
+    .replay-turn-meta-wrap { display:inline-flex; align-items:center; gap:6px; margin-left:auto; }
     .replay-turn-name { font-size:12px; font-weight:700; color:var(--text-primary); }
     .replay-turn-tools { font-size:10px; color:var(--text-muted); text-transform:uppercase; }
     .replay-turn-meta { margin-top:4px; font-size:11px; color:var(--text-secondary); }
@@ -2823,6 +2949,11 @@ function installStyles() {
     .process-trace-subtitle { font-size:11px; color:var(--text-muted); margin-top:2px; }
     .process-trace-body { padding:12px; overflow:auto; }
     .process-trace-content { display:grid; gap:10px; }
+    .anomaly-panel { border-left:4px solid var(--red-500); background:var(--red-50); }
+    .anomaly-list { display:grid; gap:6px; margin-top:8px; }
+    .anomaly-row { border:1px solid var(--red-100); border-radius:6px; background:var(--surface); padding:6px 8px; }
+    .anomaly-rule { font-size:10px; font-weight:700; color:var(--red-600); text-transform:uppercase; letter-spacing:0.03em; }
+    .anomaly-text { margin-top:2px; font-size:11px; color:var(--text-secondary); word-break:break-word; }
 
     .replay-metrics-overlay { position:fixed; inset:0; background:rgba(15,23,42,0.38); display:none; align-items:center; justify-content:center; padding:18px; z-index:1100; }
     .replay-metrics-overlay.open { display:flex; }

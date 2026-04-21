@@ -102,6 +102,13 @@ def build_replay_overview(trace_id: str, turns: list[dict[str, Any]]) -> dict[st
                 "action_section_count": len(action_sections),
                 "start_ts": turn.get("start_ts"),
                 "end_ts": turn.get("end_ts"),
+                "anomaly": turn.get("anomaly") or {
+                    "verdict": "CLEAN",
+                    "has_anomaly": False,
+                    "summary": "verified tool call",
+                    "total_violations": 0,
+                    "severity_counts": {"LOW": 0, "MEDIUM": 0, "HIGH": 0},
+                },
             }
         )
 
@@ -144,6 +151,13 @@ def build_replay_turn_detail(trace_id: str, turn: dict[str, Any]) -> dict[str, A
         "label": str(turn.get("label") or ""),
         "start_ts": turn.get("start_ts"),
         "end_ts": turn.get("end_ts"),
+        "anomaly": turn.get("anomaly") or {
+            "verdict": "CLEAN",
+            "has_anomaly": False,
+            "summary": "verified tool call",
+            "total_violations": 0,
+            "severity_counts": {"LOW": 0, "MEDIUM": 0, "HIGH": 0},
+        },
         "context": {
             "sections": context_sections,
             "text": sections_to_text(context_sections),

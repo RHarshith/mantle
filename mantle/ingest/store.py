@@ -27,6 +27,10 @@ from mantle.analysis.replay import (
     build_replay_overview,
     build_replay_turn_detail,
 )
+from mantle.analysis.tool_anomaly import (
+    ToolAnomalyDetector,
+    aggregate_tool_anomaly_reports,
+)
 from mantle.analysis.syscall_parser import (
     command_network_targets,
     extract_fd,
@@ -145,6 +149,7 @@ class TraceStore:
         self.traces: dict[str, TraceState] = {}
         self.version = 0
         self._lock = asyncio.Lock()
+        self._tool_anomaly_detector = ToolAnomalyDetector(skip_unknown_network_binaries=True)
         self.llm_api_schemas: list[dict[str, Any]] = self._builtin_llm_api_schemas()
         db_path = trace_dir.parent / "mantle_events.db"
         schema_path = Path(__file__).with_name("sql") / "schema.sql"
@@ -1972,6 +1977,7 @@ class TraceStore:
         out = []
         for trace_id in sorted(self.traces.keys()):
             t = self.traces[trace_id]
+            anomaly = self._trace_anomaly_summary(t)
             out.append(
                 {
                     "trace_id": trace_id,
@@ -1979,6 +1985,9 @@ class TraceStore:
                     "sys_event_count": len(t.sys_events),
                     "agent_event_count": len(t.agent_events),
                     "has_trajectory": len(t.agent_events) > 0,
+                    "anomaly": anomaly,
+                    "anomaly_verdict": str(anomaly.get("verdict") or "CLEAN"),
+                    "anomaly_detected": bool(anomaly.get("has_anomaly") or False),
                 }
             )
         return out
@@ -3701,6 +3710,81 @@ class TraceStore:
 
         return sorted(related, key=lambda x: int(x.get("line_no", 0)))
 
+    def _tool_root_pid_for_related(self, related_events: list[dict[str, Any]], fallback_pid: int | None = None) -> int:
+        for event in related_events:
+            if str(event.get("type") or "") == "command_exec":
+                pid = int(event.get("pid") or 0)
+                if pid > 0:
+                    return pid
+        for event in related_events:
+            pid = int(event.get("pid") or 0)
+            if pid > 0:
+                return pid
+        return int(fallback_pid or 0)
+
+    def _tool_command_for_analysis(
+        self,
+        start_event: dict[str, Any] | None,
+        related_events: list[dict[str, Any]],
+        *,
+        default_name: str = "tool call",
+    ) -> str:
+        payload = (start_event or {}).get("payload") if isinstance(start_event, dict) else {}
+        payload = payload if isinstance(payload, dict) else {}
+        cmd = self._extract_tool_command_text(payload)
+        if cmd:
+            return cmd
+        for event in related_events:
+            if str(event.get("type") or "") != "command_exec":
+                continue
+            ev_cmd = self._event_command_text(event)
+            if ev_cmd:
+                return ev_cmd
+        tool_name = str(payload.get("tool_name") or default_name or "tool call").strip()
+        return tool_name or "tool call"
+
+    def _tool_anomaly_report_for_related(
+        self,
+        trace: TraceState,
+        start_event: dict[str, Any] | None,
+        related_events: list[dict[str, Any]],
+        *,
+        fallback_root_pid: int | None = None,
+    ) -> dict[str, Any]:
+        command = self._tool_command_for_analysis(start_event, related_events)
+        root_pid = self._tool_root_pid_for_related(related_events, fallback_pid=fallback_root_pid)
+        project_root = self._trace_repo_root(trace)
+        return self._tool_anomaly_detector.analyze(
+            command,
+            related_events,
+            trace.process_parent,
+            root_pid=root_pid,
+            project_root=project_root,
+        )
+
+    def _trace_tool_anomaly_map(self, trace: TraceState) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        starts = self._tool_start_events(trace)
+        if not starts:
+            return out
+
+        for start_event in starts:
+            payload = start_event.get("payload") if isinstance(start_event, dict) else {}
+            payload = payload if isinstance(payload, dict) else {}
+            tool_call_id = str(payload.get("tool_call_id") or "").strip()
+            if not tool_call_id or tool_call_id in out:
+                continue
+
+            _, end_event = self._find_tool_events(trace, tool_call_id)
+            related = self._related_sys_events_for_tool(trace, tool_call_id, start_event, end_event)
+            out[tool_call_id] = self._tool_anomaly_report_for_related(trace, start_event, related)
+
+        return out
+
+    def _trace_anomaly_summary(self, trace: TraceState) -> dict[str, Any]:
+        reports = list(self._trace_tool_anomaly_map(trace).values())
+        return aggregate_tool_anomaly_reports(reports)
+
     def _collapse_files_into_folders(
         self,
         file_items: list[dict[str, Any]],
@@ -3911,6 +3995,7 @@ class TraceStore:
 
     def tool_graph(self, trace_id: str, tool_call_id: str) -> dict[str, Any]:
         t = self._get_trace(trace_id)
+        start_event: dict[str, Any] | None = None
 
         if tool_call_id == "internal_phase":
             setup_range = self._setup_phase_window(t, sorted(t.sys_events, key=lambda e: int(e.get("line_no", 0))))
@@ -3930,13 +4015,10 @@ class TraceStore:
                 "ts": setup_events[-1].get("ts", 0) if setup_events else 0,
             }
             related = setup_events
-            line_range = (int(setup_events[0].get("line_no", 0)), int(setup_events[-1].get("line_no", 0))) if setup_events else None
         else:
             start_event, end_event = self._find_tool_events(t, tool_call_id)
             if start_event is None:
                 raise KeyError(tool_call_id)
-            tool_ranges = self._tool_line_ranges(t)
-            line_range = tool_ranges.get(tool_call_id)
             related = self._related_sys_events_for_tool(t, tool_call_id, start_event, end_event)
 
         if related:
@@ -3951,13 +4033,22 @@ class TraceStore:
         if root_pid <= 0:
             raise KeyError(tool_call_id)
 
-        return self._git_tree_graph(
+        anomalies = self._tool_anomaly_report_for_related(
+            t,
+            start_event,
+            related,
+            fallback_root_pid=root_pid,
+        )
+
+        graph = self._git_tree_graph(
             t,
             focus_pid=root_pid,
             detailed=True,
             scoped_sys_events=related,
             include_agent_events=False,
         )
+        graph["anomalies"] = anomalies
+        return graph
 
     def _event_ts(self, event: dict[str, Any]) -> float:
         try:
@@ -4030,6 +4121,7 @@ class TraceStore:
             key=lambda e: (self._event_ts(e), self._event_seq(e)),
         )
         sys_events = sorted(list(trace.sys_events), key=lambda e: (self._event_ts(e), int(e.get("line_no") or 0)))
+        tool_anomaly_by_id = self._trace_tool_anomaly_map(trace)
 
         llm_calls = self._parse_llm_calls_from_capture(trace)
         boundaries = sorted([float(c.get("ts") or 0.0) for c in llm_calls if float(c.get("ts") or 0.0) > 0.0])
@@ -4073,6 +4165,11 @@ class TraceStore:
             span_end_ts = end_ts if end_ts is not None else (max(valid_slice_ts) if valid_slice_ts else None)
 
             tool_pairs = self._tool_pairs(agent_slice)
+            turn_tool_anomalies = [
+                tool_anomaly_by_id.get(str(tp.get("tool_call_id") or ""), self._tool_anomaly_detector.verified_report(str(tp.get("tool_name") or "tool call")))
+                for tp in tool_pairs
+            ]
+            turn_anomaly = aggregate_tool_anomaly_reports(turn_tool_anomalies)
             files_read = {str(e.get("path") or "") for e in sys_slice if str(e.get("type") or "") == "file_read" and str(e.get("path") or "")}
             files_written = {
                 str(e.get("path") or "")
@@ -4218,6 +4315,7 @@ class TraceStore:
                     "start_ts": span_start_ts,
                     "end_ts": span_end_ts,
                     "tool_call_count": len(tool_pairs),
+                    "anomaly": turn_anomaly,
                     "tags": tags,
                     "dominant_summary": dominant,
                     "prompt_text": "\n\n".join(prompt_texts),
@@ -4235,6 +4333,7 @@ class TraceStore:
                     "_agent_events": agent_slice,
                     "_sys_events": sys_slice,
                     "_tool_pairs": tool_pairs,
+                    "_tool_anomalies": turn_tool_anomalies,
                 }
             )
 
@@ -4254,7 +4353,16 @@ class TraceStore:
 
         sys_events = list(match.get("_sys_events", []))
         tool_pairs = list(match.get("_tool_pairs", []))
-        paired_tool_calls = self._replay_tool_call_pairs(trace, sys_events, tool_pairs)
+        anomaly_by_id: dict[str, dict[str, Any]] = {}
+        reports_seq = list(match.get("_tool_anomalies") or [])
+        for idx, tp in enumerate(tool_pairs):
+            tool_call_id = str(tp.get("tool_call_id") or "").strip()
+            if not tool_call_id:
+                continue
+            report = reports_seq[idx] if idx < len(reports_seq) and isinstance(reports_seq[idx], dict) else None
+            if report is not None:
+                anomaly_by_id[tool_call_id] = report
+        paired_tool_calls = self._replay_tool_call_pairs(trace, sys_events, tool_pairs, anomaly_by_id)
         file_activity = self._replay_file_activity(sys_events)
         subprocesses = self._replay_subprocesses(trace, sys_events)
 
@@ -4270,6 +4378,7 @@ class TraceStore:
             "context_sections": len((replay_payload.get("context") or {}).get("sections") or []),
             "action_sections": len((replay_payload.get("action") or {}).get("sections") or []),
             "tool_call_pairs": paired_tool_calls,
+            "anomaly": match.get("anomaly") or aggregate_tool_anomaly_reports(list(anomaly_by_id.values())),
             "file_activity": file_activity,
             "subprocesses": subprocesses,
         }
@@ -4854,19 +4963,23 @@ class TraceStore:
         trace: TraceState,
         sys_events: list[dict[str, Any]],
         tool_pairs: list[dict[str, Any]],
+        anomaly_by_id: dict[str, dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
+        anomaly_by_id = anomaly_by_id or {}
         out: list[dict[str, Any]] = []
         for tp in sorted(tool_pairs, key=lambda item: float(item.get("started_ts") or 0.0)):
             source = self._match_tool_source_for_turn(trace, sys_events, tp)
+            tool_call_id = str(tp.get("tool_call_id") or "")
             out.append(
                 {
-                    "tool_call_id": str(tp.get("tool_call_id") or ""),
+                    "tool_call_id": tool_call_id,
                     "tool_name": str(tp.get("tool_name") or "unknown"),
                     "arguments": tp.get("arguments") or {},
                     "response": tp.get("result"),
                     "started_ts": tp.get("started_ts"),
                     "finished_ts": tp.get("finished_ts"),
                     "source": source,
+                    "anomaly": anomaly_by_id.get(tool_call_id, self._tool_anomaly_detector.verified_report(str(tp.get("tool_name") or "tool call"))),
                 }
             )
         return out
@@ -5039,10 +5152,12 @@ class TraceStore:
         trace: TraceState,
         sys_events: list[dict[str, Any]],
         tool_pairs: list[dict[str, Any]] | None,
+        tool_anomaly_by_id: dict[str, dict[str, Any]] | None = None,
         anchor_pid: int | None = None,
         strict_anchor_children: bool = False,
     ) -> list[dict[str, Any]]:
         tool_pairs = tool_pairs or []
+        tool_anomaly_by_id = tool_anomaly_by_id or {}
         tool_source_by_id: dict[str, dict[str, Any]] = {}
         for tp in tool_pairs:
             tool_call_id = str(tp.get("tool_call_id") or "").strip()
@@ -5347,6 +5462,10 @@ class TraceStore:
                             str(item["tool"].get("tool_call_id") or ""),
                             {"status": "source_not_found"},
                         ),
+                        "anomaly": tool_anomaly_by_id.get(
+                            str(item["tool"].get("tool_call_id") or ""),
+                            self._tool_anomaly_detector.verified_report(str(item["tool"].get("tool_name") or "tool call")),
+                        ),
                     }
                 )
                 continue
@@ -5367,8 +5486,12 @@ class TraceStore:
         return timeline
 
     def turns_overview(self, trace_id: str) -> dict[str, Any]:
-        self._get_trace(trace_id)
+        trace = self._get_trace(trace_id)
         rows = self.sqlite_store.list_turns(trace_id)
+        turn_anomaly_by_id = {
+            str(turn.get("turn_id") or ""): turn.get("anomaly") or aggregate_tool_anomaly_reports(list(turn.get("_tool_anomalies") or []))
+            for turn in self._turns_for_trace(trace)
+        }
 
         turn_rows: list[dict[str, Any]] = []
         tool_calls_total = 0
@@ -5410,10 +5533,30 @@ class TraceStore:
                     "tool_call_count": int(metadata.get("tool_call_count") or tool_calls),
                     "tags": list(metadata.get("tags") or []),
                     "dominant_summary": str(metadata.get("dominant_summary") or ""),
+                    "anomaly": turn_anomaly_by_id.get(
+                        str(metadata.get("turn_id") or f"turn_{turn_id}"),
+                        aggregate_tool_anomaly_reports([]),
+                    ),
                 }
             )
 
         turn_count = len([r for r in turn_rows if r.get("turn_id") != "setup"])
+        anomaly_rows = [row.get("anomaly") for row in turn_rows if isinstance(row.get("anomaly"), dict)]
+        turn_verdicts = [str(item.get("verdict") or "CLEAN") for item in anomaly_rows]
+        if any(v == "VIOLATION" for v in turn_verdicts):
+            turns_anomaly_verdict = "VIOLATION"
+        elif any(v == "SUSPICIOUS" for v in turn_verdicts):
+            turns_anomaly_verdict = "SUSPICIOUS"
+        else:
+            turns_anomaly_verdict = "CLEAN"
+
+        turn_severity_counts = {
+            "LOW": sum(int(((item.get("severity_counts") or {}).get("LOW") or 0)) for item in anomaly_rows),
+            "MEDIUM": sum(int(((item.get("severity_counts") or {}).get("MEDIUM") or 0)) for item in anomaly_rows),
+            "HIGH": sum(int(((item.get("severity_counts") or {}).get("HIGH") or 0)) for item in anomaly_rows),
+        }
+        turns_total_violations = sum(int(item.get("total_violations") or 0) for item in anomaly_rows)
+
         return {
             "trace_id": trace_id,
             "executive_summary": {
@@ -5423,6 +5566,13 @@ class TraceStore:
                 "files_written": files_written_total,
                 "network_calls": network_total,
                 "subprocesses_spawned": subprocess_total,
+                "anomaly": {
+                    "verdict": turns_anomaly_verdict,
+                    "has_anomaly": turns_anomaly_verdict != "CLEAN",
+                    "summary": "anomaly detected" if turns_anomaly_verdict != "CLEAN" else "verified tool call",
+                    "total_violations": int(turns_total_violations),
+                    "severity_counts": turn_severity_counts,
+                },
             },
             "turns": turn_rows,
         }
@@ -5443,7 +5593,23 @@ class TraceStore:
 
         sys_events = list(match.get("_sys_events", []))
         tool_pairs = list(match.get("_tool_pairs", []))
-        timeline = self._build_unified_timeline(t, sys_events, tool_pairs, anchor_pid=int(t.root_pid or 0) or None)
+        anomaly_by_id: dict[str, dict[str, Any]] = {}
+        reports_seq = list(match.get("_tool_anomalies") or [])
+        for idx, tp in enumerate(tool_pairs):
+            tool_call_id = str(tp.get("tool_call_id") or "").strip()
+            if not tool_call_id:
+                continue
+            report = reports_seq[idx] if idx < len(reports_seq) and isinstance(reports_seq[idx], dict) else None
+            if report is not None:
+                anomaly_by_id[tool_call_id] = report
+
+        timeline = self._build_unified_timeline(
+            t,
+            sys_events,
+            tool_pairs,
+            anomaly_by_id,
+            anchor_pid=int(t.root_pid or 0) or None,
+        )
 
         direct_children = {
             int(e.get("child_pid") or 0)
@@ -5470,7 +5636,9 @@ class TraceStore:
                 "files_written": int(match.get("files_written_count") or 0),
                 "subprocesses_spawned": len([pid for pid in direct_children if int(pid) > 0]),
                 "network_calls": len(net_calls),
+                "anomaly": match.get("anomaly") or aggregate_tool_anomaly_reports(list(anomaly_by_id.values())),
             },
+            "anomaly": match.get("anomaly") or aggregate_tool_anomaly_reports(list(anomaly_by_id.values())),
             "prompt_text": match.get("prompt_text") or "",
             "response_text": match.get("response_text") or "",
             "prompt_sections": match.get("prompt_sections") or [],
@@ -6092,6 +6260,8 @@ class TraceStore:
         ]
         net_endpoints.sort(key=lambda x: (0 if x.get("transport") == "command" else 1, -x["count"], x["dest"]))
 
+        anomaly = self._trace_anomaly_summary(t)
+
         return {
             "trace_id": trace_id,
             "status": "completed" if t.complete else "active",
@@ -6099,6 +6269,7 @@ class TraceStore:
             "network": net_endpoints[:100],
             "tools": sorted(tools_set),
             "tool_calls": tool_calls,
+            "anomaly": anomaly,
             "totals": {
                 "unique_files": len(files),
                 "network_endpoints": len(net_endpoints),
@@ -6264,10 +6435,18 @@ class TraceStore:
         ]
         net_endpoints.sort(key=lambda x: (0 if x.get("transport") == "command" else 1, -x["count"], x["dest"]))
 
+        anomalies = self._tool_anomaly_report_for_related(
+            t,
+            start_event,
+            related,
+            fallback_root_pid=int(t.root_pid or 0),
+        )
+
         return {
             "tool_call_id": tool_call_id,
             "files": files,
             "network": net_endpoints,
+            "anomalies": anomalies,
             "totals": {"unique_files": len(files), "network_endpoints": len(net_endpoints), "events": len(related)},
         }
 
