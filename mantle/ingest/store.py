@@ -5799,6 +5799,136 @@ class TraceStore:
             "totals": totals,
         }
 
+    def _aggregate_scope_data(
+        self,
+        trace: TraceState,
+        scoped_events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Build aggregated file/network/command summaries across all PIDs in scope.
+
+        This powers the discovery-oriented event viewer: a single call produces
+        all data needed to render the unified file tree, network endpoints, and
+        distinct commands tabs without additional API roundtrips.
+        """
+        # --- pid -> command map ---
+        pid_command: dict[int, str] = {}
+        for e in scoped_events:
+            if str(e.get("type") or "") == "command_exec":
+                ep = int(e.get("pid") or 0)
+                cmd = str(e.get("command") or e.get("exec_path") or "").strip()
+                if ep > 0 and cmd:
+                    pid_command[ep] = cmd
+
+        # --- files ---
+        file_map: dict[str, dict[str, Any]] = {}
+        for e in scoped_events:
+            et = str(e.get("type") or "")
+            if et not in {"file_read", "file_write", "file_delete", "file_rename"}:
+                continue
+            path = str(e.get("path") or "")
+            if not path:
+                continue
+            ep = int(e.get("pid") or 0)
+            bucket = file_map.setdefault(path, {
+                "path": path, "read": False, "write": False, "rename": False,
+                "read_count": 0, "write_count": 0, "rename_count": 0,
+                "event_count": 0, "_pids": {},
+            })
+            if et == "file_read":
+                bucket["read"] = True
+                bucket["read_count"] += 1
+            if et in {"file_write", "file_delete", "file_rename"}:
+                bucket["write"] = True
+                bucket["write_count"] += 1
+            if et == "file_rename":
+                bucket["rename"] = True
+                bucket["rename_count"] += 1
+            bucket["event_count"] += 1
+            if ep > 0:
+                bucket["_pids"][ep] = pid_command.get(ep, "")
+
+        files_list: list[dict[str, Any]] = []
+        for info in file_map.values():
+            state = "read_write" if info["read"] and info["write"] else ("write" if info["write"] else "read")
+            files_list.append({
+                "path": info["path"],
+                "state": state,
+                "read": info["read"],
+                "write": info["write"],
+                "rename": info["rename"],
+                "read_count": info["read_count"],
+                "write_count": info["write_count"],
+                "rename_count": info["rename_count"],
+                "event_count": info["event_count"],
+                "pids": [{"pid": p, "command": c} for p, c in info["_pids"].items()],
+            })
+        files_list.sort(key=lambda x: str(x.get("path") or ""))
+        file_tree = self._file_tree(files_list) if files_list else {"name": "/", "kind": "dir", "children": [], "counts": {"read": 0, "write": 0, "rename": 0}}
+
+        # --- network ---
+        net_map: dict[str, dict[str, Any]] = {}
+        for e in scoped_events:
+            et = str(e.get("type") or "")
+            if et not in {"net_connect", "net_send", "net_recv"}:
+                continue
+            ne = self._with_inferred_net_dest(trace, e)
+            dest = self._network_display_label(ne)
+            ep = int(e.get("pid") or 0)
+            bucket = net_map.setdefault(dest, {
+                "dest": dest, "bytes_sent": 0, "bytes_recv": 0,
+                "count": 0, "connect_count": 0, "_pids": {},
+            })
+            if et == "net_connect":
+                bucket["connect_count"] += 1
+            if et == "net_send":
+                bucket["bytes_sent"] += int(ne.get("bytes") or 0)
+            elif et == "net_recv":
+                bucket["bytes_recv"] += int(ne.get("bytes") or 0)
+            bucket["count"] += 1
+            if ep > 0:
+                bucket["_pids"][ep] = pid_command.get(ep, "")
+
+        network_list: list[dict[str, Any]] = []
+        for info in net_map.values():
+            network_list.append({
+                "dest": info["dest"],
+                "bytes_sent": info["bytes_sent"],
+                "bytes_recv": info["bytes_recv"],
+                "count": info["count"],
+                "connect_count": info["connect_count"],
+                "pids": [{"pid": p, "command": c} for p, c in info["_pids"].items()],
+            })
+        network_list.sort(key=lambda x: str(x.get("dest") or ""))
+
+        # --- commands ---
+        commands_list: list[dict[str, Any]] = []
+        seen_commands: set[tuple[int, str]] = set()
+        for e in scoped_events:
+            if str(e.get("type") or "") != "command_exec":
+                continue
+            ep = int(e.get("pid") or 0)
+            cmd = str(e.get("command") or e.get("exec_path") or "").strip()
+            if not cmd or ep <= 0:
+                continue
+            key = (ep, cmd)
+            if key in seen_commands:
+                continue
+            seen_commands.add(key)
+            ppid = int(e.get("ppid") or 0)
+            commands_list.append({
+                "pid": ep,
+                "ppid": ppid,
+                "command": cmd,
+                "exec_path": str(e.get("exec_path") or "").strip(),
+            })
+
+        return {
+            "files": files_list,
+            "file_tree": file_tree,
+            "network": network_list,
+            "commands": commands_list,
+        }
+
     def display_trace(
         self,
         trace_id: str,
@@ -5893,6 +6023,8 @@ class TraceStore:
             }
         )
 
+        aggregated = self._aggregate_scope_data(trace, scoped_events)
+
         return {
             "trace_id": trace_id,
             "scope": {
@@ -5903,6 +6035,7 @@ class TraceStore:
             },
             "summary": summary,
             "timeline": timeline,
+            "aggregated": aggregated,
         }
 
     def process_subtrace(self, trace_id: str, turn_id: str, pid: int, full_lifecycle: bool = False) -> dict[str, Any]:

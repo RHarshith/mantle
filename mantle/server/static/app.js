@@ -1422,50 +1422,384 @@ function renderDisplayTraceSummary(summary) {
 }
 
 function renderDisplayTracePayload(payload, container, options = {}) {
-  const timeline = Array.isArray(payload && payload.timeline) ? payload.timeline : [];
-  const hiddenEventTypes = options.hiddenEventTypes instanceof Set ? options.hiddenEventTypes : new Set();
-  const visibleTimeline = coalesceConsecutiveFileGroups(
-    filterDisplayTraceTimeline(timeline, hiddenEventTypes)
-  );
   const scope = payload && payload.scope ? payload.scope : {};
   const summary = payload && payload.summary ? payload.summary : {};
-  const onSelectPid = typeof options.onSelectPid === "function" ? options.onSelectPid : null;
 
   const wrap = document.createElement("div");
   wrap.className = "process-trace-content";
   wrap.innerHTML = renderDisplayTraceSummary(summary);
 
-  const timelineWrap = document.createElement("div");
-  timelineWrap.className = "timeline-wrap";
-  if (!visibleTimeline.length) {
-    timelineWrap.innerHTML = '<div class="mono-text">No events captured for this scope.</div>';
-  } else {
-    for (const entry of visibleTimeline) {
-      timelineWrap.appendChild(
-        renderSystemGroup(entry, null, {
-          disableResourceDrilldown: true,
-          displayTraceContext: {
-            onSelectPid,
-            startTimestamp: scope.start_timestamp,
-            endTimestamp: scope.end_timestamp,
-          },
-        })
-      );
-    }
-  }
-
-  if (Number(scope.pid || 0) > 0) {
-    const details = document.createElement("details");
-    details.className = "timeline-root-collapsed";
-    details.innerHTML = `<summary>PID ${escapeHtml(String(scope.pid))} trace events</summary>`;
-    details.appendChild(timelineWrap);
-    wrap.appendChild(details);
-  } else {
-    wrap.appendChild(timelineWrap);
-  }
+  // --- Discovery Tabs (resource-centric view) ---
+  const discoveryHost = document.createElement("div");
+  discoveryHost.className = "discovery-host";
+  renderDiscoveryTabs(payload, discoveryHost, {});
+  wrap.appendChild(discoveryHost);
 
   container.innerHTML = "";
   container.appendChild(wrap);
+}
+
+/* ===================================================================
+ * Discovery-Oriented Event Viewer (resource-centric tabs)
+ * Replaces temporal timeline with Files / Network / Commands tabs
+ * that aggregate all events across all PIDs in the scope.
+ * =================================================================== */
+
+function _buildAggregatedFileTree(node, options) {
+  if (!node) return document.createElement("div");
+  const onFileClick = typeof options.onFileClick === "function" ? options.onFileClick : null;
+  const anomalyPaths = options.anomalyPaths instanceof Set ? options.anomalyPaths : new Set();
+
+  if (node.kind === "file") {
+    const row = document.createElement("div");
+    const state = String(node.state || "read");
+    const stateText = state === "read_write" ? "read/write" : state;
+    const isAnomaly = anomalyPaths.has(String(node.path || ""));
+    row.className = `tree-file tree-${state}${isAnomaly ? " tree-anomaly" : ""}`;
+
+    const opsText = [];
+    const rc = Number(node.read_count || 0);
+    const wc = Number(node.write_count || 0);
+    if (rc > 0) opsText.push(`${formatNumber(rc)} read${rc === 1 ? "" : "s"}`);
+    if (wc > 0) opsText.push(`${formatNumber(wc)} write${wc === 1 ? "" : "s"}`);
+    const tooltip = opsText.length ? opsText.join(", ") : "";
+
+    row.innerHTML = `
+      <span class="tree-name">${escapeHtml(node.name)}</span>
+      <span class="tree-meta">
+        <span class="tree-state">${escapeHtml(stateText)}</span>
+        ${isAnomaly ? '<span class="anomaly-indicator anomaly tree-anomaly-icon" title="anomaly detected"></span>' : ""}
+      </span>`;
+    if (tooltip) row.title = tooltip;
+    if (onFileClick) {
+      row.style.cursor = "pointer";
+      row.addEventListener("click", () => onFileClick(node));
+    }
+    return row;
+  }
+
+  // directory node
+  const details = document.createElement("details");
+  details.className = "tree-dir";
+  // Collapse by default for discovered trees to reduce visual noise
+  details.open = false;
+  const summary = document.createElement("summary");
+  summary.innerHTML = `<span>${escapeHtml(node.name || "/")}</span><span class="tree-pills">${renderCountPills(node.counts)}</span>`;
+  details.appendChild(summary);
+  for (const child of node.children || []) {
+    details.appendChild(_buildAggregatedFileTree(child, options));
+  }
+  return details;
+}
+
+function _renderResourceDetailPanel(items, options) {
+  const container = document.createElement("div");
+  container.className = "discovery-detail-panel";
+  if (!items || !items.length) {
+    container.innerHTML = '<div class="replay-empty">No events found for this resource.</div>';
+    return container;
+  }
+
+  const selectedTraceIdLocal = selectedTraceId;
+  for (const item of items) {
+    const pid = Number(item.pid || 0);
+    const cmd = String(item.command || "(unknown)");
+    const ts = item.timestamp != null ? new Date(Number(item.timestamp) * 1000).toISOString().replace("T", " ").slice(0, 19) : "";
+    const op = String(item.operation || item.type || "");
+
+    const row = document.createElement("div");
+    row.className = "discovery-detail-row";
+    row.innerHTML = `
+      <div class="discovery-detail-meta">
+        <span class="discovery-detail-pid">pid ${escapeHtml(String(pid))}</span>
+        <span class="discovery-detail-op op-badge op-${escapeHtml(op.replace("file_", "").replace("net_", ""))}">${escapeHtml(op)}</span>
+        ${ts ? `<span class="discovery-detail-ts">${escapeHtml(ts)}</span>` : ""}
+      </div>
+      <div class="discovery-detail-cmd mono-text" style="border:0;padding:2px 0;background:transparent;">${escapeHtml(cmd)}</div>
+    `;
+
+    if (pid > 0 && selectedTraceIdLocal) {
+      const openBtn = document.createElement("button");
+      openBtn.className = "inline-btn discovery-open-trace-btn";
+      openBtn.textContent = "Open Full Trace";
+      openBtn.title = `View all raw JSON events for PID ${pid} in a new tab`;
+      openBtn.addEventListener("click", async () => {
+        try {
+          const params = new URLSearchParams();
+          params.set("pid", String(pid));
+          const data = await api(`/api/traces/${encodeURIComponent(selectedTraceIdLocal)}/display-trace?${params.toString()}`);
+          const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+          const url = URL.createObjectURL(blob);
+          window.open(url, "_blank");
+        } catch (_err) {
+          alert("Failed to load full trace for this PID.");
+        }
+      });
+      row.querySelector(".discovery-detail-meta").appendChild(openBtn);
+    }
+
+    container.appendChild(row);
+  }
+  return container;
+}
+
+function renderDiscoveryTabs(payload, container, options = {}) {
+  const aggregated = payload && typeof payload.aggregated === "object" ? payload.aggregated : {};
+  const files = Array.isArray(aggregated.files) ? aggregated.files : [];
+  const fileTree = aggregated.file_tree || null;
+  const network = Array.isArray(aggregated.network) ? aggregated.network : [];
+  const commands = Array.isArray(aggregated.commands) ? aggregated.commands : [];
+  const anomalyReport = options.anomaly && typeof options.anomaly === "object" ? options.anomaly : null;
+  const scope = payload && payload.scope ? payload.scope : {};
+
+  // Build anomaly path set from violations
+  const anomalyPaths = new Set();
+  const anomalyDests = new Set();
+  if (anomalyReport) {
+    const violations = Array.isArray(anomalyReport.violations) ? anomalyReport.violations : [];
+    for (const v of violations) {
+      const p = String(v.path || v.resource || "");
+      if (p) anomalyPaths.add(p);
+      const d = v.dest_ip ? `${String(v.dest_ip)}:${String(v.dest_port || 0)}` : "";
+      if (d) anomalyDests.add(d);
+    }
+  }
+
+  // Build pid->command map for detail events
+  const pidCommandMap = {};
+  for (const cmd of commands) {
+    if (cmd.pid) pidCommandMap[cmd.pid] = String(cmd.command || "");
+  }
+  // Also from files.pids
+  for (const f of files) {
+    for (const p of f.pids || []) {
+      if (p.pid && p.command) pidCommandMap[p.pid] = String(p.command);
+    }
+  }
+
+  const wrap = document.createElement("div");
+  wrap.className = "discovery-wrap";
+
+  // --- Tab bar ---
+  const tabBar = document.createElement("div");
+  tabBar.className = "discovery-tab-bar";
+  const tabs = [
+    { id: "files", label: `Files (${formatNumber(files.length)})` },
+    { id: "network", label: `Network (${formatNumber(network.length)})` },
+    { id: "commands", label: `Commands (${formatNumber(commands.length)})` },
+  ];
+  let activeDiscoveryTab = "files";
+
+  function renderActiveTab() {
+    const contentEl = wrap.querySelector(".discovery-content");
+    const detailEl = wrap.querySelector(".discovery-detail");
+    if (!contentEl) return;
+    contentEl.innerHTML = "";
+    if (detailEl) {
+      detailEl.innerHTML = '<div class="replay-empty">Select a file, network endpoint, or command above to view its timeline.</div>';
+    }
+
+    // Highlight active tab button
+    tabBar.querySelectorAll(".discovery-tab").forEach((btn) => {
+      btn.classList.toggle("active", btn.getAttribute("data-tab") === activeDiscoveryTab);
+    });
+
+    if (activeDiscoveryTab === "files") {
+      if (!fileTree || !files.length) {
+        contentEl.innerHTML = '<div class="replay-empty">No file activity in this scope.</div>';
+        return;
+      }
+      const treeWrap = document.createElement("div");
+      treeWrap.className = "discovery-file-tree";
+      treeWrap.appendChild(_buildAggregatedFileTree(fileTree, {
+        anomalyPaths,
+        onFileClick: (node) => {
+          if (!detailEl) return;
+          const path = String(node.path || "");
+          // Find all file events matching this path and build detail items
+          const matchingFile = files.find((f) => f.path === path);
+          if (!matchingFile) return;
+          const items = (matchingFile.pids || []).map((p) => ({
+            pid: p.pid,
+            command: p.command || pidCommandMap[p.pid] || "(unknown)",
+            operation: matchingFile.state === "read_write" ? "read+write" : matchingFile.state,
+            type: matchingFile.state,
+          }));
+          detailEl.innerHTML = "";
+          const heading = document.createElement("div");
+          heading.className = "discovery-detail-heading";
+          heading.innerHTML = `<span class="detail-title">${escapeHtml(path)}</span><span class="row-sub">${formatNumber(matchingFile.event_count || 0)} events across ${formatNumber(items.length)} process${items.length === 1 ? "" : "es"}</span>`;
+          detailEl.appendChild(heading);
+          detailEl.appendChild(_renderResourceDetailPanel(items, {}));
+          // Highlight selected file in tree
+          contentEl.querySelectorAll(".tree-file").forEach((el) => el.classList.remove("discovery-selected"));
+          contentEl.querySelectorAll(".tree-file").forEach((el) => {
+            if (el.querySelector(".tree-name") && el.querySelector(".tree-name").textContent === node.name) {
+              el.classList.add("discovery-selected");
+            }
+          });
+        },
+      }));
+      // Auto-expand anomalous folders
+      if (anomalyPaths.size > 0) {
+        treeWrap.querySelectorAll("details.tree-dir").forEach((det) => {
+          // Check if any child is anomalous
+          if (det.querySelector(".tree-anomaly")) {
+            det.open = true;
+          }
+        });
+      }
+      contentEl.appendChild(treeWrap);
+
+    } else if (activeDiscoveryTab === "network") {
+      if (!network.length) {
+        contentEl.innerHTML = '<div class="replay-empty">No network activity in this scope.</div>';
+        return;
+      }
+      const list = document.createElement("div");
+      list.className = "discovery-net-list";
+      for (const ep of network) {
+        const dest = String(ep.dest || "");
+        const isAnomaly = anomalyDests.has(dest) || Array.from(anomalyDests).some((d) => dest.includes(d));
+        const row = document.createElement("button");
+        row.className = `discovery-net-row${isAnomaly ? " discovery-net-anomaly" : ""}`;
+        row.innerHTML = `
+          <div class="discovery-net-dest">
+            ${escapeHtml(dest)}
+            ${isAnomaly ? '<span class="anomaly-indicator anomaly" title="anomaly detected"></span>' : ""}
+          </div>
+          <div class="discovery-net-stats">
+            <span class="row-sub">${formatNumber(ep.connect_count || 0)} connects · tx ${formatNumber(ep.bytes_sent || 0)}B · rx ${formatNumber(ep.bytes_recv || 0)}B</span>
+          </div>`;
+        row.addEventListener("click", () => {
+          if (!detailEl) return;
+          const items = (ep.pids || []).map((p) => ({
+            pid: p.pid,
+            command: p.command || pidCommandMap[p.pid] || "(unknown)",
+            operation: "net_connect",
+            type: "connect",
+          }));
+          detailEl.innerHTML = "";
+          const heading = document.createElement("div");
+          heading.className = "discovery-detail-heading";
+          heading.innerHTML = `<span class="detail-title">${escapeHtml(dest)}</span><span class="row-sub">${formatNumber(ep.count || 0)} events across ${formatNumber(items.length)} process${items.length === 1 ? "" : "es"}</span>`;
+          detailEl.appendChild(heading);
+          detailEl.appendChild(_renderResourceDetailPanel(items, {}));
+          // Highlight
+          list.querySelectorAll(".discovery-net-row").forEach((el) => el.classList.remove("discovery-selected"));
+          row.classList.add("discovery-selected");
+        });
+        list.appendChild(row);
+      }
+      contentEl.appendChild(list);
+
+    } else if (activeDiscoveryTab === "commands") {
+      if (!commands.length) {
+        contentEl.innerHTML = '<div class="replay-empty">No commands spawned in this scope.</div>';
+        return;
+      }
+      const list = document.createElement("div");
+      list.className = "discovery-cmd-list";
+      for (const cmd of commands) {
+        const row = document.createElement("button");
+        row.className = "discovery-cmd-row";
+        row.innerHTML = `
+          <div class="discovery-cmd-text">${escapeHtml(cmd.command || "")}</div>
+          <div class="discovery-cmd-meta">
+            <span class="row-sub">pid ${escapeHtml(String(cmd.pid || ""))}</span>
+            ${cmd.ppid ? `<span class="row-sub">ppid ${escapeHtml(String(cmd.ppid))}</span>` : ""}
+          </div>`;
+        row.addEventListener("click", () => {
+          if (!detailEl) return;
+          const pid = Number(cmd.pid || 0);
+          // Find all files touched by this PID
+          const touchedFiles = files.filter((f) => (f.pids || []).some((p) => p.pid === pid));
+          const touchedNet = network.filter((n) => (n.pids || []).some((p) => p.pid === pid));
+
+          detailEl.innerHTML = "";
+          const heading = document.createElement("div");
+          heading.className = "discovery-detail-heading";
+          heading.innerHTML = `<span class="detail-title">pid ${escapeHtml(String(pid))} · ${escapeHtml(cmd.command || "")}</span><span class="row-sub">${formatNumber(touchedFiles.length)} files · ${formatNumber(touchedNet.length)} network endpoints</span>`;
+          detailEl.appendChild(heading);
+
+          // Show files and network touched by this command
+          const items = [
+            ...touchedFiles.map((f) => ({ pid, command: cmd.command, operation: f.state, type: f.state, resource: f.path })),
+            ...touchedNet.map((n) => ({ pid, command: cmd.command, operation: "connect", type: "connect", resource: n.dest })),
+          ];
+          if (items.length) {
+            for (const item of items) {
+              const el = document.createElement("div");
+              el.className = "discovery-detail-row";
+              el.innerHTML = `
+                <div class="discovery-detail-meta">
+                  <span class="discovery-detail-op op-badge op-${escapeHtml(String(item.type).replace("file_", "").replace("net_", ""))}">${escapeHtml(item.operation || "")}</span>
+                  <span class="mono-text" style="border:0;padding:0;background:transparent;font-size:11px;">${escapeHtml(item.resource || "")}</span>
+                </div>`;
+              detailEl.appendChild(el);
+            }
+          } else {
+            detailEl.appendChild(_renderResourceDetailPanel([], {}));
+          }
+
+          // Open Full Trace button
+          if (pid > 0 && selectedTraceId) {
+            const btnWrap = document.createElement("div");
+            btnWrap.style.marginTop = "8px";
+            const openBtn = document.createElement("button");
+            openBtn.className = "inline-btn discovery-open-trace-btn";
+            openBtn.textContent = "Open Full Trace for this PID";
+            openBtn.addEventListener("click", async () => {
+              try {
+                const params = new URLSearchParams();
+                params.set("pid", String(pid));
+                const data = await api(`/api/traces/${encodeURIComponent(selectedTraceId)}/display-trace?${params.toString()}`);
+                const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+                window.open(URL.createObjectURL(blob), "_blank");
+              } catch (_err) {
+                alert("Failed to load full trace for this PID.");
+              }
+            });
+            btnWrap.appendChild(openBtn);
+            detailEl.appendChild(btnWrap);
+          }
+
+          // Highlight
+          list.querySelectorAll(".discovery-cmd-row").forEach((el) => el.classList.remove("discovery-selected"));
+          row.classList.add("discovery-selected");
+        });
+        list.appendChild(row);
+      }
+      contentEl.appendChild(list);
+    }
+  }
+
+  for (const tab of tabs) {
+    const btn = document.createElement("button");
+    btn.className = `discovery-tab${tab.id === activeDiscoveryTab ? " active" : ""}`;
+    btn.setAttribute("data-tab", tab.id);
+    btn.textContent = tab.label;
+    btn.addEventListener("click", () => {
+      activeDiscoveryTab = tab.id;
+      renderActiveTab();
+    });
+    tabBar.appendChild(btn);
+  }
+  wrap.appendChild(tabBar);
+
+  // --- Content area ---
+  const contentArea = document.createElement("div");
+  contentArea.className = "discovery-content";
+  wrap.appendChild(contentArea);
+
+  // --- Detail panel ---
+  const detailPanel = document.createElement("div");
+  detailPanel.className = "discovery-detail";
+  detailPanel.innerHTML = '<div class="replay-empty">Select a file, network endpoint, or command above to view its timeline.</div>';
+  wrap.appendChild(detailPanel);
+
+  container.appendChild(wrap);
+  renderActiveTab();
 }
 
 async function display_trace(pid = null, start_timestamp = null, end_timestamp = null, options = {}) {
@@ -1632,39 +1966,14 @@ function renderProcessTracePopup(payload, turnId, toolName, options = {}) {
   if (Number(s.files_written || 0) > 0) rootPills.push(`writes ${formatNumber(s.files_written)}`);
   if (Number(s.network_calls || 0) > 0) rootPills.push(`network ${formatNumber(s.network_calls)}`);
   meta.innerHTML = rootPills.map((label) => `<span class="op-pill op-rename">${escapeHtml(label)}</span>`).join("");
-
-  const processTree = document.createElement("div");
-  processTree.className = "proc-list";
-  const execCommands = Array.isArray(s.exec_commands) ? s.exec_commands : [];
-
-  if (execCommands.length) {
-    const cmds = document.createElement("div");
-    cmds.className = "timeline-row row-process";
-    cmds.innerHTML = `
-      <div class="timeline-head">
-        <span class="row-title">Exec Commands</span>
-        <span class="row-sub">pid ${escapeHtml(String(s.pid || payload.pid || "-"))}</span>
-      </div>
-      <div class="row-content"><pre class="mono-block">${escapeHtml(execCommands.join("\n"))}</pre></div>`;
-    processTree.appendChild(cmds);
-  }
-
-  for (const entry of visibleTimeline) {
-    processTree.appendChild(
-      renderSystemGroup(entry, null, {
-        disableResourceDrilldown: true,
-        recursiveProcessExpand: true,
-        displayTraceContext: {
-          onSelectPid: options.onSelectPid,
-          startTimestamp: options.startTimestamp,
-          endTimestamp: options.endTimestamp,
-        },
-      })
-    );
-  }
-
   wrap.appendChild(meta);
-  wrap.appendChild(processTree);
+
+  // --- Discovery Tabs (resource-centric view) ---
+  const discoveryHost = document.createElement("div");
+  discoveryHost.className = "discovery-host";
+  renderDiscoveryTabs(payload, discoveryHost, { anomaly: anomalyReport });
+  wrap.appendChild(discoveryHost);
+
   bodyEl.innerHTML = "";
   bodyEl.appendChild(wrap);
   overlay.classList.add("open");
@@ -2958,6 +3267,58 @@ function installStyles() {
     .replay-metrics-overlay { position:fixed; inset:0; background:rgba(15,23,42,0.38); display:none; align-items:center; justify-content:center; padding:18px; z-index:1100; }
     .replay-metrics-overlay.open { display:flex; }
     .replay-metrics-modal { width:min(980px, 96vw); max-height:88vh; background:var(--surface); border:1px solid var(--border); border-radius:12px; box-shadow:0 20px 42px rgba(15,23,42,0.2); display:flex; flex-direction:column; overflow:hidden; }
+
+    /* === Discovery Tabs (event viewer redesign) === */
+    .discovery-wrap { display:flex; flex-direction:column; gap:0; border:1px solid var(--border); border-radius:10px; overflow:hidden; background:var(--surface); }
+    .discovery-host { margin-top:10px; }
+    .discovery-tab-bar { display:flex; gap:0; border-bottom:1px solid var(--border); background:var(--slate-50); }
+    .discovery-tab { flex:1; border:0; border-bottom:3px solid transparent; background:transparent; padding:10px 14px; font-size:12px; font-weight:700; color:var(--text-secondary); cursor:pointer; transition:all .15s; text-align:center; }
+    .discovery-tab:hover { background:var(--slate-100); color:var(--text-primary); }
+    .discovery-tab.active { background:var(--surface); color:var(--blue-600); border-bottom-color:var(--blue-500); }
+    .discovery-content { padding:10px; max-height:40vh; overflow:auto; min-height:100px; }
+    .discovery-file-tree { }
+    .discovery-file-tree .tree-dir { margin-left:4px; }
+    .discovery-file-tree .tree-file { transition:all .12s; }
+    .discovery-file-tree .tree-file.discovery-selected { background:var(--blue-50); box-shadow:inset 3px 0 0 var(--blue-500); }
+
+    /* Anomaly highlights on tree nodes */
+    .tree-anomaly { border-color:var(--red-200) !important; background:var(--red-50) !important; }
+    .tree-anomaly .tree-name { color:var(--red-600); font-weight:700; }
+    .tree-anomaly-icon { margin-left:4px; }
+
+    /* Network list */
+    .discovery-net-list { display:flex; flex-direction:column; gap:6px; }
+    .discovery-net-row { border:1px solid var(--border); border-radius:8px; background:var(--surface); text-align:left; padding:8px 10px; cursor:pointer; transition:all .12s; width:100%; }
+    .discovery-net-row:hover { background:var(--slate-50); border-color:var(--slate-300); }
+    .discovery-net-row.discovery-selected { background:var(--blue-50); box-shadow:inset 3px 0 0 var(--blue-500); }
+    .discovery-net-anomaly { border-color:var(--red-200); background:var(--red-50); }
+    .discovery-net-anomaly:hover { background:var(--red-100); }
+    .discovery-net-dest { font-size:12px; font-weight:600; font-family:Consolas, Monaco, monospace; color:var(--text-primary); display:flex; align-items:center; gap:6px; }
+    .discovery-net-stats { margin-top:3px; }
+
+    /* Commands list */
+    .discovery-cmd-list { display:flex; flex-direction:column; gap:6px; }
+    .discovery-cmd-row { border:1px solid var(--border); border-radius:8px; background:var(--surface); text-align:left; padding:8px 10px; cursor:pointer; transition:all .12s; width:100%; }
+    .discovery-cmd-row:hover { background:var(--slate-50); border-color:var(--slate-300); }
+    .discovery-cmd-row.discovery-selected { background:var(--blue-50); box-shadow:inset 3px 0 0 var(--blue-500); }
+    .discovery-cmd-text { font-size:12px; font-weight:600; font-family:Consolas, Monaco, monospace; color:var(--text-primary); word-break:break-all; }
+    .discovery-cmd-meta { margin-top:3px; display:flex; gap:8px; }
+
+    /* Detail panel (contextual drill-down) */
+    .discovery-detail { padding:10px; border-top:1px solid var(--border); background:var(--slate-50); min-height:60px; max-height:36vh; overflow:auto; }
+    .discovery-detail-heading { display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; margin-bottom:8px; padding-bottom:6px; border-bottom:1px solid var(--border); }
+    .discovery-detail-heading .detail-title { font-size:13px; font-weight:700; font-family:Consolas, Monaco, monospace; color:var(--text-primary); word-break:break-all; }
+    .discovery-detail-panel { display:flex; flex-direction:column; gap:6px; }
+    .discovery-detail-row { border:1px solid var(--border-light); border-radius:6px; background:var(--surface); padding:6px 8px; }
+    .discovery-detail-meta { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+    .discovery-detail-pid { font-size:11px; font-weight:700; color:var(--text-secondary); font-family:Consolas, Monaco, monospace; }
+    .discovery-detail-op { }
+    .discovery-detail-ts { font-size:10px; color:var(--text-muted); font-variant-numeric:tabular-nums; }
+    .discovery-detail-cmd { font-size:11px; }
+
+    /* Open Full Trace button */
+    .discovery-open-trace-btn { margin-left:auto; border:1px solid var(--blue-100); background:var(--blue-50); color:var(--blue-600); border-radius:999px; padding:2px 10px; font-size:10px; font-weight:700; cursor:pointer; transition:all .15s; white-space:nowrap; }
+    .discovery-open-trace-btn:hover { background:var(--blue-100); border-color:var(--blue-200); }
 
     @media (max-width: 1200px) {
       .turn-exec-summary { grid-template-columns: repeat(3, 1fr); }
