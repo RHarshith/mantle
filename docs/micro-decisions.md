@@ -1,5 +1,9 @@
 # Micro Decisions
 
+- 2026-04-21: Implemented tool anomaly detection with current syscall capture only (file/process/network), explicitly deferring env-var read and chmod/chown checks until capture support exists. Reason: current eBPF event schema does not include those signals; shipping supported checks now avoids blocking the feature.
+- 2026-04-21: For Rule 2 unexpected network activity, unknown binaries are skipped instead of flagged low severity. Reason: prototype focus is reducing alert fatigue and false positives in heterogeneous toolchains.
+- 2026-04-21: Fixed tool-call anomaly scoping to enforce tool start/finish timestamp bounds even when root pid lineage is available. Reason: root-pid line-range matching alone can include descendant events after tool completion, causing out-of-window false anomalies.
+
 - 2026-04-19: Added compose startup preflight in `Makefile` and `bin/mantle` to create `<repo>/.mantle` before `docker compose up`. Reason: with repo code mounted read-only at `/app`, nested bind mount target `/app/.mantle` must already exist in the mounted repo tree or container init fails with read-only mountpoint creation errors.
 - 2026-04-20: Preserved `mantle watch` wrapped-command exit status by returning the agent process code explicitly and forcing cleanup trap success. Reason: EXIT-trap postamble checks must not flip successful runs to exit code 1.
 - 2026-04-20: Updated proxy-log correlation fallback so multiple unmatched `*.log` files no longer fail `TraceStore.poll_once`; unmatched traces continue ingesting eBPF/native events without proxy payload mapping unless explicitly configured. Reason: ambiguous shared proxy logs should not block dashboard DB freshness for non-LLM traces.

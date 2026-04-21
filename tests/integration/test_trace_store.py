@@ -596,6 +596,198 @@ class TestDisplayTraceView:
 
 
 @pytest.mark.integration
+class TestToolAnomalyWindowScoping:
+    def test_tool_anomaly_excludes_events_outside_tool_window(self, tmp_path: Path):
+        obs = tmp_path / "obs"
+        traces_dir = obs / "traces"
+        events_dir = obs / "events"
+        traces_dir.mkdir(parents=True)
+        events_dir.mkdir(parents=True)
+
+        trace_id = "tool_anomaly_window_scope.ebpf.jsonl"
+        trace_events = [
+            {
+                "ts": 1710000600.0,
+                "line_no": 1,
+                "type": "command_exec",
+                "pid": 100,
+                "ppid": 1,
+                "exec_path": "/usr/bin/python3",
+                "argv": ["python3", "script.py"],
+                "command": "python3 script.py",
+            },
+            {
+                "ts": 1710000600.05,
+                "line_no": 2,
+                "type": "file_read",
+                "pid": 100,
+                "path": "/tmp/script.py",
+            },
+            # Outside tool time window: should not be counted for this tool.
+            {
+                "ts": 1710000602.0,
+                "line_no": 3,
+                "type": "file_read",
+                "pid": 100,
+                "path": "/home/user/.ssh/id_rsa",
+            },
+            {
+                "ts": 1710000602.1,
+                "line_no": 4,
+                "type": "process_exit",
+                "pid": 100,
+            },
+        ]
+
+        (traces_dir / trace_id).write_text(
+            "\n".join(json.dumps(event) for event in trace_events) + "\n",
+            encoding="utf-8",
+        )
+
+        agent_events = [
+            {
+                "ts": 1710000600.0,
+                "monotonic_ns": 0,
+                "trace_id": "test-trace",
+                "session_id": "test-session",
+                "seq": 1,
+                "event_type": "tool_call_started",
+                "payload": {
+                    "tool_call_id": "tc_1",
+                    "tool_name": "python3",
+                    "arguments": {"command": "python3 script.py"},
+                },
+            },
+            {
+                "ts": 1710000600.2,
+                "monotonic_ns": 200000000,
+                "trace_id": "test-trace",
+                "session_id": "test-session",
+                "seq": 2,
+                "event_type": "tool_call_finished",
+                "payload": {
+                    "tool_call_id": "tc_1",
+                    "tool_name": "python3",
+                    "result": {"ok": True},
+                },
+            },
+        ]
+
+        (events_dir / "tool_anomaly_window_scope.events.jsonl").write_text(
+            "\n".join(json.dumps(event) for event in agent_events) + "\n",
+            encoding="utf-8",
+        )
+
+        store = TraceStore(trace_dir=traces_dir, events_dir=events_dir, proxy_dir=None)
+        asyncio.get_event_loop().run_until_complete(store.poll_once())
+
+        summary = store.tool_summary(trace_id, "tc_1")
+        anomalies = summary.get("anomalies") or {}
+        violations = anomalies.get("violations") or []
+
+        assert anomalies.get("verdict") == "CLEAN"
+        assert not violations
+
+
+@pytest.mark.integration
+class TestOutsideToolAnomalyAssociation:
+    def test_sensitive_access_outside_tool_window_surfaces_in_turn_and_raw_events(self, tmp_path: Path):
+        obs = tmp_path / "obs"
+        traces_dir = obs / "traces"
+        events_dir = obs / "events"
+        traces_dir.mkdir(parents=True)
+        events_dir.mkdir(parents=True)
+
+        trace_id = "outside_tool_sensitive_access.ebpf.jsonl"
+        trace_events = [
+            {
+                "ts": 1710000700.0,
+                "line_no": 1,
+                "type": "command_exec",
+                "pid": 100,
+                "ppid": 1,
+                "exec_path": "/usr/bin/python3",
+                "argv": ["python3", "script.py"],
+                "command": "python3 script.py",
+            },
+            {
+                "ts": 1710000700.05,
+                "line_no": 2,
+                "type": "file_read",
+                "pid": 100,
+                "path": "/tmp/script.py",
+            },
+            {
+                "ts": 1710000700.7,
+                "line_no": 3,
+                "type": "file_read",
+                "pid": 100,
+                "path": "/etc/passwd",
+            },
+            {
+                "ts": 1710000700.75,
+                "line_no": 4,
+                "type": "process_exit",
+                "pid": 100,
+            },
+        ]
+
+        (traces_dir / trace_id).write_text(
+            "\n".join(json.dumps(event) for event in trace_events) + "\n",
+            encoding="utf-8",
+        )
+
+        agent_events = [
+            {
+                "ts": 1710000700.0,
+                "monotonic_ns": 0,
+                "trace_id": "test-trace",
+                "session_id": "test-session",
+                "seq": 1,
+                "event_type": "tool_call_started",
+                "payload": {
+                    "tool_call_id": "tc_1",
+                    "tool_name": "python3",
+                    "arguments": {"command": "python3 script.py"},
+                },
+            },
+            {
+                "ts": 1710000700.2,
+                "monotonic_ns": 200000000,
+                "trace_id": "test-trace",
+                "session_id": "test-session",
+                "seq": 2,
+                "event_type": "tool_call_finished",
+                "payload": {
+                    "tool_call_id": "tc_1",
+                    "tool_name": "python3",
+                    "result": {"ok": True},
+                },
+            },
+        ]
+
+        (events_dir / "outside_tool_sensitive_access.events.jsonl").write_text(
+            "\n".join(json.dumps(event) for event in agent_events) + "\n",
+            encoding="utf-8",
+        )
+
+        store = TraceStore(trace_dir=traces_dir, events_dir=events_dir, proxy_dir=None)
+        asyncio.get_event_loop().run_until_complete(store.poll_once())
+
+        tool_summary = store.tool_summary(trace_id, "tc_1")
+        assert (tool_summary.get("anomalies") or {}).get("verdict") == "CLEAN"
+
+        replay = store.replay_turn_detail(trace_id, "turn_1")
+        assert ((replay.get("summary") or {}).get("anomaly") or {}).get("verdict") == "VIOLATION"
+        assert replay.get("raw_events_has_anomaly") is True
+
+        raw_report = replay.get("raw_events_anomaly") or {}
+        raw_violations = raw_report.get("violations") or []
+        assert raw_report.get("verdict") == "VIOLATION"
+        assert any(str(item.get("resource") or "") == "/etc/passwd" for item in raw_violations)
+
+
+@pytest.mark.integration
 class TestTraceStoreDelete:
     """Test trace deletion."""
 

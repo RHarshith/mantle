@@ -11,6 +11,34 @@ Define exact API response shapes used by dashboard analysis features, with repla
 
 ## Endpoint Contract Set (Replay-Critical)
 
+## Anomaly Report Shape
+
+When present, anomaly payloads follow this structure:
+
+```json
+{
+  "verdict": "CLEAN|SUSPICIOUS|VIOLATION",
+  "has_anomaly": false,
+  "summary": "verified tool call",
+  "total_violations": 0,
+  "severity_counts": {"LOW": 0, "MEDIUM": 0, "HIGH": 0}
+}
+```
+
+Tool-level anomaly reports may also include detailed fields:
+
+```json
+{
+  "command": "python3 script.py",
+  "root_pid": 123,
+  "violations": [],
+  "unsupported_checks": [
+    "sensitive_env_var_reads_not_captured",
+    "chmod_chown_outside_scope_not_captured"
+  ]
+}
+```
+
 ### 1) Replay turn list
 
 `GET /api/traces/{trace_id}/replay-turns`
@@ -77,7 +105,8 @@ Define exact API response shapes used by dashboard analysis features, with repla
       "response": {},
       "started_ts": 1776182079.48,
       "finished_ts": 1776182079.49,
-      "source": {"status": "matched", "pid": 522158}
+      "source": {"status": "matched", "pid": 522158},
+      "anomaly": {"verdict": "CLEAN", "has_anomaly": false, "summary": "verified tool call", "total_violations": 0, "severity_counts": {"LOW": 0, "MEDIUM": 0, "HIGH": 0}}
     }
   ],
   "summary": {
@@ -89,6 +118,7 @@ Define exact API response shapes used by dashboard analysis features, with repla
     "network_calls": 0,
     "context_sections": 4,
     "action_sections": 3,
+    "anomaly": {"verdict": "CLEAN", "has_anomaly": false, "summary": "verified tool call", "total_violations": 0, "severity_counts": {"LOW": 0, "MEDIUM": 0, "HIGH": 0}},
     "tool_call_pairs": [],
     "file_activity": {"read_paths": [], "write_paths": [], "tree": {}},
     "subprocesses": []
@@ -115,8 +145,10 @@ Define exact API response shapes used by dashboard analysis features, with repla
     "files_read": 0,
     "files_written": 1,
     "subprocesses_spawned": 0,
-    "network_calls": 0
+    "network_calls": 0,
+    "anomaly": {"verdict": "CLEAN", "has_anomaly": false, "summary": "verified tool call", "total_violations": 0, "severity_counts": {"LOW": 0, "MEDIUM": 0, "HIGH": 0}}
   },
+  "anomaly": {"verdict": "CLEAN", "has_anomaly": false, "summary": "verified tool call", "total_violations": 0, "severity_counts": {"LOW": 0, "MEDIUM": 0, "HIGH": 0}},
   "prompt_text": "...",
   "response_text": "...",
   "prompt_sections": [],
@@ -227,6 +259,22 @@ Rules:
 - `pid` present + timestamps omitted: infer lifecycle window from process start/fork to exit.
 - `pid` present + timestamps present: apply pid-descendant filter and timestamp filter.
 - frontend raw-event viewers must call this endpoint for both replay raw-tab and source-pid popup flows.
+
+## Additional Anomaly-Carrying Endpoints
+
+- `GET /api/traces` trace rows include:
+  - `anomaly` (Anomaly Report Shape)
+  - `anomaly_verdict`
+  - `anomaly_detected`
+
+- `GET /api/traces/{trace_id}/summary` includes:
+  - `anomaly` (Anomaly Report Shape)
+
+- `GET /api/traces/{trace_id}/tool-summary/{tool_call_id}` includes:
+  - `anomalies` (tool-level anomaly report)
+
+- `GET /api/traces/{trace_id}/tool-graph/{tool_call_id}` includes:
+  - `anomalies` (tool-level anomaly report)
 
 ## Additional Dashboard Metrics API (Overview Tabs)
 

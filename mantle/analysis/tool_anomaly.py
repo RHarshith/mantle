@@ -299,7 +299,7 @@ class ToolAnomalyDetector:
                 _ensure_process(ppid)
                 child_map[ppid].add(pid)
 
-        for pid, proc in proc_map.items():
+        for pid, proc in list(proc_map.items()):
             ppid = int(proc.get("ppid") or process_parent.get(pid, 0) or 0)
             if ppid > 0 and ppid != pid:
                 child_map[ppid].add(pid)
@@ -776,10 +776,21 @@ def aggregate_tool_anomaly_reports(reports: list[dict[str, Any]]) -> dict[str, A
     severity_counts = Counter()
     total_violations = 0
     for report in valid:
+        # Aggregate from nested severity_counts if available (e.g. from aggregated turn reports)
+        if isinstance(report.get("severity_counts"), dict):
+            for sev, count in report["severity_counts"].items():
+                severity_counts[str(sev).upper()] += int(count)
+        
+        # Also aggregate raw violations if present
         violations = report.get("violations") if isinstance(report.get("violations"), list) else []
-        total_violations += len(violations)
-        for violation in violations:
-            severity_counts[str(violation.get("severity") or "LOW").upper()] += 1
+        if "total_violations" in report:
+            total_violations += int(report["total_violations"])
+        else:
+            total_violations += len(violations)
+            
+        if not isinstance(report.get("severity_counts"), dict):
+            for violation in violations:
+                severity_counts[str(violation.get("severity") or "LOW").upper()] += 1
 
     verdict = "CLEAN"
     if severity_counts.get("HIGH", 0) > 0 or severity_counts.get("MEDIUM", 0) > 0:

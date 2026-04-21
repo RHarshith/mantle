@@ -280,6 +280,9 @@ watch_cmd() {
 
     local cgroup_path
     cgroup_path="/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)"
+    
+    local agent_cgroup="$cgroup_path/agent"
+    mkdir -p "$agent_cgroup"
 
     local proxy_control_url="${MANTLE_PROXY_CONTROL_URL:-http://127.0.0.1:4000/mantle/active-trace}"
 
@@ -292,7 +295,7 @@ watch_cmd() {
     echo "  Agent:   $executable"
     echo "  Task:    ${task_args[*]:-<interactive>}"
     echo "  Trace:   $trace_id"
-    echo "  Cgroup:  $cgroup_path"
+    echo "  Cgroup:  $agent_cgroup"
     echo "  Output:  $output_file"
     echo "═══════════════════════════════════════════════════════════"
 
@@ -314,7 +317,7 @@ try:
 except Exception as e:
     print(str(e), file=sys.stderr)
     sys.exit(1)
-' "$cgroup_path" "$trace_id" "$container_output_file" "$agent_tag"; then
+' "$agent_cgroup" "$trace_id" "$container_output_file" "$agent_tag"; then
         echo "Error: could not start eBPF trace." >&2
     echo "Hint: ensure services are running (for example: make build)." >&2
         exit 1
@@ -356,7 +359,10 @@ except Exception:
     # Run the agent
     local agent_rc=0
     echo "[*] Running $executable..."
-    "$resolved_executable" ${task_args[@]+"${task_args[@]}"} || agent_rc=$?
+    (
+        echo $BASHPID > "$agent_cgroup/cgroup.procs"
+        exec "$resolved_executable" ${task_args[@]+"${task_args[@]}"}
+    ) || agent_rc=$?
     return "$agent_rc"
 }
 

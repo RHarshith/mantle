@@ -27,10 +27,17 @@ Required `GET /api/traces` fields per trace row:
 - `status` (`active` or `completed`)
 - `agent_event_count`
 - `sys_event_count`
+- `anomaly` (optional anomaly report)
+- `anomaly_verdict` (optional shorthand)
+- `anomaly_detected` (optional shorthand)
 
 UI behavior:
 
 - every trace row shows trace id and status badge
+- every trace row shows anomaly status icon:
+  - red exclamation when anomaly exists
+  - green check when verified clean
+  - tooltip text must be exactly `anomaly detected` or `verified tool call`
 - traces are grouped by process buckets stored in localStorage
 - delete button calls `DELETE /api/traces/{trace_id}`
 
@@ -41,6 +48,7 @@ Required from `GET /api/traces/{trace_id}/replay-turns`:
 - top-level: `trace_id`, `turns[]`
 - per turn item:
   - `turn_id`, `label`, `tool_call_count`, `context_section_count`, `action_section_count`
+  - `anomaly` (optional anomaly report)
 
 Rendered output:
 
@@ -48,6 +56,7 @@ Rendered output:
   - title: `label || turn_id`
   - metadata: `ctx <count> · act <count>`
   - tools badge: `<tool_call_count> tools`
+  - anomaly icon with same red/green + tooltip semantics as trace list
 
 ## Replay Turn Detail Contract
 
@@ -57,6 +66,7 @@ Required from `GET /api/traces/{trace_id}/replay-turns/{turn_id}`:
 - `action.sections[]`
 - `summary`
 - `tool_call_response_pairs[]`
+- top-level `anomaly` (optional anomaly report)
 
 Replay detail tabs must include:
 
@@ -98,6 +108,7 @@ Each tool pair card must show:
 - arguments JSON
 - response preview (truncated, expandable)
 - source link if `source.pid > 0`, else source missing text
+- anomaly status icon using the same tooltip semantics
 
 ### Summary tab
 
@@ -145,6 +156,9 @@ Popup must show:
 - grouped timeline rows for process/file/network activity
 - recursive child-pid drilldown via the same renderer function
 - the same compact/detailed switch and hidden-event filtering behavior as Raw Events tab
+- when opened from an anomalous tool-call source, an anomaly detail panel with:
+  - anomaly summary sentence
+  - list of rule violations
 
 ## State Diff Contract
 

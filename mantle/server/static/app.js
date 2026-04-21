@@ -2256,6 +2256,9 @@ function renderReplayDetail(payload) {
   const isAction = currentReplayPaneTab === "action";
   const isSummary = currentReplayPaneTab === "summary";
   const isRawEvents = currentReplayPaneTab === "raw_events";
+  const rawEventsAnomaly = normalizeAnomaly((payload || {}).raw_events_anomaly || null);
+  const rawEventsHasAnomaly = Boolean((payload || {}).raw_events_has_anomaly || rawEventsAnomaly.has_anomaly || rawEventsAnomaly.verdict !== "CLEAN");
+  const rawEventsTabAnomalyHtml = rawEventsHasAnomaly ? anomalyIndicatorHtml(rawEventsAnomaly, "raw-events-tab-anomaly-indicator") : "";
 
   let title = "Summary";
   let contentHtml = "";
@@ -2293,8 +2296,45 @@ function renderReplayDetail(payload) {
       </div>`;
   } else if (isRawEvents) {
     title = "Raw Events";
+    
+    let rawEventsAnomalyPanelHtml = "";
+    const rawReport = (payload || {}).raw_events_anomaly;
+    if (rawReport && rawEventsHasAnomaly) {
+      const violations = Array.isArray(rawReport.violations) ? rawReport.violations : [];
+      const items = violations.slice(0, 20).map((violation) => {
+        const rule = String(violation?.rule || "unknown");
+        const severity = String(violation?.severity || "LOW");
+        const resource = String(
+          violation?.resource
+            || violation?.path
+            || ((violation?.dest_ip || violation?.dest_port)
+              ? `${String(violation?.dest_ip || "")}:${String(violation?.dest_port || 0)}`
+              : (violation?.child_binary || ""))
+        );
+        const operation = String(violation?.operation || violation?.reason || "");
+        return `
+          <div class="anomaly-row">
+            <div><span class="anomaly-rule">${escapeHtml(rule)}</span> <span class="row-sub">${escapeHtml(severity)}</span></div>
+            <div class="anomaly-text">${escapeHtml(resource || "(resource unavailable)")}${operation ? ` · ${escapeHtml(operation)}` : ""}</div>
+          </div>`;
+      }).join("");
+
+      rawEventsAnomalyPanelHtml = `
+        <div class="timeline-row anomaly-panel" style="margin-bottom: 12px; margin-top: 12px; border: 1px solid var(--border-color); border-radius: 6px;">
+          <div class="timeline-head">
+            <span class="row-title">Turn Anomaly</span>
+            ${anomalyIndicatorHtml(rawEventsAnomaly, "tool-anomaly-indicator")}
+          </div>
+          <div class="row-content">
+            <div class="mono-text">${escapeHtml(String(rawEventsAnomaly.summary || "anomaly detected"))}</div>
+            <div class="anomaly-list">${items || '<div class="mono-text">No violation details captured.</div>'}</div>
+          </div>
+        </div>`;
+    }
+
     contentHtml = `
       <div class="replay-raw-pane">
+        ${rawEventsAnomalyPanelHtml}
         <div class="replay-raw-controls" id="replayRawControls"></div>
         <div class="replay-raw-host" id="replayRawEventsHost"><div class="replay-empty">Loading raw event trace...</div></div>
       </div>`;
@@ -2311,7 +2351,7 @@ function renderReplayDetail(payload) {
       <button class="replay-subtab ${isContext ? "active" : ""}" id="replayContextTab">Context</button>
       <button class="replay-subtab ${isAction ? "active" : ""}" id="replayActionTab">Action</button>
       <button class="replay-subtab ${isSummary ? "active" : ""}" id="replaySummaryTab">Summary</button>
-      <button class="replay-subtab ${isRawEvents ? "active" : ""}" id="replayRawEventsTab">Raw Events</button>
+      <button class="replay-subtab ${isRawEvents ? "active" : ""}" id="replayRawEventsTab">Raw Events ${rawEventsTabAnomalyHtml}</button>
     </div>
     <div class="replay-sections">${contentHtml}</div>`;
 

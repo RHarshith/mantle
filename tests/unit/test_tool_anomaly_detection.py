@@ -85,3 +85,15 @@ def test_low_only_violations_are_suspicious() -> None:
     assert report["severity_counts"]["LOW"] >= 1
     assert report["severity_counts"]["MEDIUM"] == 0
     assert report["severity_counts"]["HIGH"] == 0
+
+
+def test_parent_process_map_enrichment_does_not_mutate_iteration() -> None:
+    detector = ToolAnomalyDetector()
+    events = [
+        _event(1, "command_exec", pid=601, ppid=6010, exec_path="/usr/bin/python3", argv=["python3", "script.py"], command="python3 script.py"),
+    ]
+
+    report = detector.analyze("python3 script.py", events, {601: 6010})
+
+    assert report["command"] == "python3 script.py"
+    assert report["root_pid"] == 601

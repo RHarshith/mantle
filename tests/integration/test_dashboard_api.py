@@ -23,7 +23,10 @@ def dashboard_app(populated_obs_dir: Path):
         pytest.skip("fastapi[testclient] / httpx not installed")
 
     # Import inline to avoid top-level failure if fastapi is not installed.
-    from mantle.server.app import app, store
+    try:
+        from mantle.server.app import app, store
+    except (PermissionError, RuntimeError) as exc:
+        pytest.skip(f"Dashboard runtime paths are not writable in this environment: {exc}")
 
     # Rewire the global store with our test data directory.
     store.trace_dir = populated_obs_dir / "traces"
@@ -48,6 +51,25 @@ class TestDashboardAPI:
         assert resp.status_code == 200
         data = resp.json()
         assert isinstance(data, list) or "traces" in data
+
+    def test_anomaly_fields_exposed_in_trace_and_summary(self, client):
+        traces_resp = client.get("/api/traces")
+        assert traces_resp.status_code == 200
+        traces_data = traces_resp.json()
+        traces = traces_data.get("traces") if isinstance(traces_data, dict) else traces_data
+        assert isinstance(traces, list)
+        assert traces
+
+        trace = traces[0]
+        assert "anomaly" in trace
+        assert "anomaly_verdict" in trace
+        assert "anomaly_detected" in trace
+
+        trace_id = trace["trace_id"]
+        summary_resp = client.get(f"/api/traces/{trace_id}/summary")
+        assert summary_resp.status_code == 200
+        summary = summary_resp.json()
+        assert "anomaly" in summary
 
     def test_capture_quality_endpoint(self, client):
         traces_resp = client.get("/api/traces")

@@ -3701,6 +3701,9 @@ class TraceStore:
                     continue
                 if root_exit_line is not None and line_no > root_exit_line:
                     continue
+                ets = float(e.get("ts", 0))
+                if ets < start_ts or ets > (end_ts + 0.25):
+                    continue
                 pid = int(e.get("pid", 0))
                 if pid and self._is_descendant_or_same_pid(trace, pid, root_pid):
                     related.append(e)
@@ -3762,6 +3765,60 @@ class TraceStore:
             project_root=project_root,
         )
 
+    def _events_outside_tool_windows(
+        self,
+        events: list[dict[str, Any]],
+        tool_pairs: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        windows: list[tuple[float, float]] = []
+        for pair in tool_pairs:
+            start_ts = float(pair.get("started_ts") or 0.0)
+            if start_ts <= 0.0:
+                continue
+            end_ts = float(pair.get("finished_ts") or (start_ts + 5.0))
+            if end_ts < start_ts:
+                end_ts = start_ts + 5.0
+            windows.append((start_ts, end_ts + 0.25))
+
+        if not windows:
+            return sorted(events, key=lambda e: int(e.get("line_no", 0)))
+
+        outside: list[dict[str, Any]] = []
+        for event in events:
+            ts = float(event.get("ts") or 0.0)
+            in_window = any(start_ts <= ts <= end_ts for start_ts, end_ts in windows)
+            if not in_window:
+                outside.append(event)
+        return sorted(outside, key=lambda e: int(e.get("line_no", 0)))
+
+    def _outside_tool_anomaly_report_for_turn(
+        self,
+        trace: TraceState,
+        turn_events: list[dict[str, Any]],
+        tool_pairs: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        outside_events = self._events_outside_tool_windows(turn_events, tool_pairs)
+        fallback_root_pid = int(trace.root_pid or 0)
+        if not outside_events:
+            return {
+                **self._tool_anomaly_detector.verified_report("outside tool call activity", root_pid=fallback_root_pid),
+                "scope": "outside_tool_call",
+                "event_count": 0,
+            }
+
+        project_root = self._trace_repo_root(trace)
+        root_pid = self._tool_root_pid_for_related(outside_events, fallback_pid=fallback_root_pid)
+        report = self._tool_anomaly_detector.analyze(
+            "outside tool call activity",
+            outside_events,
+            trace.process_parent,
+            root_pid=root_pid,
+            project_root=project_root,
+        )
+        report["scope"] = "outside_tool_call"
+        report["event_count"] = len(outside_events)
+        return report
+
     def _trace_tool_anomaly_map(self, trace: TraceState) -> dict[str, dict[str, Any]]:
         out: dict[str, dict[str, Any]] = {}
         starts = self._tool_start_events(trace)
@@ -3782,7 +3839,11 @@ class TraceStore:
         return out
 
     def _trace_anomaly_summary(self, trace: TraceState) -> dict[str, Any]:
-        reports = list(self._trace_tool_anomaly_map(trace).values())
+        reports = [
+            turn.get("anomaly")
+            for turn in self._turns_for_trace(trace)
+            if isinstance(turn.get("anomaly"), dict)
+        ]
         return aggregate_tool_anomaly_reports(reports)
 
     def _collapse_files_into_folders(
@@ -4169,7 +4230,15 @@ class TraceStore:
                 tool_anomaly_by_id.get(str(tp.get("tool_call_id") or ""), self._tool_anomaly_detector.verified_report(str(tp.get("tool_name") or "tool call")))
                 for tp in tool_pairs
             ]
-            turn_anomaly = aggregate_tool_anomaly_reports(turn_tool_anomalies)
+            outside_tool_anomaly = self._outside_tool_anomaly_report_for_turn(trace, sys_slice, tool_pairs)
+            outside_tool_has_anomaly = bool(
+                outside_tool_anomaly.get("has_anomaly")
+                or str(outside_tool_anomaly.get("verdict") or "CLEAN") != "CLEAN"
+            )
+            aggregate_reports = list(turn_tool_anomalies)
+            if outside_tool_has_anomaly:
+                aggregate_reports.append(outside_tool_anomaly)
+            turn_anomaly = aggregate_tool_anomaly_reports(aggregate_reports)
             files_read = {str(e.get("path") or "") for e in sys_slice if str(e.get("type") or "") == "file_read" and str(e.get("path") or "")}
             files_written = {
                 str(e.get("path") or "")
@@ -4316,6 +4385,8 @@ class TraceStore:
                     "end_ts": span_end_ts,
                     "tool_call_count": len(tool_pairs),
                     "anomaly": turn_anomaly,
+                    "raw_events_anomaly": outside_tool_anomaly,
+                    "raw_events_has_anomaly": outside_tool_has_anomaly,
                     "tags": tags,
                     "dominant_summary": dominant,
                     "prompt_text": "\n\n".join(prompt_texts),
@@ -4334,6 +4405,7 @@ class TraceStore:
                     "_sys_events": sys_slice,
                     "_tool_pairs": tool_pairs,
                     "_tool_anomalies": turn_tool_anomalies,
+                    "_outside_tool_anomaly": outside_tool_anomaly,
                 }
             )
 
@@ -4382,6 +4454,11 @@ class TraceStore:
             "file_activity": file_activity,
             "subprocesses": subprocesses,
         }
+        replay_payload["raw_events_anomaly"] = match.get("raw_events_anomaly") or self._tool_anomaly_detector.verified_report(
+            "outside tool call activity",
+            root_pid=int(trace.root_pid or 0),
+        )
+        replay_payload["raw_events_has_anomaly"] = bool(match.get("raw_events_has_anomaly") or False)
         call_source_map, text_source_map = self._replay_tool_output_source_maps(trace, turns)
         self._attach_replay_tool_output_sources(replay_payload, call_source_map, text_source_map)
         return replay_payload
@@ -5639,6 +5716,11 @@ class TraceStore:
                 "anomaly": match.get("anomaly") or aggregate_tool_anomaly_reports(list(anomaly_by_id.values())),
             },
             "anomaly": match.get("anomaly") or aggregate_tool_anomaly_reports(list(anomaly_by_id.values())),
+            "raw_events_anomaly": match.get("raw_events_anomaly") or self._tool_anomaly_detector.verified_report(
+                "outside tool call activity",
+                root_pid=int(t.root_pid or 0),
+            ),
+            "raw_events_has_anomaly": bool(match.get("raw_events_has_anomaly") or False),
             "prompt_text": match.get("prompt_text") or "",
             "response_text": match.get("response_text") or "",
             "prompt_sections": match.get("prompt_sections") or [],
