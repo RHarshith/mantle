@@ -20,7 +20,7 @@ usage() {
     cat <<'EOF'
 Usage:
     mantle serve [--host <host>] [--port <port>]
-    mantle watch [--trace-id <id>] [--no-ebpf] <executable> [args...]
+    mantle watch [--process-name <name>] [--trace-id <id>] [--no-ebpf] <executable> [args...]
     mantle daemon start|stop|status
 
 Commands:
@@ -31,6 +31,7 @@ Commands:
 Examples:
     mantle serve --host 0.0.0.0 --port 8099
     mantle watch aider
+    mantle watch --process-name my-task aider
     mantle watch aider "inspect this repo and summarize"
     sudo mantle daemon start
 EOF
@@ -157,6 +158,28 @@ daemon_cmd() {
     esac
 }
 
+ensure_user_oracle_command() {
+    local oracle_src user_bin oracle_link
+    oracle_src="$SCRIPT_DIR/mantle-oracle"
+    user_bin="$HOME/.local/bin"
+    oracle_link="$user_bin/mantle-oracle"
+
+    if [[ ! -f "$oracle_src" ]]; then
+        return
+    fi
+
+    mkdir -p "$user_bin"
+    chmod +x "$oracle_src" || true
+
+    # Keep a stable user-level command target for host-side agent execution.
+    ln -sfn "$oracle_src" "$oracle_link"
+
+    case ":$PATH:" in
+        *":$user_bin:"*) ;;
+        *) export PATH="$user_bin:$PATH" ;;
+    esac
+}
+
 # ── watch ─────────────────────────────────────────────────────────
 
 watch_cmd() {
@@ -164,8 +187,11 @@ watch_cmd() {
     local logs_root obs_root config_root
     local -a task_args
     local enable_ebpf=true
+    local process_name=""
 
     trace_id=""
+
+    ensure_user_oracle_command
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -175,6 +201,14 @@ watch_cmd() {
                     exit 1
                 fi
                 trace_id="$2"
+                shift 2
+                ;;
+            --process-name)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: $1 requires a value." >&2
+                    exit 1
+                fi
+                process_name="$2"
                 shift 2
                 ;;
             --no-ebpf)
@@ -270,10 +304,20 @@ watch_cmd() {
     # The _MANTLE_SCOPED guard prevents infinite re-exec.
     if [[ -z "${_MANTLE_SCOPED:-}" ]]; then
         export _MANTLE_SCOPED=1
+        local -a scoped_cmd
+        scoped_cmd=("$SCRIPT_DIR/mantle" watch --trace-id "$trace_id")
+        if [[ -n "$process_name" ]]; then
+            scoped_cmd+=(--process-name "$process_name")
+        fi
+        if ! $enable_ebpf; then
+            scoped_cmd+=(--no-ebpf)
+        fi
+        scoped_cmd+=("$resolved_executable")
+        if [[ ${#task_args[@]} -gt 0 ]]; then
+            scoped_cmd+=("${task_args[@]}")
+        fi
         exec systemd-run --user --scope -q --unit="mantle-watch-$$" \
-            "$SCRIPT_DIR/mantle" watch --trace-id "$trace_id" \
-            "$resolved_executable" \
-            ${task_args[@]+"${task_args[@]}"}
+            "${scoped_cmd[@]}"
     fi
 
     # === We are now inside a cgroup scope ===
@@ -328,10 +372,28 @@ except Exception as e:
         -d "{\"trace_file\": \"$trace_id\"}" \
         "$proxy_control_url" >/dev/null 2>&1 || true
 
+    # If --process-name was specified, register process and trace with server
+    local server_url="${MANTLE_SERVER_URL:-http://127.0.0.1:8099}"
+    if [[ -n "$process_name" ]]; then
+        # Auto-create process (idempotent)
+        curl -sf -X POST -H "Content-Type: application/json" \
+            -d "{\"name\": \"$process_name\"}" \
+            "${server_url}/api/processes" >/dev/null 2>&1 || true
+        # Assign trace to process
+        curl -sf -X POST -H "Content-Type: application/json" \
+            -d "{\"trace_id\": \"$trace_id\"}" \
+            "${server_url}/api/processes/${process_name}/traces" >/dev/null 2>&1 || true
+        # Tell proxy which process is active
+        curl -sf -X POST -H "Content-Type: application/json" \
+            -d "{\"process_name\": \"$process_name\"}" \
+            "http://127.0.0.1:4000/mantle/active-process" >/dev/null 2>&1 || true
+    fi
+
     # Export variables needed by the cleanup trap handler.
     _MANTLE_CLEANUP_TRACE_ID="$trace_id"
     _MANTLE_CLEANUP_PROXY_URL="$proxy_control_url"
     _MANTLE_CLEANUP_OUTPUT="$output_file"
+    _MANTLE_CLEANUP_PROCESS_NAME="$process_name"
 
     # Cleanup on exit (normal, SIGINT, SIGTERM)
     cleanup() {
@@ -349,6 +411,12 @@ except Exception:
         curl -sf -X POST -H "Content-Type: application/json" \
             -d '{"trace_file": null}' \
             "$_MANTLE_CLEANUP_PROXY_URL" >/dev/null 2>&1 || true
+        # Clear active process on proxy
+        if [[ -n "$_MANTLE_CLEANUP_PROCESS_NAME" ]]; then
+            curl -sf -X POST -H "Content-Type: application/json" \
+                -d '{"process_name": null}' \
+                "http://127.0.0.1:4000/mantle/active-process" >/dev/null 2>&1 || true
+        fi
         echo ""
         echo "[*] Done. Captured data:"
         [[ -f "$_MANTLE_CLEANUP_OUTPUT" ]] && echo "    Trace: $_MANTLE_CLEANUP_OUTPUT ($(wc -l < "$_MANTLE_CLEANUP_OUTPUT") lines)"

@@ -79,6 +79,49 @@ from litellm.proxy.proxy_server import app
 
 _ACTIVE_TRACE_LOCK = threading.RLock()
 _ACTIVE_TRACE_FILE: str | None = None
+_ACTIVE_PROCESS_NAME: str | None = None
+
+
+def _oracle_path() -> str:
+    """Resolve the oracle command/path to present to the agent.
+
+    Default to the command name (host PATH lookup) because agents usually run
+    on the host, not inside the proxy container filesystem.
+    """
+    env_path = os.getenv("MANTLE_ORACLE_PATH", "").strip()
+    if env_path:
+        return env_path
+    return "mantle-oracle"
+
+
+def _build_oracle_instruction() -> str | None:
+    """Build the oracle system prompt instruction, or None if not applicable."""
+    with _ACTIVE_TRACE_LOCK:
+        pname = _ACTIVE_PROCESS_NAME
+        tfile = _ACTIVE_TRACE_FILE
+    if not pname or not tfile:
+        return None
+    oracle = _oracle_path()
+    return (
+        "\n\n[IMPORTANT] Run the oracle after each turn to check task progress"
+        ":\n"
+        f"  {oracle} --process-name {pname} --trace-id {tfile}\n"
+    )
+
+
+def _build_oracle_user_directive() -> str | None:
+    """Build a user-role directive that forces explicit oracle acknowledgement."""
+    with _ACTIVE_TRACE_LOCK:
+        pname = _ACTIVE_PROCESS_NAME
+        tfile = _ACTIVE_TRACE_FILE
+    if not pname or not tfile:
+        return None
+    oracle = _oracle_path()
+    return (
+        "[MANDATORY ACTION] Before continuing, run this oracle command now:\n"
+        f"  {oracle} --process-name {pname} --trace-id {tfile}\n"
+        "Then include exactly this token in your next reply: ORACLE_ACKNOWLEDGED"
+    )
 
 
 def _responses_upstream_url(request: Request) -> str:
@@ -185,6 +228,24 @@ async def get_active_trace() -> dict[str, Any]:
     return {"active_trace_file": _get_active_trace_file()}
 
 
+class ActiveProcessPayload(BaseModel):
+    process_name: str | None = None
+
+
+@app.post("/mantle/active-process")
+async def set_active_process(payload: ActiveProcessPayload) -> dict[str, Any]:
+    global _ACTIVE_PROCESS_NAME
+    with _ACTIVE_TRACE_LOCK:
+        _ACTIVE_PROCESS_NAME = payload.process_name
+    return {"process_name": payload.process_name}
+
+
+@app.get("/mantle/active-process")
+async def get_active_process() -> dict[str, Any]:
+    with _ACTIVE_TRACE_LOCK:
+        return {"process_name": _ACTIVE_PROCESS_NAME}
+
+
 @app.post("/v1/responses")
 @app.post("/responses")
 async def proxy_responses_passthrough(request: Request) -> Response:
@@ -200,6 +261,34 @@ async def proxy_responses_passthrough(request: Request) -> Response:
                 request_payload = parsed
         except Exception:
             request_payload = {}
+
+    # ── Oracle instruction injection (Responses API) ──────────────
+    oracle_instruction = _build_oracle_instruction()
+    oracle_user_directive = _build_oracle_user_directive()
+    modified_body = request_body
+    if oracle_instruction and request_payload:
+        existing_instructions = str(request_payload.get("instructions") or "")
+        request_payload["instructions"] = existing_instructions + oracle_instruction
+
+        # Also force acknowledgement via user-role content.
+        if oracle_user_directive:
+            if isinstance(request_payload.get("messages"), list):
+                request_payload["messages"].append(
+                    {"role": "user", "content": oracle_user_directive}
+                )
+            else:
+                response_input = request_payload.get("input")
+                if isinstance(response_input, list):
+                    response_input.append(
+                        {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": oracle_user_directive}],
+                        }
+                    )
+                elif isinstance(response_input, str):
+                    request_payload["input"] = f"{response_input}\n\n{oracle_user_directive}"
+
+        modified_body = json.dumps(request_payload).encode("utf-8")
 
     upstream_url = _responses_upstream_url(request)
     upstream_headers = _build_upstream_headers(request)
@@ -218,7 +307,7 @@ async def proxy_responses_passthrough(request: Request) -> Response:
         async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
             upstream_response = await client.post(
                 upstream_url,
-                content=request_body,
+                content=modified_body,
                 headers=upstream_headers,
             )
     except httpx.HTTPError as exc:
@@ -287,7 +376,7 @@ async def proxy_responses_passthrough(request: Request) -> Response:
 # 1. Create a Context Variable to hold the ephemeral port natively in the async thread
 client_port_var = contextvars.ContextVar("client_port", default="unknown_port")
 
-# 2. FastAPI Middleware: Catch the port BEFORE the request hits the LLM
+# 2. FastAPI Middleware: Catch the port and inject oracle instruction for Chat API
 @app.middleware("http")
 async def capture_port_middleware(request: Request, call_next):
     # Extract the source port and save it to the context variable
@@ -299,7 +388,46 @@ async def capture_port_middleware(request: Request, call_next):
         scope_headers = request.scope.get("headers")
         if isinstance(scope_headers, list):
             scope_headers.append((b"x-client-src-port", port.encode("ascii")))
-    
+
+    # ── Oracle instruction injection (Chat Completions API) ──────
+    # For Chat API requests routed through LiteLLM, inject the oracle
+    # instruction into the messages list before LiteLLM processes them.
+    path = request.url.path.rstrip("/")
+    if path in {"/v1/chat/completions", "/chat/completions"}:
+        oracle_instruction = _build_oracle_instruction()
+        oracle_user_directive = _build_oracle_user_directive()
+        if oracle_instruction:
+            try:
+                body = await request.body()
+                if body:
+                    payload = json.loads(body.decode("utf-8"))
+                    if isinstance(payload, dict) and isinstance(payload.get("messages"), list):
+                        messages = payload["messages"]
+                        # Find existing system message and append, or insert a new one.
+                        injected = False
+                        for msg in messages:
+                            if isinstance(msg, dict) and msg.get("role") == "system":
+                                existing = str(msg.get("content") or "")
+                                msg["content"] = existing + oracle_instruction
+                                injected = True
+                                break
+                        if not injected:
+                            messages.insert(0, {"role": "system", "content": oracle_instruction.strip()})
+
+                        # Force explicit oracle acknowledgement in user-visible prompt context.
+                        if oracle_user_directive:
+                            messages.append({"role": "user", "content": oracle_user_directive})
+
+                        # Replace the request body in the ASGI scope.
+                        modified_body = json.dumps(payload).encode("utf-8")
+
+                        async def _receive():
+                            return {"type": "http.request", "body": modified_body}
+
+                        request._receive = _receive
+            except Exception:
+                pass  # Best-effort; don't break the request on injection failure.
+
     # Pass the request down the chain
     response = await call_next(request)
     return response

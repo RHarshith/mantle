@@ -556,6 +556,8 @@ class TraceStore:
                     events_path_candidates=self._trace_to_event_candidates(file_path),
                     proxy_path=proxy_path,
                 )
+                # Register trace in SQLite traces table (upsert — may already exist from CLI).
+                self.sqlite_store.register_trace(trace_id=trace_id, file_name=trace_id)
                 changed = True
 
         for state in self.traces.values():
@@ -1974,10 +1976,13 @@ class TraceStore:
         return False
 
     def list_traces(self) -> list[dict[str, Any]]:
+        # Fetch process/guide metadata from SQLite to augment in-memory state.
+        trace_infos = self.sqlite_store.all_trace_infos()
         out = []
         for trace_id in sorted(self.traces.keys()):
             t = self.traces[trace_id]
             anomaly = self._trace_anomaly_summary(t)
+            info = trace_infos.get(trace_id) or {}
             out.append(
                 {
                     "trace_id": trace_id,
@@ -1988,9 +1993,37 @@ class TraceStore:
                     "anomaly": anomaly,
                     "anomaly_verdict": str(anomaly.get("verdict") or "CLEAN"),
                     "anomaly_detected": bool(anomaly.get("has_anomaly") or False),
+                    "process_name": info.get("process_name"),
+                    "is_guide": info.get("is_guide", False),
                 }
             )
         return out
+
+    # ── Process / Guide wrappers ──────────────────────────────────────
+
+    def create_process(self, name: str) -> dict[str, Any]:
+        """Create a named process grouping."""
+        return self.sqlite_store.create_process(name)
+
+    def list_processes(self) -> list[dict[str, Any]]:
+        """Return all processes."""
+        return self.sqlite_store.list_processes()
+
+    def delete_process(self, name: str) -> None:
+        """Delete a process."""
+        self.sqlite_store.delete_process(name)
+
+    def assign_trace_to_process(self, trace_id: str, process_name: str) -> None:
+        """Assign a trace to a process."""
+        self.sqlite_store.assign_trace_to_process(trace_id, process_name)
+
+    def set_guide_trace(self, process_name: str, trace_id: str) -> None:
+        """Set one trace as guide for a process."""
+        self.sqlite_store.set_guide_trace(process_name, trace_id)
+
+    def get_guide_trace(self, process_name: str) -> str | None:
+        """Return guide trace_id for a process."""
+        return self.sqlite_store.get_guide_trace(process_name)
 
     def trace_capture_quality(self, trace_id: str) -> dict[str, Any]:
         """Return capture confidence metadata for one trace.

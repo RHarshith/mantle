@@ -465,79 +465,67 @@ function setCollapsed(sectionBody, caret, collapsed) {
 }
 
 function loadProcessState() {
-  try {
-    const rawMap = localStorage.getItem("mantle.traceProcessMap");
-    const parsedMap = rawMap ? JSON.parse(rawMap) : {};
-    traceProcessMap = parsedMap && typeof parsedMap === "object" ? parsedMap : {};
-  } catch (_) {
-    traceProcessMap = {};
-  }
-
-  try {
-    const rawNames = localStorage.getItem("mantle.processNames");
-    const parsedNames = rawNames ? JSON.parse(rawNames) : ["default"];
-    processNames = Array.isArray(parsedNames) ? parsedNames.map((n) => String(n || "").trim()).filter(Boolean) : ["default"];
-  } catch (_) {
-    processNames = ["default"];
-  }
-
-  if (!processNames.includes("default")) processNames.unshift("default");
+  // Fetch processes from server API (called during init and refresh).
+  // Falls back to empty state on error.
+  return fetch("/api/processes")
+    .then((res) => res.ok ? res.json() : { processes: [] })
+    .then((data) => {
+      const serverProcesses = (data.processes || []).map((p) => String(p.name || "").trim()).filter(Boolean);
+      processNames = serverProcesses.length ? serverProcesses : [];
+      // Build traceProcessMap from trace data (set during renderTraceList).
+    })
+    .catch(() => {
+      processNames = [];
+    });
 }
 
 function saveProcessState() {
-  localStorage.setItem("mantle.traceProcessMap", JSON.stringify(traceProcessMap));
-  localStorage.setItem("mantle.processNames", JSON.stringify(processNames));
+  // No-op: process state is now server-side.
 }
 
 function getTraceProcess(traceId) {
-  const raw = String(traceProcessMap[traceId] || "").trim();
-  if (!raw) return "default";
-  return raw;
+  return traceProcessMap[traceId] || null;
 }
 
-function setTraceProcess(traceId, processName) {
-  const value = String(processName || "default").trim() || "default";
-  traceProcessMap[traceId] = value;
-  if (!processNames.includes(value)) {
-    processNames.push(value);
+async function setTraceProcess(traceId, processName) {
+  const value = String(processName || "").trim();
+  if (!value) {
+    return;
   }
-  saveProcessState();
+  const response = await fetch(`/api/processes/${encodeURIComponent(value)}/traces`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ trace_id: traceId }),
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to assign trace (${response.status})`);
+  }
+  traceProcessMap[traceId] = value;
 }
 
 function normalizeProcessAssignments(traces) {
-  const traceIds = new Set((traces || []).map((t) => String(t.trace_id || "")));
-  for (const key of Object.keys(traceProcessMap)) {
-    if (!traceIds.has(key)) {
-      delete traceProcessMap[key];
-    }
-  }
+  traceProcessMap = {};
   for (const t of traces || []) {
     const tid = String(t.trace_id || "");
     if (!tid) continue;
-    if (!traceProcessMap[tid]) traceProcessMap[tid] = "default";
+    traceProcessMap[tid] = t.process_name || null;
   }
-  processNames = Array.from(new Set(["default", ...processNames, ...Object.values(traceProcessMap).map((n) => String(n || "default"))]));
-  processNames.sort((a, b) => {
-    if (a === "default") return -1;
-    if (b === "default") return 1;
-    return a.localeCompare(b);
-  });
-  saveProcessState();
 }
 
-function createProcess() {
+async function createProcess() {
   const name = window.prompt("New process name", "");
   if (!name) return;
   const normalized = String(name || "").trim();
   if (!normalized) return;
-  if (!processNames.includes(normalized)) {
-    processNames.push(normalized);
-    processNames.sort((a, b) => {
-      if (a === "default") return -1;
-      if (b === "default") return 1;
-      return a.localeCompare(b);
+  try {
+    await fetch("/api/processes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: normalized }),
     });
-    saveProcessState();
+    await loadProcessState();
+  } catch (err) {
+    console.error("Failed to create process", err);
   }
   renderTraceList(cachedTraces);
 }
@@ -563,87 +551,140 @@ function renderTraceList(traces) {
     traceListEl.appendChild(clearBtn);
   }
 
+  // Group traces by process_name (from server data).
   const grouped = new Map();
   for (const name of processNames) {
     grouped.set(name, []);
   }
+  // Unassigned group for traces without a process.
+  const unassigned = [];
   for (const t of traces || []) {
-    const pname = getTraceProcess(t.trace_id);
-    if (!grouped.has(pname)) grouped.set(pname, []);
-    grouped.get(pname).push(t);
+    const pname = t.process_name || null;
+    if (!pname) {
+      unassigned.push(t);
+    } else {
+      if (!grouped.has(pname)) grouped.set(pname, []);
+      grouped.get(pname).push(t);
+    }
   }
 
   for (const [processName, items] of grouped.entries()) {
-    const section = document.createElement("div");
-    section.className = "trace-process-group";
+    renderProcessSection(processName, items, true);
+  }
+  if (unassigned.length) {
+    renderProcessSection("Unassigned", unassigned, false);
+  }
+}
 
-    const header = document.createElement("div");
-    header.className = "trace-process-header";
-    header.innerHTML = `<span class="trace-process-name">${escapeHtml(processName)}</span><span class="trace-process-count">${formatNumber(items.length)}</span>`;
-    section.appendChild(header);
+function renderProcessSection(processName, items, isDeletable) {
+  const section = document.createElement("div");
+  section.className = "trace-process-group";
 
-    if (!items.length) {
-      const empty = document.createElement("div");
-      empty.className = "trace-process-empty";
-      empty.textContent = "No traces";
-      section.appendChild(empty);
-      traceListEl.appendChild(section);
-      continue;
-    }
+  const header = document.createElement("div");
+  header.className = "trace-process-header";
+  header.innerHTML = `<span class="trace-process-name">${escapeHtml(processName)}</span><span class="trace-process-count">${formatNumber(items.length)}</span>`;
 
-    for (const t of items) {
-      const row = document.createElement("div");
-      row.className = `trace-item${t.trace_id === selectedTraceId ? " active" : ""}`;
-      const statusClass = t.status === "completed" ? "completed" : "active";
-      const anomalyMeta = normalizeAnomaly(t.anomaly || {
-        anomaly_verdict: t.anomaly_verdict,
-        anomaly_detected: t.anomaly_detected,
-      });
-      const anomalyHtml = anomalyIndicatorHtml(anomalyMeta, "trace-anomaly-indicator");
-      const moveOptions = processNames
-        .map((name) => `<option value="${escapeHtml(name)}" ${name === processName ? "selected" : ""}>${escapeHtml(name)}</option>`)
-        .join("");
-      row.innerHTML = `
-        <div class="trace-row">
-          <div class="trace-main">
-            <div class="trace-name">${escapeHtml(t.trace_id)}</div>
-            <div class="trace-meta"><span class="trace-status ${statusClass}">${escapeHtml(t.status)}</span> agent: ${formatNumber(t.agent_event_count)} sys: ${formatNumber(t.sys_event_count)}</div>
-            <div class="trace-meta">Move to: <select class="trace-move-select">${moveOptions}</select></div>
-          </div>
-          <div class="trace-row-actions">
-            ${anomalyHtml}
-            <button class="trace-delete-btn" title="Delete trace">×</button>
-          </div>
-        </div>`;
-
-      row.addEventListener("click", () => selectTrace(t.trace_id));
-
-      const moveSelect = row.querySelector(".trace-move-select");
-      moveSelect.addEventListener("click", (e) => e.stopPropagation());
-      moveSelect.addEventListener("change", (e) => {
-        e.stopPropagation();
-        setTraceProcess(t.trace_id, moveSelect.value);
+  if (isDeletable) {
+    const deleteProcessBtn = document.createElement("button");
+    deleteProcessBtn.className = "trace-delete-btn";
+    deleteProcessBtn.title = "Delete process";
+    deleteProcessBtn.textContent = "×";
+    deleteProcessBtn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      if (!confirm(`Delete process "${processName}"? Traces will become unassigned.`)) return;
+      try {
+        await fetch(`/api/processes/${encodeURIComponent(processName)}`, { method: "DELETE" });
+        await loadProcessState();
         renderTraceList(cachedTraces);
-        if (!selectedTraceId) {
-          renderDimensionOverview(activeTab);
-        }
-      });
+      } catch (err) {
+        console.error("Failed to delete process", err);
+      }
+    });
+    header.appendChild(deleteProcessBtn);
+  }
+  section.appendChild(header);
 
-      const deleteBtn = row.querySelector(".trace-delete-btn");
-      deleteBtn.addEventListener("click", async (e) => {
+  if (!items.length) {
+    const empty = document.createElement("div");
+    empty.className = "trace-process-empty";
+    empty.textContent = "No traces";
+    section.appendChild(empty);
+    traceListEl.appendChild(section);
+    return;
+  }
+
+  for (const t of items) {
+    const row = document.createElement("div");
+    row.className = `trace-item${t.trace_id === selectedTraceId ? " active" : ""}`;
+    const statusClass = t.status === "completed" ? "completed" : "active";
+    const anomalyMeta = normalizeAnomaly(t.anomaly || {
+      anomaly_verdict: t.anomaly_verdict,
+      anomaly_detected: t.anomaly_detected,
+    });
+    const anomalyHtml = anomalyIndicatorHtml(anomalyMeta, "trace-anomaly-indicator");
+    const guideBadge = t.is_guide ? '<span class="guide-badge" title="Guide trace">⭐ Guide</span>' : '';
+    const currentProcess = String(t.process_name || "");
+    const moveOptions = [
+      `<option value="" ${currentProcess ? "" : "selected"}>Unassigned</option>`,
+      ...processNames.map((name) => `<option value="${escapeHtml(name)}" ${name === currentProcess ? "selected" : ""}>${escapeHtml(name)}</option>`),
+    ].join("");
+
+    row.innerHTML = `
+      <div class="trace-row">
+        <div class="trace-main">
+          <div class="trace-name">${escapeHtml(t.trace_id)} ${guideBadge}</div>
+          <div class="trace-meta"><span class="trace-status ${statusClass}">${escapeHtml(t.status)}</span> agent: ${formatNumber(t.agent_event_count)} sys: ${formatNumber(t.sys_event_count)}</div>
+          <div class="trace-meta">Move to: <select class="trace-move-select">${moveOptions}</select></div>
+        </div>
+        <div class="trace-row-actions">
+          ${t.process_name && !t.is_guide ? '<button class="set-guide-btn" title="Set as guide">⭐</button>' : ''}
+          ${anomalyHtml}
+          <button class="trace-delete-btn" title="Delete trace">×</button>
+        </div>
+      </div>`;
+
+    row.addEventListener("click", () => selectTrace(t.trace_id));
+
+    const moveSelect = row.querySelector(".trace-move-select");
+    moveSelect.addEventListener("click", (e) => e.stopPropagation());
+    moveSelect.addEventListener("change", async (e) => {
+      e.stopPropagation();
+      try {
+        await setTraceProcess(t.trace_id, moveSelect.value);
+        await refreshTraces(true, { preserveView: true });
+      } catch (err) {
+        console.error("Failed to assign trace to process", err);
+        moveSelect.value = currentProcess;
+      }
+    });
+
+    const guideBtn = row.querySelector(".set-guide-btn");
+    if (guideBtn) {
+      guideBtn.addEventListener("click", async (e) => {
         e.stopPropagation();
         try {
-          await fetch(`/api/traces/${encodeURIComponent(t.trace_id)}`, { method: "DELETE" });
+          await fetch(`/api/traces/${encodeURIComponent(t.trace_id)}/set-guide`, { method: "POST" });
+          await refreshTraces(true, { preserveView: true });
         } catch (err) {
-          console.error("Failed to delete trace", err);
+          console.error("Failed to set guide", err);
         }
       });
-
-      section.appendChild(row);
     }
 
-    traceListEl.appendChild(section);
+    const deleteBtn = row.querySelector(".trace-delete-btn");
+    deleteBtn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      try {
+        await fetch(`/api/traces/${encodeURIComponent(t.trace_id)}`, { method: "DELETE" });
+      } catch (err) {
+        console.error("Failed to delete trace", err);
+      }
+    });
+
+    section.appendChild(row);
   }
+
+  traceListEl.appendChild(section);
 }
 
 function renderBreadcrumbs() {
@@ -3119,6 +3160,9 @@ function installStyles() {
     .trace-move-select { border:1px solid var(--border); border-radius:6px; font-size:11px; padding:2px 5px; margin-left:4px; }
     .trace-row-actions { display:flex; flex-direction:column; align-items:flex-end; gap:8px; }
     .trace-row-actions .trace-delete-btn { margin:0; }
+    .guide-badge { display:inline-flex; align-items:center; gap:3px; font-size:10px; font-weight:700; color:#f59e0b; background:#fef3c7; border:1px solid #fcd34d; border-radius:999px; padding:1px 7px; margin-left:6px; vertical-align:middle; }
+    .set-guide-btn { border:none; background:none; cursor:pointer; font-size:14px; padding:2px 4px; border-radius:4px; opacity:0.5; transition:opacity 0.15s; }
+    .set-guide-btn:hover { opacity:1; background:var(--slate-100); }
 
     .anomaly-indicator { width:16px; height:16px; border-radius:999px; display:inline-flex; align-items:center; justify-content:center; font-size:10px; font-weight:800; line-height:1; flex:0 0 16px; }
     .anomaly-indicator::before { content:"!"; }
@@ -3378,7 +3422,7 @@ function installStyles() {
 
 async function init() {
   installStyles();
-  loadProcessState();
+  await loadProcessState();
 
   setCollapsed(fileSectionBody, fileCaret, true);
   setCollapsed(toolsSectionBody, toolsCaret, true);

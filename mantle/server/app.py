@@ -133,6 +133,85 @@ async def delete_trace(trace_id: str) -> dict[str, Any]:
 		raise HTTPException(status_code=404, detail="Trace not found")
 
 
+# ── Process lifecycle ──────────────────────────────────────────────
+
+@app.post("/api/processes")
+def create_process(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+	"""Create a named process grouping (idempotent)."""
+	name = str(payload.get("name") or "").strip()
+	if not name:
+		raise HTTPException(status_code=400, detail="name is required")
+	return store.create_process(name)
+
+
+@app.get("/api/processes")
+def list_processes() -> dict[str, Any]:
+	"""Return all processes."""
+	return {"processes": store.list_processes()}
+
+
+@app.delete("/api/processes/{process_name}")
+def delete_process(process_name: str) -> dict[str, Any]:
+	"""Delete a process."""
+	store.delete_process(process_name)
+	return {"ok": True}
+
+
+@app.post("/api/processes/{process_name}/traces")
+def assign_trace_to_process(
+	process_name: str,
+	payload: dict[str, Any] = Body(default={}),
+) -> dict[str, Any]:
+	"""Register / assign a trace to a process."""
+	trace_id = str(payload.get("trace_id") or "").strip()
+	if not trace_id:
+		raise HTTPException(status_code=400, detail="trace_id is required")
+	# Ensure process exists (idempotent) and trace row exists, then explicitly assign.
+	store.create_process(process_name)
+	store.sqlite_store.register_trace(trace_id=trace_id, file_name=trace_id)
+	store.assign_trace_to_process(trace_id, process_name)
+	return {"ok": True, "trace_id": trace_id, "process_name": process_name}
+
+
+@app.post("/api/traces/{trace_id}/set-guide")
+def set_guide_trace(trace_id: str) -> dict[str, Any]:
+	"""Mark a trace as the guide for its process."""
+	info = store.sqlite_store.get_trace_info(trace_id)
+	if info is None:
+		raise HTTPException(status_code=404, detail="Trace not registered")
+	process_name = info.get("process_name")
+	if not process_name:
+		raise HTTPException(
+			status_code=400,
+			detail="Trace is not assigned to a process",
+		)
+	store.set_guide_trace(process_name, trace_id)
+	return {"ok": True, "guide_trace_id": trace_id, "process_name": process_name}
+
+
+@app.get("/api/traces/{trace_id}/reward-status")
+def reward_status(trace_id: str) -> dict[str, Any]:
+	"""Compute and return reward status for a trace against its process guide."""
+	from mantle.reward.engine import compute_reward_status
+	info = store.sqlite_store.get_trace_info(trace_id)
+	if info is None:
+		raise HTTPException(status_code=404, detail="Trace not registered")
+	process_name = info.get("process_name")
+	if not process_name:
+		return {"error": "trace_not_in_process", "progress": 0, "satisfied": [], "pending": []}
+	guide_trace_id = store.get_guide_trace(process_name)
+	if not guide_trace_id:
+		return {"error": "no_guide_trace", "progress": 0, "satisfied": [], "pending": []}
+	if guide_trace_id == trace_id:
+		return {"error": "trace_is_guide", "progress": 1.0, "satisfied": [], "pending": []}
+	return compute_reward_status(
+		guide_trace_id=guide_trace_id,
+		active_trace_id=trace_id,
+		process_name=process_name,
+		sqlite_store=store.sqlite_store,
+	)
+
+
 @app.get("/api/config")
 def config() -> dict[str, Any]:
 	"""Expose effective dashboard backend configuration."""

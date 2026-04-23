@@ -57,3 +57,19 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 
 CREATE INDEX IF NOT EXISTS idx_tool_calls_trace_id ON tool_calls(trace_id);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_trace_turn ON tool_calls(trace_id, turn_id);
+
+-- Process: a user-named logical grouping that owns one or more traces.
+CREATE TABLE IF NOT EXISTS process (
+    name       TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL          -- unix epoch seconds
+);
+
+-- Traces: registers each trace file with optional process membership and guide flag.
+CREATE TABLE IF NOT EXISTS traces (
+    id           TEXT PRIMARY KEY,        -- same value as existing trace_id (filename)
+    process_name TEXT REFERENCES process(name) ON DELETE SET NULL,
+    is_guide     INTEGER NOT NULL DEFAULT 0,
+    created_at   INTEGER NOT NULL,        -- unix epoch seconds
+    file_name    TEXT NOT NULL UNIQUE
+);
+CREATE INDEX IF NOT EXISTS idx_traces_process ON traces(process_name);

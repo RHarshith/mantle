@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# mantle-oracle — Agent-callable oracle for guided reward evaluation.
+#
+# Usage:
+#   mantle-oracle --process-name <name> --trace-id <id>
+#
+# Queries the mantle server for the current reward status of a trace
+# against its process's guide trace and prints structured JSON to stdout.
+
+usage() {
+    cat <<'EOF'
+Usage:
+    mantle-oracle --process-name <name> --trace-id <id>
+
+Options:
+    --process-name  Name of the process (required)
+    --trace-id      ID of the active trace (required)
+
+Environment:
+    MANTLE_SERVER_URL  Server base URL (default: http://127.0.0.1:8099)
+
+Output:
+    JSON object with fields: progress, score, satisfied, pending, next_hint
+EOF
+}
+
+process_name=""
+trace_id=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --process-name)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --process-name requires a value." >&2
+                exit 1
+            fi
+            process_name="$2"
+            shift 2
+            ;;
+        --trace-id)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --trace-id requires a value." >&2
+                exit 1
+            fi
+            trace_id="$2"
+            shift 2
+            ;;
+        -h|--help|help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -z "$process_name" ]] || [[ -z "$trace_id" ]]; then
+    echo "Error: --process-name and --trace-id are required." >&2
+    usage
+    exit 1
+fi
+
+server_url="${MANTLE_SERVER_URL:-http://127.0.0.1:8099}"
+
+response=$(curl -sf "${server_url}/api/traces/${trace_id}/reward-status" 2>/dev/null) || {
+    echo '{"error": "failed to reach mantle server", "progress": 0}' 
+    exit 1
+}
+
+echo "$response"

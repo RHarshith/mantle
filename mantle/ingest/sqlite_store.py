@@ -448,3 +448,180 @@ class SQLiteTraceStore:
                 }
             )
         return out
+
+    # ── Process / Trace / Guide CRUD ──────────────────────────────────
+
+    def create_process(self, name: str) -> dict[str, Any]:
+        """Create a process. No-op if name already exists (idempotent)."""
+        import time as _time
+
+        now = int(_time.time())
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO process(name, created_at) VALUES (?, ?)",
+                (name, now),
+            )
+            row = conn.execute(
+                "SELECT name, created_at FROM process WHERE name = ?", (name,)
+            ).fetchone()
+        return {"name": row["name"], "created_at": int(row["created_at"])}
+
+    def list_processes(self) -> list[dict[str, Any]]:
+        """Return all processes ordered by created_at DESC."""
+        with self._connect() as conn:
+            rows = list(
+                conn.execute(
+                    """
+                    SELECT p.name, p.created_at,
+                           COUNT(t.id) AS trace_count,
+                           MAX(CASE WHEN t.is_guide = 1 THEN 1 ELSE 0 END) AS has_guide
+                    FROM process p
+                    LEFT JOIN traces t ON t.process_name = p.name
+                    GROUP BY p.name
+                    ORDER BY p.created_at DESC
+                    """
+                )
+            )
+        return [
+            {
+                "name": str(row["name"]),
+                "created_at": int(row["created_at"]),
+                "trace_count": int(row["trace_count"]),
+                "has_guide": bool(row["has_guide"]),
+            }
+            for row in rows
+        ]
+
+    def delete_process(self, name: str) -> None:
+        """Delete a process. Associated traces have process_name set to NULL via FK."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM process WHERE name = ?", (name,))
+
+    def register_trace(
+        self,
+        trace_id: str,
+        file_name: str,
+        process_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Upsert a traces row.
+
+        If the trace already exists, update process_name only when the
+        existing value is NULL (preserves explicit assignments).
+        """
+        import time as _time
+
+        now = int(_time.time())
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT id, process_name, is_guide, created_at, file_name FROM traces WHERE id = ?",
+                (trace_id,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO traces(id, process_name, is_guide, created_at, file_name) VALUES (?, ?, 0, ?, ?)",
+                    (trace_id, process_name, now, file_name),
+                )
+            else:
+                # Only update process_name if currently NULL and a new value is provided.
+                if process_name is not None and existing["process_name"] is None:
+                    conn.execute(
+                        "UPDATE traces SET process_name = ? WHERE id = ?",
+                        (process_name, trace_id),
+                    )
+            row = conn.execute(
+                "SELECT id, process_name, is_guide, created_at, file_name FROM traces WHERE id = ?",
+                (trace_id,),
+            ).fetchone()
+        return {
+            "id": str(row["id"]),
+            "process_name": row["process_name"],
+            "is_guide": bool(row["is_guide"]),
+            "created_at": int(row["created_at"]),
+            "file_name": str(row["file_name"]),
+        }
+
+    def assign_trace_to_process(self, trace_id: str, process_name: str) -> None:
+        """Explicitly assign a trace to a process (from UI)."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE traces SET process_name = ? WHERE id = ?",
+                (process_name, trace_id),
+            )
+
+    def set_guide_trace(self, process_name: str, trace_id: str) -> None:
+        """Set one trace as guide for a process, clearing any previous guide."""
+        with self._connect() as conn:
+            # Clear existing guide(s) in this process.
+            conn.execute(
+                "UPDATE traces SET is_guide = 0 WHERE process_name = ? AND is_guide = 1",
+                (process_name,),
+            )
+            conn.execute(
+                "UPDATE traces SET is_guide = 1 WHERE id = ? AND process_name = ?",
+                (trace_id, process_name),
+            )
+
+    def get_guide_trace(self, process_name: str) -> str | None:
+        """Return the trace_id of the current guide for a process, or None."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM traces WHERE process_name = ? AND is_guide = 1",
+                (process_name,),
+            ).fetchone()
+        return str(row["id"]) if row else None
+
+    def list_traces_for_process(self, process_name: str) -> list[dict[str, Any]]:
+        """Return all traces belonging to a process."""
+        with self._connect() as conn:
+            rows = list(
+                conn.execute(
+                    "SELECT id, process_name, is_guide, created_at, file_name FROM traces WHERE process_name = ? ORDER BY created_at",
+                    (process_name,),
+                )
+            )
+        return [
+            {
+                "id": str(row["id"]),
+                "process_name": row["process_name"],
+                "is_guide": bool(row["is_guide"]),
+                "created_at": int(row["created_at"]),
+                "file_name": str(row["file_name"]),
+            }
+            for row in rows
+        ]
+
+    def get_trace_info(self, trace_id: str) -> dict[str, Any] | None:
+        """Return traces-table metadata for one trace, or None if not registered."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, process_name, is_guide, created_at, file_name FROM traces WHERE id = ?",
+                (trace_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": str(row["id"]),
+            "process_name": row["process_name"],
+            "is_guide": bool(row["is_guide"]),
+            "created_at": int(row["created_at"]),
+            "file_name": str(row["file_name"]),
+        }
+
+    def all_trace_infos(self) -> dict[str, dict[str, Any]]:
+        """Return traces-table metadata for all registered traces, keyed by id."""
+        with self._connect() as conn:
+            rows = list(
+                conn.execute(
+                    "SELECT id, process_name, is_guide, created_at, file_name FROM traces"
+                )
+            )
+        return {
+            str(row["id"]): {
+                "id": str(row["id"]),
+                "process_name": row["process_name"],
+                "is_guide": bool(row["is_guide"]),
+                "created_at": int(row["created_at"]),
+                "file_name": str(row["file_name"]),
+            }
+            for row in rows
+        }
