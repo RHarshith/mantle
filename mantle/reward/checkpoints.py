@@ -221,6 +221,9 @@ def extract_checkpoints(guide_events: list[dict[str, Any]]) -> list[Checkpoint]:
         if etype in {"net_connect", "connect"}:
             dest = str(event.get("dest") or "")
             if dest and not dest.startswith("fd="):
+                # TODO: add proper event filtering to separate LLM transport noise.
+                if dest == "127.0.0.1:4000":
+                    continue
                 key = ("connect", dest)
                 if key not in seen:
                     seen.add(key)

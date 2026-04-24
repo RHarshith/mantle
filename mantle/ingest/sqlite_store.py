@@ -391,6 +391,33 @@ class SQLiteTraceStore:
                 )
             )
 
+    def tool_call_windows_for_trace(self, trace_id: str) -> list[tuple[int, int]]:
+        """Return ordered (start_ts_ns, end_ts_ns) windows for all tool calls in a trace."""
+        with self._connect() as conn:
+            rows = list(
+                conn.execute(
+                    """
+                    SELECT start_ts_ns, end_ts_ns
+                    FROM tool_calls
+                    WHERE trace_id = ?
+                    ORDER BY start_ts_ns, end_ts_ns
+                    """,
+                    (trace_id,),
+                )
+            )
+
+        out: list[tuple[int, int]] = []
+        for row in rows:
+            try:
+                start = int(row["start_ts_ns"])
+                end = int(row["end_ts_ns"])
+            except (TypeError, ValueError):
+                continue
+            if end < start:
+                continue
+            out.append((start, end))
+        return out
+
     def events_for_window(self, trace_id: str, start_ts_ns: int, end_ts_ns: int) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = list(

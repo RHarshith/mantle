@@ -82,6 +82,11 @@ _ACTIVE_TRACE_FILE: str | None = None
 _ACTIVE_PROCESS_NAME: str | None = None
 
 
+def _oracle_server_base_url() -> str:
+    """Resolve the Mantle server base URL used to fetch oracle status."""
+    return os.getenv("MANTLE_SERVER_URL", "http://127.0.0.1:8099").rstrip("/")
+
+
 def _oracle_path() -> str:
     """Resolve the oracle command/path to present to the agent.
 
@@ -94,34 +99,100 @@ def _oracle_path() -> str:
     return "mantle-oracle"
 
 
-def _build_oracle_instruction() -> str | None:
-    """Build the oracle system prompt instruction, or None if not applicable."""
+def _format_oracle_status(payload: dict[str, Any], *, process_name: str, trace_id: str | None) -> str:
+    """Format oracle JSON into a short prompt-safe status block."""
+    lines = ["[Mantle oracle status]"]
+    if process_name:
+        lines.append(f"process: {process_name}")
+    if trace_id:
+        lines.append(f"trace: {trace_id}")
+
+    if "progress" in payload or "score" in payload:
+        if "progress" in payload:
+            lines.append(f"progress: {payload.get('progress')}")
+        if "score" in payload:
+            lines.append(f"score: {payload.get('score')}")
+        satisfied = payload.get("satisfied") or []
+        pending = payload.get("pending") or []
+        checkpoints = payload.get("checkpoints") or []
+
+        def _join(items: list[Any]) -> str:
+            if not items:
+                return "-"
+            return "; ".join(str(item) for item in items)
+
+        lines.append(f"satisfied: {_join(list(satisfied))}")
+        lines.append(f"pending: {_join(list(pending))}")
+
+        if checkpoints:
+            checkpoint_names: list[str] = []
+            for cp in checkpoints:
+                if isinstance(cp, dict):
+                    name = str(cp.get("name") or "").strip()
+                    desc = str(cp.get("description") or "").strip()
+                    checkpoint_names.append(f"{name} ({desc})" if name and desc else name or desc)
+                else:
+                    checkpoint_names.append(str(cp))
+            lines.append(f"checkpoints: {_join([name for name in checkpoint_names if name])}")
+        else:
+            lines.append("checkpoints: -")
+    else:
+        checkpoints = payload.get("checkpoints") or []
+        if checkpoints:
+            rendered: list[str] = []
+            for cp in checkpoints:
+                if isinstance(cp, dict):
+                    name = str(cp.get("name") or "").strip()
+                    desc = str(cp.get("description") or "").strip()
+                    rendered.append(f"{name} ({desc})" if name and desc else name or desc)
+                else:
+                    text = str(cp).strip()
+                    if text:
+                        rendered.append(text)
+            lines.append(f"checkpoints: {'; '.join(item for item in rendered if item) or '-'}")
+        else:
+            lines.append("checkpoints: -")
+
+    next_hint = str(payload.get("next_hint") or "").strip()
+    if next_hint:
+        lines.append(f"next_hint: {next_hint}")
+
+    return "\n".join(lines)
+
+
+async def _build_oracle_user_directive() -> str | None:
+    """Fetch oracle status for the active process and trace, if available."""
     with _ACTIVE_TRACE_LOCK:
         pname = _ACTIVE_PROCESS_NAME
         tfile = _ACTIVE_TRACE_FILE
-    if not pname or not tfile:
+    if not pname:
         return None
-    oracle = _oracle_path()
-    return (
-        "\n\n[IMPORTANT] Run the oracle after each turn to check task progress"
-        ":\n"
-        f"  {oracle} --process-name {pname} --trace-id {tfile}\n"
-    )
 
+    server_url = _oracle_server_base_url()
+    if tfile:
+        endpoint = f"{server_url}/api/traces/{tfile}/reward-status"
+    else:
+        endpoint = f"{server_url}/api/processes/{pname}/checkpoint-details"
 
-def _build_oracle_user_directive() -> str | None:
-    """Build a user-role directive that forces explicit oracle acknowledgement."""
-    with _ACTIVE_TRACE_LOCK:
-        pname = _ACTIVE_PROCESS_NAME
-        tfile = _ACTIVE_TRACE_FILE
-    if not pname or not tfile:
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0)) as client:
+            response = await client.get(endpoint)
+            response.raise_for_status()
+            payload = response.json()
+    except Exception:
+        PROXY_LOGGER.exception(
+            "failed to fetch oracle status",
+            extra={"process_name": pname, "trace_id": tfile, "endpoint": endpoint},
+        )
         return None
-    oracle = _oracle_path()
-    return (
-        "[MANDATORY ACTION] Before continuing, run this oracle command now:\n"
-        f"  {oracle} --process-name {pname} --trace-id {tfile}\n"
-        "Then include exactly this token in your next reply: ORACLE_ACKNOWLEDGED"
-    )
+
+    if not isinstance(payload, dict):
+        return None
+
+    if payload.get("error") in {"no_guide_trace", "trace_not_in_process", "trace_not_registered"}:
+        return None
+
+    return _format_oracle_status(payload, process_name=pname, trace_id=tfile)
 
 
 def _responses_upstream_url(request: Request) -> str:
@@ -262,31 +333,26 @@ async def proxy_responses_passthrough(request: Request) -> Response:
         except Exception:
             request_payload = {}
 
-    # ── Oracle instruction injection (Responses API) ──────────────
-    oracle_instruction = _build_oracle_instruction()
-    oracle_user_directive = _build_oracle_user_directive()
+    # ── Oracle status injection (Responses API) ──────────────────────
+    oracle_user_directive = await _build_oracle_user_directive()
     modified_body = request_body
-    if oracle_instruction and request_payload:
-        existing_instructions = str(request_payload.get("instructions") or "")
-        request_payload["instructions"] = existing_instructions + oracle_instruction
-
-        # Also force acknowledgement via user-role content.
-        if oracle_user_directive:
-            if isinstance(request_payload.get("messages"), list):
-                request_payload["messages"].append(
-                    {"role": "user", "content": oracle_user_directive}
+    if oracle_user_directive and request_payload:
+        # Add oracle status for explicit prompt-side visibility.
+        if isinstance(request_payload.get("messages"), list):
+            request_payload["messages"].append(
+                {"role": "user", "content": oracle_user_directive}
+            )
+        else:
+            response_input = request_payload.get("input")
+            if isinstance(response_input, list):
+                response_input.append(
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": oracle_user_directive}],
+                    }
                 )
-            else:
-                response_input = request_payload.get("input")
-                if isinstance(response_input, list):
-                    response_input.append(
-                        {
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": oracle_user_directive}],
-                        }
-                    )
-                elif isinstance(response_input, str):
-                    request_payload["input"] = f"{response_input}\n\n{oracle_user_directive}"
+            elif isinstance(response_input, str):
+                request_payload["input"] = f"{response_input}\n\n{oracle_user_directive}"
 
         modified_body = json.dumps(request_payload).encode("utf-8")
 
@@ -376,7 +442,7 @@ async def proxy_responses_passthrough(request: Request) -> Response:
 # 1. Create a Context Variable to hold the ephemeral port natively in the async thread
 client_port_var = contextvars.ContextVar("client_port", default="unknown_port")
 
-# 2. FastAPI Middleware: Catch the port and inject oracle instruction for Chat API
+# 2. FastAPI Middleware: Catch the port and inject oracle status for Chat API
 @app.middleware("http")
 async def capture_port_middleware(request: Request, call_next):
     # Extract the source port and save it to the context variable
@@ -389,34 +455,21 @@ async def capture_port_middleware(request: Request, call_next):
         if isinstance(scope_headers, list):
             scope_headers.append((b"x-client-src-port", port.encode("ascii")))
 
-    # ── Oracle instruction injection (Chat Completions API) ──────
+    # ── Oracle status injection (Chat Completions API) ──────────────
     # For Chat API requests routed through LiteLLM, inject the oracle
-    # instruction into the messages list before LiteLLM processes them.
+    # status into the messages list before LiteLLM processes them.
     path = request.url.path.rstrip("/")
     if path in {"/v1/chat/completions", "/chat/completions"}:
-        oracle_instruction = _build_oracle_instruction()
-        oracle_user_directive = _build_oracle_user_directive()
-        if oracle_instruction:
+        oracle_user_directive = await _build_oracle_user_directive()
+        if oracle_user_directive:
             try:
                 body = await request.body()
                 if body:
                     payload = json.loads(body.decode("utf-8"))
                     if isinstance(payload, dict) and isinstance(payload.get("messages"), list):
                         messages = payload["messages"]
-                        # Find existing system message and append, or insert a new one.
-                        injected = False
-                        for msg in messages:
-                            if isinstance(msg, dict) and msg.get("role") == "system":
-                                existing = str(msg.get("content") or "")
-                                msg["content"] = existing + oracle_instruction
-                                injected = True
-                                break
-                        if not injected:
-                            messages.insert(0, {"role": "system", "content": oracle_instruction.strip()})
-
-                        # Force explicit oracle acknowledgement in user-visible prompt context.
-                        if oracle_user_directive:
-                            messages.append({"role": "user", "content": oracle_user_directive})
+                        # Append oracle status so the model can act on the result.
+                        messages.append({"role": "user", "content": oracle_user_directive})
 
                         # Replace the request body in the ASGI scope.
                         modified_body = json.dumps(payload).encode("utf-8")

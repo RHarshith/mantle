@@ -13,6 +13,8 @@ predicates from the guide trace and evaluates them against the active trace.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
+from pathlib import Path
 from typing import Any, Protocol
 
 from mantle.reward.checkpoints import Checkpoint, extract_checkpoints
@@ -114,6 +116,96 @@ class CheckpointRewardAlgorithm:
 _DEFAULT_ALGORITHM: RewardAlgorithm = CheckpointRewardAlgorithm()
 
 
+_FILE_EVENT_TYPES = {"file_open", "file_write", "openat"}
+
+
+def _events_for_tool_windows(sqlite_store: Any, trace_id: str) -> list[dict[str, Any]]:
+    """Return trace events constrained to tool-call windows only."""
+    windows = sqlite_store.tool_call_windows_for_trace(trace_id)
+    if not windows:
+        return []
+
+    out: dict[int, dict[str, Any]] = {}
+    for start_ns, end_ns in windows:
+        for event in sqlite_store.events_for_window(trace_id, start_ts_ns=start_ns, end_ts_ns=end_ns):
+            event_id = int(event.get("id") or 0)
+            if event_id <= 0:
+                continue
+            out[event_id] = event
+
+    ordered = list(out.values())
+    ordered.sort(key=lambda e: (int(e.get("timestamp_ns") or 0), int(e.get("id") or 0)))
+    return ordered
+
+
+def _is_file_event(event: dict[str, Any]) -> bool:
+    return str(event.get("event_type") or "") in _FILE_EVENT_TYPES
+
+
+def _path_in_home(path: str, home_dir: str) -> bool:
+    # Relative paths are treated as in-scope; absolute paths must be under home.
+    p = path.strip()
+    if not p.startswith("/"):
+        return True
+    normalized = p.rstrip("/")
+    home_norm = home_dir.rstrip("/")
+    return normalized == home_norm or normalized.startswith(home_norm + "/")
+
+
+def _infer_home_dir(events: list[dict[str, Any]]) -> str | None:
+    """Infer the most likely home directory from observed file paths."""
+    counts: dict[str, int] = {}
+    for event in events:
+        for key in ("path", "src", "exec_path", "command"):
+            raw = str(event.get(key) or "").strip()
+            if not raw.startswith("/home/"):
+                continue
+            parts = Path(raw).parts
+            if len(parts) < 3:
+                continue
+            candidate = str(Path(parts[0]) / parts[1] / parts[2])
+            counts[candidate] = counts.get(candidate, 0) + 1
+
+    if counts:
+        return max(counts.items(), key=lambda item: item[1])[0]
+
+    host_home = os.getenv("MANTLE_HOST_HOME", "").strip()
+    if host_home.startswith("/home/"):
+        return host_home
+
+    env_home = os.getenv("HOME", "").strip()
+    if env_home.startswith("/home/"):
+        return env_home
+    # Last-resort constraint for Linux host-style home layouts.
+    return "/home"
+
+
+def _filter_file_events_to_home(
+    events: list[dict[str, Any]],
+    *,
+    home_dir: str | None,
+) -> list[dict[str, Any]]:
+    if not home_dir:
+        return events
+
+    filtered: list[dict[str, Any]] = []
+    for event in events:
+        if not _is_file_event(event):
+            filtered.append(event)
+            continue
+
+        # Keep file events only if at least one file path is under home.
+        in_home = False
+        for key in ("path", "src"):
+            raw = str(event.get(key) or "").strip()
+            if raw and _path_in_home(raw, home_dir):
+                in_home = True
+                break
+        if in_home:
+            filtered.append(event)
+    return filtered
+
+
 def compute_reward_status(
     *,
     guide_trace_id: str,
@@ -126,17 +218,19 @@ def compute_reward_status(
     Reads BPF events from SQLite for both traces and runs the default
     reward algorithm.
     """
-    # Fetch sys events for guide and active traces from SQLite.
-    guide_events = sqlite_store.events_for_window(
-        guide_trace_id, start_ts_ns=0, end_ts_ns=2**63 - 1,
-    )
-    current_events = sqlite_store.events_for_window(
-        active_trace_id, start_ts_ns=0, end_ts_ns=2**63 - 1,
-    )
+    # Fetch only events that fall within tool-call windows for each trace.
+    guide_events = _events_for_tool_windows(sqlite_store, guide_trace_id)
+    current_events = _events_for_tool_windows(sqlite_store, active_trace_id)
 
     # Filter to sys events only (BPF events, not proxy/agent events).
     guide_sys = [e for e in guide_events if e.get("event_kind") == "sys"]
     current_sys = [e for e in current_events if e.get("event_kind") == "sys"]
+
+    # Drop file events outside the inferred home directory to reduce noise.
+    guide_home = _infer_home_dir(guide_sys)
+    current_home = _infer_home_dir(current_sys)
+    guide_sys = _filter_file_events_to_home(guide_sys, home_dir=guide_home)
+    current_sys = _filter_file_events_to_home(current_sys, home_dir=current_home)
 
     ri = RewardInput(
         guide_events=guide_sys,
@@ -145,6 +239,8 @@ def compute_reward_status(
             "process_name": process_name,
             "guide_trace_id": guide_trace_id,
             "active_trace_id": active_trace_id,
+            "guide_home_dir": guide_home,
+            "active_home_dir": current_home,
         },
     )
 
@@ -160,4 +256,8 @@ def compute_reward_status(
         "pending": result.pending,
         "next_hint": result.next_hint,
         "checkpoints": result.raw.get("checkpoints", []),
+        "guide_home_dir": guide_home,
+        "active_home_dir": current_home,
+        "guide_event_count": len(guide_sys),
+        "active_event_count": len(current_sys),
     }

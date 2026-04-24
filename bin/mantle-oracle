@@ -4,7 +4,7 @@ set -euo pipefail
 # mantle-oracle — Agent-callable oracle for guided reward evaluation.
 #
 # Usage:
-#   mantle-oracle --process-name <name> --trace-id <id>
+#   mantle-oracle --process-name <name> [--trace-id <id>]
 #
 # Queries the mantle server for the current reward status of a trace
 # against its process's guide trace and prints structured JSON to stdout.
@@ -12,22 +12,26 @@ set -euo pipefail
 usage() {
     cat <<'EOF'
 Usage:
-    mantle-oracle --process-name <name> --trace-id <id>
+    mantle-oracle [--debug] --process-name <name> [--trace-id <id>]
 
 Options:
+    --debug         Print full JSON response (previous behavior)
     --process-name  Name of the process (required)
-    --trace-id      ID of the active trace (required)
+    --trace-id      ID of the active trace (optional)
 
 Environment:
     MANTLE_SERVER_URL  Server base URL (default: http://127.0.0.1:8099)
 
 Output:
-    JSON object with fields: progress, score, satisfied, pending, next_hint
+    With --trace-id: progress, score, satisfied, pending, checkpoints
+    Without --trace-id: checkpoint details only (no score)
+    --debug: full JSON response
 EOF
 }
 
 process_name=""
 trace_id=""
+debug=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -47,6 +51,10 @@ while [[ $# -gt 0 ]]; do
             trace_id="$2"
             shift 2
             ;;
+        --debug)
+            debug=true
+            shift
+            ;;
         -h|--help|help)
             usage
             exit 0
@@ -59,17 +67,111 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "$process_name" ]] || [[ -z "$trace_id" ]]; then
-    echo "Error: --process-name and --trace-id are required." >&2
+if [[ -z "$process_name" ]]; then
+    echo "Error: --process-name is required." >&2
     usage
     exit 1
 fi
 
 server_url="${MANTLE_SERVER_URL:-http://127.0.0.1:8099}"
 
-response=$(curl -sf "${server_url}/api/traces/${trace_id}/reward-status" 2>/dev/null) || {
-    echo '{"error": "failed to reach mantle server", "progress": 0}' 
-    exit 1
-}
+if [[ -n "$trace_id" ]]; then
+    response=$(curl -sf "${server_url}/api/traces/${trace_id}/reward-status" 2>/dev/null) || {
+        echo '{"error": "failed to reach mantle server", "progress": 0}'
+        exit 1
+    }
+else
+    response=$(curl -sf "${server_url}/api/processes/${process_name}/checkpoint-details" 2>/dev/null) || {
+        echo '{"error": "failed to reach mantle server", "checkpoints": []}'
+        exit 1
+    }
+fi
 
-echo "$response"
+if $debug; then
+    echo "$response"
+    exit 0
+fi
+
+if [[ -z "$trace_id" ]]; then
+ORACLE_RESPONSE="$response" /home/harshith/code_projects/mantle/.venv/bin/python - <<'PY'
+import json
+import os
+import sys
+
+raw = os.environ.get("ORACLE_RESPONSE", "")
+try:
+    data = json.loads(raw)
+except json.JSONDecodeError:
+    print("checkpoints: -")
+    sys.exit(0)
+
+checkpoints = data.get("checkpoints") or []
+
+def _join_lines(items):
+    if not items:
+        return "-"
+    return "; ".join(str(item) for item in items)
+
+details = []
+for cp in checkpoints:
+    if isinstance(cp, dict):
+        name = str(cp.get("name") or "").strip()
+        desc = str(cp.get("description") or "").strip()
+        if name and desc:
+            details.append(f"{name} ({desc})")
+        elif name:
+            details.append(name)
+    else:
+        text = str(cp).strip()
+        if text:
+            details.append(text)
+
+print(f"checkpoints: {_join_lines(details)}")
+PY
+exit 0
+fi
+
+ORACLE_RESPONSE="$response" /home/harshith/code_projects/mantle/.venv/bin/python - <<'PY'
+import json
+import os
+import sys
+
+raw = os.environ.get("ORACLE_RESPONSE", "")
+try:
+    data = json.loads(raw)
+except json.JSONDecodeError:
+    print("progress: 0")
+    print("score: 0")
+    print("satisfied: -")
+    print("pending: -")
+    print("checkpoints: -")
+    sys.exit(0)
+
+progress = data.get("progress", 0)
+score = data.get("score", 0)
+satisfied = data.get("satisfied") or []
+pending = data.get("pending") or []
+checkpoints = data.get("checkpoints") or []
+
+def _join_lines(items):
+    if not items:
+        return "-"
+    return "; ".join(str(item) for item in items)
+
+if checkpoints:
+    checkpoint_names = []
+    for cp in checkpoints:
+        if isinstance(cp, dict):
+            checkpoint_names.append(str(cp.get("name") or ""))
+        else:
+            checkpoint_names.append(str(cp))
+    checkpoint_text = _join_lines([n for n in checkpoint_names if n])
+else:
+    checkpoint_text = "-"
+
+print(f"progress: {progress}")
+print(f"score: {score}")
+print(f"satisfied: {_join_lines(satisfied)}")
+print(f"pending: {_join_lines(pending)}")
+print(f"checkpoints: {checkpoint_text}")
+PY

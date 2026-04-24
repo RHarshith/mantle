@@ -212,6 +212,37 @@ def reward_status(trace_id: str) -> dict[str, Any]:
 	)
 
 
+@app.get("/api/processes/{process_name}/checkpoint-details")
+def process_checkpoint_details(process_name: str) -> dict[str, Any]:
+	"""Return guide-derived checkpoint details for a process without scoring."""
+	from mantle.reward.checkpoints import extract_checkpoints
+	from mantle.reward.engine import _events_for_tool_windows, _filter_file_events_to_home, _infer_home_dir
+
+	guide_trace_id = store.get_guide_trace(process_name)
+	if not guide_trace_id:
+		return {
+			"error": "no_guide_trace",
+			"process_name": process_name,
+			"checkpoints": [],
+		}
+
+	guide_events = _events_for_tool_windows(store.sqlite_store, guide_trace_id)
+	guide_sys = [e for e in guide_events if e.get("event_kind") == "sys"]
+	guide_home = _infer_home_dir(guide_sys)
+	guide_sys = _filter_file_events_to_home(guide_sys, home_dir=guide_home)
+	checkpoints = extract_checkpoints(guide_sys)
+
+	return {
+		"process_name": process_name,
+		"guide_trace_id": guide_trace_id,
+		"checkpoints": [
+			{"name": cp.name, "description": cp.description}
+			for cp in checkpoints
+		],
+		"guide_home_dir": guide_home,
+	}
+
+
 @app.get("/api/config")
 def config() -> dict[str, Any]:
 	"""Expose effective dashboard backend configuration."""
