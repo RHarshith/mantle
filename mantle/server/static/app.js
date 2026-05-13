@@ -2718,6 +2718,9 @@ function renderReplayShell(overview) {
     }
   }
 
+  const existingList = graphCanvas.querySelector(".replay-turn-list");
+  const scrollPos = existingList ? existingList.scrollTop : 0;
+
   const turns = (overview || {}).turns || [];
   const turnButtons = turns.map((turn) => {
     const active = turn.turn_id === currentReplayTurnId;
@@ -2745,6 +2748,11 @@ function renderReplayShell(overview) {
         <div class="replay-empty">Select a turn to inspect context and action details.</div>
       </section>
     </div>`;
+
+  const newList = graphCanvas.querySelector(".replay-turn-list");
+  if (newList && scrollPos > 0) {
+    newList.scrollTop = scrollPos;
+  }
 
   graphCanvas.querySelectorAll(".replay-turn-item").forEach((btn) => {
     btn.addEventListener("click", async () => {
@@ -3049,6 +3057,7 @@ async function selectTrace(traceId) {
   currentTurnId = null;
   currentReplayTurnId = null;
   viewStack = [];
+  graphCanvas.innerHTML = "";
   renderTraceList(cachedTraces);
   renderBreadcrumbs();
   graphWrapper.classList.toggle("replay-mode", true);
