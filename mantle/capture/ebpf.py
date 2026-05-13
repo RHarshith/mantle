@@ -588,7 +588,7 @@ def run_capture(
     # Increase bpftrace str() buffer size to avoid path truncation.
     # Default is 64 bytes which truncates most real filesystem paths.
     bpf_env = os.environ.copy()
-    bpf_env.setdefault("BPFTRACE_STR_LEN", "200")
+    bpf_env.setdefault("BPFTRACE_MAX_STRLEN", "128")
 
     proc = subprocess.Popen(
         ["bpftrace", "-q", str(bt_script), str(cgroup_id)],
