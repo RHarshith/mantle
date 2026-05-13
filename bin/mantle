@@ -249,7 +249,11 @@ watch_cmd() {
     # Generate trace ID
     local agent_tag
     agent_tag="$(basename "$resolved_executable")"
-    [[ -z "$trace_id" ]] && trace_id="${agent_tag}_$(date +%Y%m%d_%H%M%S).ebpf.jsonl"
+    if [[ -z "$trace_id" ]]; then
+        trace_id="${agent_tag}_$(date +%Y%m%d_%H%M%S).ebpf.jsonl"
+    elif [[ "$trace_id" != *.ebpf.jsonl ]]; then
+        trace_id="${trace_id}.ebpf.jsonl"
+    fi
     local trace_basename="${trace_id%.ebpf.jsonl}"
     local output_file="$obs_root/traces/$trace_id"
 

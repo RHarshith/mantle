@@ -122,6 +122,11 @@ class TraceState:
     payload_intervals: list[tuple[float, float, str]] = field(default_factory=list)  # (start_ts, end_ts, host:port) sorted by start_ts
     sys_events: list[dict[str, Any]] = field(default_factory=list)
     agent_events: list[dict[str, Any]] = field(default_factory=list)
+    # ── Performance tracking ──
+    _dirty: bool = False
+    _last_synced_version: tuple[int, int, int] = (0, 0, 0)  # (sys_count, agent_count, proxy_offset)
+    _llm_calls_cache: list[dict[str, Any]] | None = None
+    _llm_calls_cache_offset: int = 0
 
 
 class TraceStore:
@@ -154,6 +159,10 @@ class TraceStore:
         db_path = trace_dir.parent / "mantle_events.db"
         schema_path = Path(__file__).with_name("sql") / "schema.sql"
         self.sqlite_store = SQLiteTraceStore(db_path=db_path, schema_path=schema_path)
+        # In-memory caches keyed by (trace_id, version) for hot-path acceleration
+        self._turn_overview_cache: dict[str, tuple[int, dict[str, Any]]] = {}
+        self._turn_detail_cache: dict[tuple[str, str], tuple[int, dict[str, Any]]] = {}
+        self._trace_anomaly_cache: dict[str, tuple[int, dict[str, Any]]] = {}
 
     def _builtin_llm_api_schemas(self) -> list[dict[str, Any]]:
         """Return builtin LLM API schema definitions."""
@@ -516,6 +525,21 @@ class TraceStore:
             return []
         return parse_llm_calls_from_capture(trace.proxy_path, self.llm_api_schemas)
 
+    def _cached_parse_llm_calls(self, trace: TraceState) -> list[dict[str, Any]]:
+        """Cache-aware wrapper for _parse_llm_calls_from_capture.
+
+        Only re-parses when proxy_offset changes (i.e., new data was appended).
+        """
+        if (
+            trace._llm_calls_cache is not None
+            and trace._llm_calls_cache_offset == trace.proxy_offset
+        ):
+            return trace._llm_calls_cache
+        result = self._parse_llm_calls_from_capture(trace)
+        trace._llm_calls_cache = result
+        trace._llm_calls_cache_offset = trace.proxy_offset
+        return result
+
     def _trace_to_event_candidates(self, trace_file: Path) -> list[Path]:
         name = trace_file.name
         no_ext = trace_file.stem
@@ -562,33 +586,57 @@ class TraceStore:
             if not state.proxy_path and (self.proxy_dir or self.proxy_log_file):
                 state.proxy_path = self._find_proxy_file(state.trace_id)
 
+            trace_changed = False
             if state.trace_path.exists():
-                changed = self._tail_ebpf_events(state) or changed
+                trace_changed = self._tail_ebpf_events(state) or trace_changed
             has_native = self._tail_events(state)
-            changed = has_native or changed
+            trace_changed = has_native or trace_changed
 
             active_capture = self._active_llm_capture_path(state)
-            if active_capture is None:
+            if active_capture is not None:
+                # If no native events FILE exists, continuously tail proxy capture
+                # (don't check `state.agent_events` — that becomes non-empty after the
+                # first payload read and would block all subsequent reads)
+                native_file_exists = any(
+                    c.exists() for c in state.events_path_candidates
+                )
+                if native_file_exists:
+                    # Native events provide agent events; only extract
+                    # network interval data from the selected LLM capture.
+                    trace_changed = self._tail_litellm_capture_events(state, intervals_only=True) or trace_changed
+                else:
+                    trace_changed = self._tail_litellm_capture_events(state) or trace_changed
+
+            if trace_changed:
+                state._dirty = True
+                changed = True
+
+        # Only sync traces that actually have new data
+        any_synced = False
+        for state in self.traces.values():
+            if not state._dirty:
                 continue
+            current_version = self._trace_data_version(state)
+            if current_version == state._last_synced_version:
+                state._dirty = False
+                continue
+            self._sync_trace_to_sqlite(state)
+            state._last_synced_version = current_version
+            state._dirty = False
+            any_synced = True
 
-            # If no native events FILE exists, continuously tail proxy capture
-            # (don't check `state.agent_events` — that becomes non-empty after the
-            # first payload read and would block all subsequent reads)
-            native_file_exists = any(
-                c.exists() for c in state.events_path_candidates
-            )
-            if native_file_exists:
-                # Native events provide agent events; only extract
-                # network interval data from the selected LLM capture.
-                changed = self._tail_litellm_capture_events(state, intervals_only=True) or changed
-            else:
-                changed = self._tail_litellm_capture_events(state) or changed
-
-        if changed:
-            for state in self.traces.values():
-                self._sync_trace_to_sqlite(state)
+        if any_synced:
             async with self._lock:
                 self.version += 1
+                # Invalidate in-memory caches
+                self._turn_overview_cache.clear()
+                self._turn_detail_cache.clear()
+                self._trace_anomaly_cache.clear()
+
+    @staticmethod
+    def _trace_data_version(state: TraceState) -> tuple[int, int, int]:
+        """Lightweight version key for cache invalidation."""
+        return (len(state.sys_events), len(state.agent_events), state.proxy_offset)
 
     def _sync_trace_to_sqlite(self, state: TraceState) -> None:
         """Persist the current in-memory trace state to SQLite tables."""
@@ -599,6 +647,8 @@ class TraceStore:
             agent_events=state.agent_events,
             turns=turns,
         )
+        # Persist pre-computed turn metrics so API endpoints become pure DB reads
+        self.sqlite_store.replace_turn_computed(state.trace_id, turns)
 
     def _read_new_lines(self, path: Path, start_offset: int) -> tuple[list[str], int]:
         if not path.exists():
@@ -668,6 +718,7 @@ class TraceStore:
         ]
         if trace_id.endswith(".ebpf.jsonl"):
             base = trace_id[: -len(".ebpf.jsonl")]
+            candidates.append(self.proxy_dir / base)
             candidates.append(self.proxy_dir / f"{base}.proxy.jsonl")
             candidates.append(self.proxy_dir / f"{base}.log")
 
@@ -3839,12 +3890,29 @@ class TraceStore:
         return out
 
     def _trace_anomaly_summary(self, trace: TraceState) -> dict[str, Any]:
-        reports = [
-            turn.get("anomaly")
-            for turn in self._turns_for_trace(trace)
-            if isinstance(turn.get("anomaly"), dict)
-        ]
-        return aggregate_tool_anomaly_reports(reports)
+        # Check in-memory cache first
+        cached = self._trace_anomaly_cache.get(trace.trace_id)
+        if cached is not None and cached[0] == self.version:
+            return cached[1]
+
+        # Read pre-computed anomaly data from DB instead of calling _turns_for_trace
+        computed_turns = self.sqlite_store.get_turns_computed(trace.trace_id)
+        if computed_turns:
+            reports = [
+                turn.get("anomaly")
+                for turn in computed_turns
+                if isinstance(turn.get("anomaly"), dict)
+            ]
+        else:
+            # Fallback: if no pre-computed data yet (first load), use _turns_for_trace
+            reports = [
+                turn.get("anomaly")
+                for turn in self._turns_for_trace(trace)
+                if isinstance(turn.get("anomaly"), dict)
+            ]
+        result = aggregate_tool_anomaly_reports(reports)
+        self._trace_anomaly_cache[trace.trace_id] = (self.version, result)
+        return result
 
     def _collapse_files_into_folders(
         self,
@@ -4413,16 +4481,91 @@ class TraceStore:
 
     def replay_turns_overview(self, trace_id: str) -> dict[str, Any]:
         trace = self._get_trace(trace_id)
+        # Try DB-first: read pre-computed turn data
+        computed_turns = self.sqlite_store.get_turns_computed(trace_id)
+        if computed_turns:
+            return build_replay_overview(trace_id, computed_turns)
+        # Fallback: compute from in-memory data
         turns = self._turns_for_trace(trace)
         return build_replay_overview(trace_id, turns)
 
     def replay_turn_detail(self, trace_id: str, turn_id: str) -> dict[str, Any]:
         trace = self._get_trace(trace_id)
+
+        # Try DB-first path
+        computed = self.sqlite_store.get_turn_computed(trace_id, turn_id)
+        if computed is not None:
+            return self._replay_turn_detail_from_computed(trace, trace_id, turn_id, computed)
+
+        # Fallback: use _turns_for_trace
         turns = self._turns_for_trace(trace)
         match = next((turn for turn in turns if str(turn.get("turn_id")) == turn_id), None)
         if match is None:
             raise KeyError(turn_id)
 
+        return self._replay_turn_detail_from_match(trace, trace_id, match, turns)
+
+    def _replay_turn_detail_from_computed(
+        self, trace: TraceState, trace_id: str, turn_id: str, computed: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Build replay_turn_detail from pre-computed DB data."""
+        start_ts = computed.get("start_ts")
+        end_ts = computed.get("end_ts")
+
+        # Fetch sys_events from DB scoped to this turn's time window
+        if start_ts is not None and end_ts is not None:
+            start_ns = int(start_ts * 1_000_000_000)
+            end_ns = int(end_ts * 1_000_000_000)
+            sys_events = self.sqlite_store.sys_events_for_turn_window(trace_id, start_ns, end_ns)
+        else:
+            sys_events = []
+
+        tool_pairs = list(computed.get("tool_pairs") or [])
+        anomaly_by_id: dict[str, dict[str, Any]] = {}
+        reports_seq = list(computed.get("tool_anomalies") or [])
+        for idx, tp in enumerate(tool_pairs):
+            tool_call_id = str(tp.get("tool_call_id") or "").strip()
+            if not tool_call_id:
+                continue
+            report = reports_seq[idx] if idx < len(reports_seq) and isinstance(reports_seq[idx], dict) else None
+            if report is not None:
+                anomaly_by_id[tool_call_id] = report
+        paired_tool_calls = self._replay_tool_call_pairs(trace, sys_events, tool_pairs, anomaly_by_id)
+        file_activity = self._replay_file_activity(sys_events)
+        subprocesses = self._replay_subprocesses(trace, sys_events)
+
+        replay_payload = build_replay_turn_detail(trace_id, computed)
+        replay_payload["tool_call_response_pairs"] = paired_tool_calls
+        replay_payload["summary"] = {
+            "tool_calls": int(computed.get("tool_call_count") or 0),
+            "context_tokens": self._count_text_tokens_tiktoken(replay_payload.get("context", {}).get("text") or ""),
+            "files_read": int(computed.get("files_read_count") or 0),
+            "files_written": int(computed.get("files_written_count") or 0),
+            "subprocesses_spawned": len(subprocesses),
+            "network_calls": int(computed.get("network_call_count") or 0),
+            "context_sections": len((replay_payload.get("context") or {}).get("sections") or []),
+            "action_sections": len((replay_payload.get("action") or {}).get("sections") or []),
+            "tool_call_pairs": paired_tool_calls,
+            "anomaly": computed.get("anomaly") or aggregate_tool_anomaly_reports(list(anomaly_by_id.values())),
+            "file_activity": file_activity,
+            "subprocesses": subprocesses,
+        }
+        replay_payload["raw_events_anomaly"] = computed.get("raw_events_anomaly") or self._tool_anomaly_detector.verified_report(
+            "outside tool call activity",
+            root_pid=int(trace.root_pid or 0),
+        )
+        replay_payload["raw_events_has_anomaly"] = bool(computed.get("raw_events_has_anomaly") or False)
+
+        # Build source maps from all computed turns
+        all_computed = self.sqlite_store.get_turns_computed(trace_id)
+        call_source_map, text_source_map = self._replay_tool_output_source_maps(trace, all_computed or [])
+        self._attach_replay_tool_output_sources(replay_payload, call_source_map, text_source_map)
+        return replay_payload
+
+    def _replay_turn_detail_from_match(
+        self, trace: TraceState, trace_id: str, match: dict[str, Any], turns: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Build replay_turn_detail from in-memory turn dict (fallback)."""
         sys_events = list(match.get("_sys_events", []))
         tool_pairs = list(match.get("_tool_pairs", []))
         anomaly_by_id: dict[str, dict[str, Any]] = {}
@@ -4832,7 +4975,9 @@ class TraceStore:
 
     def replay_state_diff(self, trace_id: str, from_turn_id: str | None = None, to_turn_id: str | None = None) -> dict[str, Any]:
         trace = self._get_trace(trace_id)
-        turns = self._turns_for_trace(trace)
+        # Try DB-first
+        computed_turns = self.sqlite_store.get_turns_computed(trace_id)
+        turns = computed_turns if computed_turns else self._turns_for_trace(trace)
         if not turns:
             return {
                 "trace_id": trace_id,
@@ -4938,7 +5083,9 @@ class TraceStore:
         to_turn_id: str | None = None,
     ) -> dict[str, Any]:
         trace = self._get_trace(trace_id)
-        turns = self._turns_for_trace(trace)
+        # Try DB-first
+        computed_turns = self.sqlite_store.get_turns_computed(trace_id)
+        turns = computed_turns if computed_turns else self._turns_for_trace(trace)
         if not turns:
             raise KeyError(path)
 
@@ -5563,12 +5710,15 @@ class TraceStore:
         return timeline
 
     def turns_overview(self, trace_id: str) -> dict[str, Any]:
-        trace = self._get_trace(trace_id)
-        rows = self.sqlite_store.list_turns(trace_id)
-        turn_anomaly_by_id = {
-            str(turn.get("turn_id") or ""): turn.get("anomaly") or aggregate_tool_anomaly_reports(list(turn.get("_tool_anomalies") or []))
-            for turn in self._turns_for_trace(trace)
-        }
+        # Check in-memory cache first
+        cached = self._turn_overview_cache.get(trace_id)
+        if cached is not None and cached[0] == self.version:
+            return cached[1]
+
+        self._get_trace(trace_id)  # validate trace exists
+
+        # Read all pre-computed turn data from DB — no _turns_for_trace() call
+        computed_turns = self.sqlite_store.get_turns_computed(trace_id)
 
         turn_rows: list[dict[str, Any]] = []
         tool_calls_total = 0
@@ -5577,45 +5727,47 @@ class TraceStore:
         network_total = 0
         subprocess_total = 0
 
-        for row in rows:
-            metadata: dict[str, Any] = {}
-            try:
-                parsed = json.loads(str(row["metadata"] or "{}"))
-                if isinstance(parsed, dict):
-                    metadata = parsed
-            except json.JSONDecodeError:
-                metadata = {}
-
-            turn_id = int(row["turn_id"])
-            start_ns = int(row["start_ts_ns"])
-            end_ns = int(row["end_ts_ns"])
-
-            tool_calls = len(self.sqlite_store.tool_calls_for_turn(trace_id, turn_id))
-            tool_calls_total += tool_calls
-            files_read_total += self.sqlite_store.unique_paths_in_window(trace_id, start_ns, end_ns, ["file_read"])
-            files_written_total += self.sqlite_store.unique_paths_in_window(
-                trace_id,
-                start_ns,
-                end_ns,
-                ["file_write", "file_delete", "file_rename"],
-            )
-            network_total += self.sqlite_store.count_event_type_in_window(trace_id, start_ns, end_ns, "net_connect")
-            subprocess_total += self.sqlite_store.count_event_type_in_window(trace_id, start_ns, end_ns, "process_spawn")
+        for ct in computed_turns:
+            tool_calls_total += int(ct.get("tool_call_count") or 0)
+            files_read_total += int(ct.get("files_read_count") or 0)
+            files_written_total += int(ct.get("files_written_count") or 0)
+            network_total += int(ct.get("network_call_count") or 0)
+            subprocess_total += int(ct.get("subprocess_direct_count") or 0)
 
             turn_rows.append(
                 {
-                    "turn_id": str(metadata.get("turn_id") or f"turn_{turn_id}"),
-                    "label": str(metadata.get("label") or f"Turn {turn_id}"),
-                    "index": int(metadata.get("index") or turn_id),
-                    "tool_call_count": int(metadata.get("tool_call_count") or tool_calls),
-                    "tags": list(metadata.get("tags") or []),
-                    "dominant_summary": str(metadata.get("dominant_summary") or ""),
-                    "anomaly": turn_anomaly_by_id.get(
-                        str(metadata.get("turn_id") or f"turn_{turn_id}"),
-                        aggregate_tool_anomaly_reports([]),
-                    ),
+                    "turn_id": str(ct.get("turn_id") or ""),
+                    "label": str(ct.get("label") or ""),
+                    "index": int(ct.get("index") or 0),
+                    "tool_call_count": int(ct.get("tool_call_count") or 0),
+                    "tags": list(ct.get("tags") or []),
+                    "dominant_summary": str(ct.get("dominant_summary") or ""),
+                    "anomaly": ct.get("anomaly") or aggregate_tool_anomaly_reports([]),
                 }
             )
+
+        # If no pre-computed data yet, fall back to the old path
+        if not turn_rows:
+            trace = self._get_trace(trace_id)
+            turns = self._turns_for_trace(trace)
+            for turn in turns:
+                tc = int(turn.get("tool_call_count") or 0)
+                tool_calls_total += tc
+                files_read_total += int(turn.get("files_read_count") or 0)
+                files_written_total += int(turn.get("files_written_count") or 0)
+                network_total += int(turn.get("network_call_count") or 0)
+                subprocess_total += int(turn.get("subprocess_direct_count") or 0)
+                turn_rows.append(
+                    {
+                        "turn_id": str(turn.get("turn_id") or ""),
+                        "label": str(turn.get("label") or ""),
+                        "index": int(turn.get("index") or 0),
+                        "tool_call_count": tc,
+                        "tags": list(turn.get("tags") or []),
+                        "dominant_summary": str(turn.get("dominant_summary") or ""),
+                        "anomaly": turn.get("anomaly") or aggregate_tool_anomaly_reports([]),
+                    }
+                )
 
         turn_count = len([r for r in turn_rows if r.get("turn_id") != "setup"])
         anomaly_rows = [row.get("anomaly") for row in turn_rows if isinstance(row.get("anomaly"), dict)]
@@ -5634,7 +5786,7 @@ class TraceStore:
         }
         turns_total_violations = sum(int(item.get("total_violations") or 0) for item in anomaly_rows)
 
-        return {
+        result = {
             "trace_id": trace_id,
             "executive_summary": {
                 "turns": turn_count,
@@ -5653,14 +5805,116 @@ class TraceStore:
             },
             "turns": turn_rows,
         }
+        self._turn_overview_cache[trace_id] = (self.version, result)
+        return result
 
     def turn_detail(self, trace_id: str, turn_id: str) -> dict[str, Any]:
+        # Check in-memory cache first
+        cache_key = (trace_id, turn_id)
+        cached = self._turn_detail_cache.get(cache_key)
+        if cached is not None and cached[0] == self.version:
+            return cached[1]
+
         t = self._get_trace(trace_id)
+
+        # Try DB-first path: read pre-computed data
+        computed = self.sqlite_store.get_turn_computed(trace_id, turn_id)
+        if computed is not None:
+            result = self._turn_detail_from_computed(t, trace_id, turn_id, computed)
+            self._turn_detail_cache[cache_key] = (self.version, result)
+            return result
+
+        # Fallback: use _turns_for_trace (only before first sync)
         turns = self._turns_for_trace(t)
         match = next((turn for turn in turns if str(turn.get("turn_id")) == turn_id), None)
         if match is None:
             raise KeyError(turn_id)
 
+        result = self._turn_detail_from_match(t, trace_id, turn_id, match)
+        self._turn_detail_cache[cache_key] = (self.version, result)
+        return result
+
+    def _turn_detail_from_computed(
+        self, t: TraceState, trace_id: str, turn_id: str, computed: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Build turn_detail response from pre-computed DB data + scoped sys_events."""
+        start_ts = computed.get("start_ts")
+        end_ts = computed.get("end_ts")
+
+        # Fetch sys_events from DB scoped to this turn's time window
+        if start_ts is not None and end_ts is not None:
+            start_ns = int(start_ts * 1_000_000_000)
+            end_ns = int(end_ts * 1_000_000_000)
+            sys_events = self.sqlite_store.sys_events_for_turn_window(trace_id, start_ns, end_ns)
+        else:
+            sys_events = []
+
+        tool_pairs = list(computed.get("tool_pairs") or [])
+        anomaly_by_id: dict[str, dict[str, Any]] = {}
+        reports_seq = list(computed.get("tool_anomalies") or [])
+        for idx, tp in enumerate(tool_pairs):
+            tool_call_id = str(tp.get("tool_call_id") or "").strip()
+            if not tool_call_id:
+                continue
+            report = reports_seq[idx] if idx < len(reports_seq) and isinstance(reports_seq[idx], dict) else None
+            if report is not None:
+                anomaly_by_id[tool_call_id] = report
+
+        timeline = self._build_unified_timeline(
+            t,
+            sys_events,
+            tool_pairs,
+            anomaly_by_id,
+            anchor_pid=int(t.root_pid or 0) or None,
+        )
+
+        direct_children = {
+            int(e.get("child_pid") or 0)
+            for e in sys_events
+            if str(e.get("type") or "") == "process_spawn" and int(e.get("child_pid") or 0) > 0
+        }
+        direct_children.update(
+            int(e.get("pid") or 0)
+            for e in sys_events
+            if str(e.get("type") or "") == "command_exec"
+            and int(e.get("pid") or 0) > 0
+            and int(e.get("ppid") or 0) > 0
+            and int(e.get("pid") or 0) != int(e.get("ppid") or 0)
+        )
+        net_calls = [e for e in sys_events if str(e.get("type") or "") == "net_connect"]
+
+        return {
+            "trace_id": trace_id,
+            "turn_id": turn_id,
+            "label": computed.get("label"),
+            "summary": {
+                "tool_calls": int(computed.get("tool_call_count") or 0),
+                "files_read": int(computed.get("files_read_count") or 0),
+                "files_written": int(computed.get("files_written_count") or 0),
+                "subprocesses_spawned": len([pid for pid in direct_children if int(pid) > 0]),
+                "network_calls": len(net_calls),
+                "anomaly": computed.get("anomaly") or aggregate_tool_anomaly_reports(list(anomaly_by_id.values())),
+            },
+            "anomaly": computed.get("anomaly") or aggregate_tool_anomaly_reports(list(anomaly_by_id.values())),
+            "raw_events_anomaly": computed.get("raw_events_anomaly") or self._tool_anomaly_detector.verified_report(
+                "outside tool call activity",
+                root_pid=int(t.root_pid or 0),
+            ),
+            "raw_events_has_anomaly": bool(computed.get("raw_events_has_anomaly") or False),
+            "prompt_text": computed.get("prompt_text") or "",
+            "response_text": computed.get("response_text") or "",
+            "prompt_sections": computed.get("prompt_sections") or [],
+            "response_sections": computed.get("response_sections") or [],
+            "pre_tool_counts": computed.get("pre_tool_counts") or {},
+            "timeline": timeline,
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+        }
+
+    def _turn_detail_from_match(
+        self, t: TraceState, trace_id: str, turn_id: str, match: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Build turn_detail response from an in-memory turn dict (fallback path)."""
         sqlite_row = None
         if turn_id.startswith("turn_"):
             try:
@@ -6122,10 +6376,27 @@ class TraceStore:
 
     def process_subtrace(self, trace_id: str, turn_id: str, pid: int, full_lifecycle: bool = False) -> dict[str, Any]:
         t = self._get_trace(trace_id)
-        turns = self._turns_for_trace(t)
-        match = next((turn for turn in turns if str(turn.get("turn_id")) == turn_id), None)
-        if match is None and not full_lifecycle:
-            raise KeyError(turn_id)
+
+        # Try DB-first: read pre-computed turn data for this turn
+        computed = self.sqlite_store.get_turn_computed(trace_id, turn_id)
+        if computed is not None:
+            match = computed  # Use pre-computed data as 'match'
+            start_ts = computed.get("start_ts")
+            end_ts = computed.get("end_ts")
+            # Fetch sys_events from DB scoped to turn window
+            if start_ts is not None and end_ts is not None:
+                start_ns = int(start_ts * 1_000_000_000)
+                end_ns = int(end_ts * 1_000_000_000)
+                scoped_turn_events = self.sqlite_store.sys_events_for_turn_window(trace_id, start_ns, end_ns)
+            else:
+                scoped_turn_events = []
+        else:
+            # Fallback: use _turns_for_trace
+            turns = self._turns_for_trace(t)
+            match = next((turn for turn in turns if str(turn.get("turn_id")) == turn_id), None)
+            if match is None and not full_lifecycle:
+                raise KeyError(turn_id)
+            scoped_turn_events = list(match.get("_sys_events", [])) if isinstance(match, dict) else []
 
         pid = int(pid)
         if pid <= 0:
@@ -6134,7 +6405,6 @@ class TraceStore:
         # Keep process popup scoped to the selected turn when available.
         # This prevents sibling tool-call activity from other turns from
         # interleaving with this PID's file stream.
-        scoped_turn_events = list(match.get("_sys_events", [])) if isinstance(match, dict) else []
         base_events = scoped_turn_events if scoped_turn_events else list(t.sys_events)
 
         if full_lifecycle:
@@ -6298,15 +6568,30 @@ class TraceStore:
 
     def raw_resource_events(self, trace_id: str, turn_id: str, resource_type: str, resource_key: str) -> dict[str, Any]:
         t = self._get_trace(trace_id)
-        turns = self._turns_for_trace(t)
-        match = next((turn for turn in turns if str(turn.get("turn_id")) == turn_id), None)
-        if match is None:
-            raise KeyError(turn_id)
 
-        start_ts = match.get("start_ts")
+        # Try DB-first: read pre-computed turn data
+        computed = self.sqlite_store.get_turn_computed(trace_id, turn_id)
+        if computed is not None:
+            start_ts = computed.get("start_ts")
+            end_ts = computed.get("end_ts")
+            if start_ts is not None and end_ts is not None:
+                start_ns = int(start_ts * 1_000_000_000)
+                end_ns = int(end_ts * 1_000_000_000)
+                sys_events = self.sqlite_store.sys_events_for_turn_window(trace_id, start_ns, end_ns)
+            else:
+                sys_events = []
+        else:
+            # Fallback: use _turns_for_trace
+            turns = self._turns_for_trace(t)
+            match = next((turn for turn in turns if str(turn.get("turn_id")) == turn_id), None)
+            if match is None:
+                raise KeyError(turn_id)
+            start_ts = match.get("start_ts")
+            sys_events = list(match.get("_sys_events", []))
+
         rows: list[dict[str, Any]] = []
 
-        for e in match.get("_sys_events", []):
+        for e in sys_events:
             et = str(e.get("type") or "")
             include = False
             if resource_type == "file" and et in {"file_read", "file_write", "file_delete", "file_rename"}:
@@ -6678,8 +6963,13 @@ class TraceStore:
     def trace_dimension_metrics(self, trace_id: str) -> dict[str, Any]:
         """Compute correctness/safety/efficiency heuristics for one trace."""
         trace = self._get_trace(trace_id)
-        turns = self._turns_for_trace(trace)
-        llm_calls = self._parse_llm_calls_from_capture(trace)
+
+        # Try DB-first for turns
+        computed_turns = self.sqlite_store.get_turns_computed(trace_id)
+        turns = computed_turns if computed_turns else self._turns_for_trace(trace)
+
+        # Cache LLM calls at TraceState level
+        llm_calls = self._cached_parse_llm_calls(trace)
 
         agent_events = sorted(
             list(trace.agent_events),

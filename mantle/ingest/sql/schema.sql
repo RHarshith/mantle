@@ -57,3 +57,45 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 
 CREATE INDEX IF NOT EXISTS idx_tool_calls_trace_id ON tool_calls(trace_id);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_trace_turn ON tool_calls(trace_id, turn_id);
+
+CREATE TABLE IF NOT EXISTS turn_computed (
+    id INTEGER PRIMARY KEY,
+    trace_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    turn_index INTEGER NOT NULL DEFAULT 0,
+    -- Summary metrics
+    tool_call_count INTEGER NOT NULL DEFAULT 0,
+    files_read_count INTEGER NOT NULL DEFAULT 0,
+    files_written_count INTEGER NOT NULL DEFAULT 0,
+    network_call_count INTEGER NOT NULL DEFAULT 0,
+    subprocess_direct_count INTEGER NOT NULL DEFAULT 0,
+    -- Display fields
+    label TEXT NOT NULL DEFAULT '',
+    tags JSON NOT NULL DEFAULT '[]',
+    dominant_summary TEXT NOT NULL DEFAULT '',
+    -- Prompt/Response text
+    prompt_text TEXT NOT NULL DEFAULT '',
+    response_text TEXT NOT NULL DEFAULT '',
+    -- Structured sections (JSON arrays)
+    prompt_sections JSON NOT NULL DEFAULT '[]',
+    response_sections JSON NOT NULL DEFAULT '[]',
+    replay_context_sections JSON NOT NULL DEFAULT '[]',
+    replay_action_sections JSON NOT NULL DEFAULT '[]',
+    -- Anomaly data
+    anomaly JSON NOT NULL DEFAULT '{}',
+    raw_events_anomaly JSON NOT NULL DEFAULT '{}',
+    raw_events_has_anomaly INTEGER NOT NULL DEFAULT 0,
+    -- Pre-tool activity counts
+    pre_tool_counts JSON NOT NULL DEFAULT '{}',
+    first_tool_ts REAL,
+    -- Tool pair data
+    tool_pairs JSON NOT NULL DEFAULT '[]',
+    tool_anomalies JSON NOT NULL DEFAULT '[]',
+    -- Timestamps
+    start_ts REAL,
+    end_ts REAL,
+    UNIQUE(trace_id, turn_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_turn_computed_trace ON turn_computed(trace_id);
+CREATE INDEX IF NOT EXISTS idx_turn_computed_trace_turn ON turn_computed(trace_id, turn_id);
