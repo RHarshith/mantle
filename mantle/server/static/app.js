@@ -3,7 +3,8 @@
 let selectedTraceId = null;
 let cachedTraces = [];
 let latestVersion = -1;
-let activeTab = "correctness";
+let activeTab = "profiler";
+let tokenProfileChart = null;
 let replayOverview = null;
 let currentReplayTurnId = null;
 let currentReplayPaneTab = "context";
@@ -30,7 +31,7 @@ const TRACE_HIDDEN_EVENT_TYPES_STORAGE_KEY = "mantle.trace.hiddenEventTypes";
 const DEFAULT_COMPACT_TRACE_HIDDEN_EVENT_TYPES = ["fd_open", "fd_close", "fd_write", "fd_write_ret"];
 let compactTraceHiddenEventTypes = [];
 let detailedTraceViewEnabled = false;
-let allDimensionMetrics = [];
+
 let traceProcessMap = {};
 let processNames = ["default"];
 
@@ -44,9 +45,8 @@ const breadcrumbsEl = $("breadcrumbs");
 const graphWrapper = $("graphWrapper");
 const graphCanvas = $("graphCanvas");
 const detailsEl = $("details");
-const traceTabBtn = $("traceTabBtn");
+const profilerTabBtn = $("profilerTabBtn");
 const replayTabBtn = $("replayTabBtn");
-const settingsTabBtn = $("settingsTabBtn");
 const addProcessBtn = $("addProcessBtn");
 const fileToggle = $("fileToggle");
 const toolsToggle = $("toolsToggle");
@@ -550,15 +550,14 @@ function renderTraceList(traces) {
     const clearBtn = document.createElement("button");
     clearBtn.className = "btn";
     clearBtn.style.margin = "8px 12px";
-    clearBtn.textContent = "Show Dimension Overview";
+    clearBtn.textContent = "Clear Selection";
     clearBtn.addEventListener("click", async () => {
       selectedTraceId = null;
       currentReplayTurnId = null;
       renderTraceList(cachedTraces);
       renderBreadcrumbs();
       graphWrapper.classList.toggle("replay-mode", false);
-      await loadDimensionMetricsCache();
-      renderDimensionOverview(activeTab);
+      graphCanvas.innerHTML = `<div class="empty-state"><h3>Token Profiler</h3><p>Select a trace to view its token consumption profile.</p></div>`;
     });
     traceListEl.appendChild(clearBtn);
   }
@@ -624,9 +623,6 @@ function renderTraceList(traces) {
         e.stopPropagation();
         setTraceProcess(t.trace_id, moveSelect.value);
         renderTraceList(cachedTraces);
-        if (!selectedTraceId) {
-          renderDimensionOverview(activeTab);
-        }
       });
 
       const deleteBtn = row.querySelector(".trace-delete-btn");
@@ -712,118 +708,157 @@ function pct(numerator, denominator) {
   return (Number(numerator || 0) / Number(denominator || 1)) * 100;
 }
 
-function loadDimensionMetricsCache() {
-  return api("/api/dimensions/metrics").then((payload) => {
-    allDimensionMetrics = payload.traces || [];
-    return allDimensionMetrics;
-  });
+function formatBytes(bytes) {
+  const n = Number(bytes || 0);
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(2)} MB`;
 }
 
-function aggregateByProcess() {
-  const out = new Map();
-  for (const row of allDimensionMetrics || []) {
-    const traceId = String(row.trace_id || "");
-    if (!traceId) continue;
-    const processName = getTraceProcess(traceId);
-    if (!out.has(processName)) out.set(processName, []);
-    out.get(processName).push(row);
-  }
-  return out;
+async function loadTokenProfile(traceId) {
+  if (!traceId) return;
+  const payload = await api(`/api/traces/${encodeURIComponent(traceId)}/token-profile`);
+  const profile = payload.profile || [];
+  renderTokenProfileChart(profile);
 }
 
-function renderDimensionOverview(dimension) {
+function renderTokenProfileChart(profile) {
   const strip = $("summaryStrip");
-  const grouped = aggregateByProcess();
-  const rows = Array.from(grouped.entries()).sort((a, b) => a[0].localeCompare(b[0]));
 
-  if (!rows.length) {
+  if (!profile.length) {
     strip.style.gridTemplateColumns = "repeat(3, 1fr)";
     strip.innerHTML = `
-      <div class="summary-card"><div class="k">Dimension</div><div class="v">${escapeHtml(dimension)}</div></div>
-      <div class="summary-card"><div class="k">Processes</div><div class="v">0</div></div>
-      <div class="summary-card"><div class="k">Traces</div><div class="v">0</div></div>`;
-    graphCanvas.innerHTML = `<div class="empty-state"><h3>No traces available</h3><p>Run a trace, then process-level ${escapeHtml(dimension)} metrics will appear here.</p></div>`;
+      <div class="summary-card"><div class="k">Turns</div><div class="v">0</div></div>
+      <div class="summary-card"><div class="k">Total Request</div><div class="v">—</div></div>
+      <div class="summary-card"><div class="k">Total Response</div><div class="v">—</div></div>`;
+    graphCanvas.innerHTML = `<div class="empty-state"><h3>No Proxy Data</h3><p>This trace has no LLM proxy capture data. Token profiling requires proxy request/response payloads.</p></div>`;
     return;
   }
 
-  const totalTraces = rows.reduce((acc, [, traces]) => acc + traces.length, 0);
-  strip.style.gridTemplateColumns = "repeat(3, 1fr)";
+  const totalReq = profile.reduce((a, p) => a + p.request_bytes, 0);
+  const totalResp = profile.reduce((a, p) => a + p.response_bytes, 0);
+  const maxReq = Math.max(...profile.map((p) => p.request_bytes));
+  const avgDelta = profile.length ? profile.reduce((a, p) => a + p.delta_bytes, 0) / profile.length : 0;
+
+  strip.style.gridTemplateColumns = "repeat(5, 1fr)";
   strip.innerHTML = `
-    <div class="summary-card"><div class="k">Dimension</div><div class="v">${escapeHtml(dimension)}</div></div>
-    <div class="summary-card"><div class="k">Processes</div><div class="v">${formatNumber(rows.length)}</div></div>
-    <div class="summary-card"><div class="k">Traces</div><div class="v">${formatNumber(totalTraces)}</div></div>`;
+    <div class="summary-card"><div class="k">Turns</div><div class="v">${formatNumber(profile.length)}</div></div>
+    <div class="summary-card"><div class="k">Total Request</div><div class="v">${formatBytes(totalReq)}</div></div>
+    <div class="summary-card"><div class="k">Total Response</div><div class="v">${formatBytes(totalResp)}</div></div>
+    <div class="summary-card"><div class="k">Max Context</div><div class="v">${formatBytes(maxReq)}</div></div>
+    <div class="summary-card"><div class="k">Avg Tool Output</div><div class="v">${formatBytes(avgDelta)}</div></div>`;
 
-  const cards = [];
-  for (const [processName, traces] of rows) {
-    if (dimension === "correctness") {
-      const success = traces.filter((t) => (t.correctness || {}).task_completion_state === "success").length;
-      const goalScores = traces.map((t) => Number((t.correctness || {}).goal_adherence_score || 0));
-      const turns = traces.map((t) => Number((t.correctness || {}).turns_to_completion || 0));
-      const recovery = traces.map((t) => Number((t.correctness || {}).error_recovery_rate || 0));
-      const redundant = traces.map((t) => Number((t.correctness || {}).redundant_tool_call_ratio || 0));
-      cards.push(`
-        <div class="timeline-row">
-          <div class="timeline-head"><span class="row-title">Process: ${escapeHtml(processName)}</span><span class="row-sub">correctness</span></div>
-          <div class="row-content">
-            <div class="replay-summary-grid">
-              <div class="replay-summary-metric"><div class="k">Task completion rate</div><div class="v">${pct(success, traces.length).toFixed(1)}%</div></div>
-              <div class="replay-summary-metric"><div class="k">Goal adherence score</div><div class="v">${mean(goalScores).toFixed(2)}</div></div>
-              <div class="replay-summary-metric"><div class="k">Turns mean/variance</div><div class="v">${mean(turns).toFixed(2)} / ${variance(turns).toFixed(2)}</div></div>
-              <div class="replay-summary-metric"><div class="k">Error recovery rate</div><div class="v">${(mean(recovery) * 100).toFixed(1)}%</div></div>
-              <div class="replay-summary-metric"><div class="k">Redundant tool calls</div><div class="v">${(mean(redundant) * 100).toFixed(1)}%</div></div>
-            </div>
-          </div>
-        </div>`);
-      continue;
-    }
-
-    if (dimension === "safety") {
-      const scopeViol = traces.filter((t) => Boolean((t.safety || {}).scope_violation)).length;
-      const sensitive = traces.map((t) => Number((t.safety || {}).sensitive_path_access_count || 0));
-      const external = traces.filter((t) => Boolean((t.safety || {}).external_network_call)).length;
-      const creds = traces.filter((t) => Boolean((t.safety || {}).credential_pattern_detected)).length;
-      const blast = traces.map((t) => Number((t.safety || {}).blast_radius_files_written || 0));
-      const irreversible = traces.map((t) => Number((t.safety || {}).irreversible_action_rate || 0));
-      cards.push(`
-        <div class="timeline-row">
-          <div class="timeline-head"><span class="row-title">Process: ${escapeHtml(processName)}</span><span class="row-sub">safety</span></div>
-          <div class="row-content">
-            <div class="replay-summary-grid">
-              <div class="replay-summary-metric"><div class="k">Scope violation rate</div><div class="v">${pct(scopeViol, traces.length).toFixed(1)}%</div></div>
-              <div class="replay-summary-metric"><div class="k">Sensitive path access</div><div class="v">${mean(sensitive).toFixed(2)} / trace</div></div>
-              <div class="replay-summary-metric"><div class="k">External network call rate</div><div class="v">${pct(external, traces.length).toFixed(1)}%</div></div>
-              <div class="replay-summary-metric"><div class="k">Credential pattern detection</div><div class="v">${pct(creds, traces.length).toFixed(1)}%</div></div>
-              <div class="replay-summary-metric"><div class="k">Blast radius (files written)</div><div class="v">${mean(blast).toFixed(2)}</div></div>
-              <div class="replay-summary-metric"><div class="k">Irreversible action rate</div><div class="v">${(mean(irreversible) * 100).toFixed(1)}%</div></div>
-            </div>
-          </div>
-        </div>`);
-      continue;
-    }
-
-    const tokenEff = traces.map((t) => Number((t.efficiency || {}).token_efficiency || 0));
-    const toolEff = traces.map((t) => Number((t.efficiency || {}).tool_call_efficiency || 0));
-    const contextUtil = traces.map((t) => Number((t.efficiency || {}).context_utilization || 0));
-    const turnTime = traces.map((t) => Number((t.efficiency || {}).avg_turn_time_ms || 0));
-    const retryRate = traces.map((t) => Number((t.efficiency || {}).retry_rate || 0));
-    const firstSuccess = traces.map((t) => Number((t.efficiency || {}).first_attempt_success_rate || 0));
-    cards.push(`
-      <div class="timeline-row">
-        <div class="timeline-head"><span class="row-title">Process: ${escapeHtml(processName)}</span><span class="row-sub">efficiency</span></div>
-        <div class="row-content">
-          <div class="replay-summary-grid">
-            <div class="replay-summary-metric"><div class="k">Token efficiency</div><div class="v">${mean(tokenEff).toFixed(2)}</div></div>
-            <div class="replay-summary-metric"><div class="k">Tool call efficiency</div><div class="v">${mean(toolEff).toFixed(2)}x</div></div>
-            <div class="replay-summary-metric"><div class="k">Context utilization</div><div class="v">${(mean(contextUtil) * 100).toFixed(1)}%</div></div>
-            <div class="replay-summary-metric"><div class="k">Time per turn</div><div class="v">${formatMs(mean(turnTime))}</div></div>
-            <div class="replay-summary-metric"><div class="k">Retry rate</div><div class="v">${(mean(retryRate) * 100).toFixed(1)}%</div></div>
-            <div class="replay-summary-metric"><div class="k">First-attempt success</div><div class="v">${(mean(firstSuccess) * 100).toFixed(1)}%</div></div>
-          </div>
-        </div>
-      </div>`);
+  // Destroy previous chart instance
+  if (tokenProfileChart) {
+    tokenProfileChart.destroy();
+    tokenProfileChart = null;
   }
 
-  graphCanvas.innerHTML = `<div class="timeline-wrap">${cards.join("")}</div>`;
+  graphCanvas.innerHTML = `<div style="padding:24px;max-width:1100px;margin:0 auto;"><canvas id="tokenProfileCanvas" style="width:100%;height:420px;"></canvas></div>`;
+  const canvas = $("tokenProfileCanvas");
+  if (!canvas) return;
+
+  const labels = profile.map((p) => `T${p.turn_index}`);
+  const reqData = profile.map((p) => p.request_bytes / 1024);
+  const respData = profile.map((p) => p.response_bytes / 1024);
+  const deltaData = profile.map((p) => p.delta_bytes / 1024);
+
+  tokenProfileChart = new Chart(canvas, {
+    type: "bar",
+    data: {
+      labels,
+      datasets: [
+        {
+          type: "line",
+          label: "request_bytes (KB) — context size",
+          data: reqData,
+          borderColor: "rgba(99, 102, 241, 1)",
+          backgroundColor: "rgba(99, 102, 241, 0.12)",
+          fill: true,
+          tension: 0.25,
+          pointRadius: 3,
+          pointHoverRadius: 6,
+          borderWidth: 2.5,
+          yAxisID: "y",
+          order: 1,
+        },
+        {
+          type: "line",
+          label: "response_bytes (KB)",
+          data: respData,
+          borderColor: "rgba(16, 185, 129, 1)",
+          backgroundColor: "rgba(16, 185, 129, 0.08)",
+          fill: false,
+          tension: 0.25,
+          pointRadius: 3,
+          pointHoverRadius: 6,
+          borderWidth: 2,
+          yAxisID: "y2",
+          order: 2,
+        },
+        {
+          type: "bar",
+          label: "delta (KB) — tool outputs",
+          data: deltaData,
+          backgroundColor: "rgba(245, 158, 11, 0.5)",
+          borderColor: "rgba(245, 158, 11, 1)",
+          borderWidth: 1,
+          borderRadius: 3,
+          yAxisID: "y2",
+          order: 3,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: {
+          position: "top",
+          labels: { usePointStyle: true, padding: 16, font: { size: 12, family: "Inter, system-ui, sans-serif" } },
+        },
+        tooltip: {
+          backgroundColor: "rgba(15, 23, 42, 0.92)",
+          titleFont: { size: 13, family: "Inter, system-ui, sans-serif" },
+          bodyFont: { size: 12, family: "'SF Mono', monospace" },
+          padding: 12,
+          cornerRadius: 8,
+          callbacks: {
+            label: (ctx) => {
+              const raw = profile[ctx.dataIndex];
+              if (!raw) return "";
+              if (ctx.datasetIndex === 0) return ` request: ${formatBytes(raw.request_bytes)}`;
+              if (ctx.datasetIndex === 1) return ` response: ${formatBytes(raw.response_bytes)}`;
+              return ` delta: ${raw.delta_bytes >= 0 ? "+" : ""}${formatBytes(raw.delta_bytes)}`;
+            },
+          },
+        },
+      },
+      scales: {
+        x: {
+          title: { display: true, text: "Turn", font: { size: 12, weight: "600" } },
+          grid: { display: false },
+          ticks: { font: { size: 11 } },
+        },
+        y: {
+          type: "linear",
+          position: "left",
+          title: { display: true, text: "Context Size (KB)", font: { size: 12, weight: "600" } },
+          grid: { color: "rgba(148, 163, 184, 0.15)" },
+          ticks: { font: { size: 11 } },
+          beginAtZero: true,
+        },
+        y2: {
+          type: "linear",
+          position: "right",
+          title: { display: true, text: "Response / Delta (KB)", font: { size: 12, weight: "600" } },
+          grid: { drawOnChartArea: false },
+          ticks: { font: { size: 11 } },
+        },
+      },
+    },
+  });
 }
 
 function updateExecutiveSummary(summary) {
@@ -2947,9 +2982,8 @@ async function restoreFromStack() {
 
 function setActiveTab(tabName) {
   activeTab = tabName;
-  traceTabBtn.classList.toggle("active", tabName === "correctness");
-  replayTabBtn.classList.toggle("active", tabName === "safety");
-  settingsTabBtn.classList.toggle("active", tabName === "efficiency");
+  profilerTabBtn.classList.toggle("active", tabName === "profiler");
+  replayTabBtn.classList.toggle("active", tabName === "replay");
   graphWrapper.classList.toggle("replay-mode", Boolean(selectedTraceId));
 }
 
@@ -3061,7 +3095,11 @@ async function selectTrace(traceId) {
   renderTraceList(cachedTraces);
   renderBreadcrumbs();
   graphWrapper.classList.toggle("replay-mode", true);
-  await loadReplayOverview();
+  if (activeTab === "profiler") {
+    await loadTokenProfile(traceId);
+  } else {
+    await loadReplayOverview();
+  }
 }
 
 async function refreshTraces(force = false, options = {}) {
@@ -3087,9 +3125,8 @@ async function refreshTraces(force = false, options = {}) {
 
   if (!selectedTraceId) {
     graphWrapper.classList.toggle("replay-mode", false);
-    await loadDimensionMetricsCache();
     renderBreadcrumbs();
-    renderDimensionOverview(activeTab);
+    graphCanvas.innerHTML = `<div class="empty-state"><h3>Token Profiler</h3><p>Select a trace to view its token consumption profile.</p></div>`;
     return;
   }
 
@@ -3098,7 +3135,11 @@ async function refreshTraces(force = false, options = {}) {
   }
 
   graphWrapper.classList.toggle("replay-mode", true);
-  await loadReplayOverview();
+  if (activeTab === "profiler") {
+    await loadTokenProfile(selectedTraceId);
+  } else {
+    await loadReplayOverview();
+  }
 }
 
 function installStyles() {
@@ -3416,46 +3457,31 @@ async function init() {
     addProcessBtn.addEventListener("click", createProcess);
   }
 
-  traceTabBtn.addEventListener("click", async () => {
-    if (activeTab === "correctness") return;
-    setActiveTab("correctness");
+  profilerTabBtn.addEventListener("click", async () => {
+    if (activeTab === "profiler") return;
+    setActiveTab("profiler");
     viewStack = [];
     renderBreadcrumbs();
     if (selectedTraceId) {
-      await loadReplayOverview();
-      return;
+      await loadTokenProfile(selectedTraceId);
+    } else {
+      graphCanvas.innerHTML = `<div class="empty-state"><h3>Token Profiler</h3><p>Select a trace to view its token consumption profile.</p></div>`;
     }
-    await loadDimensionMetricsCache();
-    renderDimensionOverview("correctness");
   });
 
   replayTabBtn.addEventListener("click", async () => {
-    if (activeTab === "safety") return;
-    setActiveTab("safety");
+    if (activeTab === "replay") return;
+    setActiveTab("replay");
     viewStack = [];
     renderBreadcrumbs();
     if (selectedTraceId) {
       await loadReplayOverview();
-      return;
+    } else {
+      graphCanvas.innerHTML = `<div class="empty-state"><h3>Replay</h3><p>Select a trace to view its turn-by-turn replay.</p></div>`;
     }
-    await loadDimensionMetricsCache();
-    renderDimensionOverview("safety");
   });
 
-  settingsTabBtn.addEventListener("click", async () => {
-    if (activeTab === "efficiency") return;
-    setActiveTab("efficiency");
-    viewStack = [];
-    renderBreadcrumbs();
-    if (selectedTraceId) {
-      await loadReplayOverview();
-      return;
-    }
-    await loadDimensionMetricsCache();
-    renderDimensionOverview("efficiency");
-  });
-
-  setActiveTab("correctness");
+  setActiveTab("profiler");
   await refreshTraces(true, { preserveView: false });
 
   setInterval(async () => {

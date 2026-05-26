@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Mantle Trustworthiness Dashboard</title>
   <script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
   <style>
     :root {
       --bg: #f8fafc;
@@ -316,9 +317,8 @@
         </div>
       </div>
       <div class="view-tabs">
-        <button class="view-tab active" id="traceTabBtn">Correctness</button>
-        <button class="view-tab" id="replayTabBtn">Safety</button>
-        <button class="view-tab" id="settingsTabBtn">Efficiency</button>
+        <button class="view-tab active" id="profilerTabBtn">Profiler</button>
+        <button class="view-tab" id="replayTabBtn">Replay</button>
       </div>
       <div class="summary-strip" id="summaryStrip">
         <div class="summary-card"><div class="k">Turns</div><div class="v" id="sumTurns">0</div></div>
@@ -331,8 +331,8 @@
       <div class="graph-wrapper" id="graphWrapper">
         <div class="graph-canvas" id="graphCanvas">
           <div class="empty-state" id="emptyState">
-            <h3>Correctness Overview</h3>
-            <p>Select a trace to open replay, or keep no selection to see process-level correctness metrics.</p>
+            <h3>Token Profiler</h3>
+            <p>Select a trace to view its token consumption profile and context growth patterns.</p>
           </div>
         </div>
       </div>
@@ -372,6 +372,6 @@
       </div>
     </aside>
   </div>
-  <script src="/static/app.js?v=20260403-state-diff-fix"></script>
+  <script src="/static/app.js?v=20260525-token-profiler"></script>
 </body>
 </html>

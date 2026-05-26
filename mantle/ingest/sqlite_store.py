@@ -693,3 +693,57 @@ class SQLiteTraceStore:
             out.append(event)
         return out
 
+    # ── token_profile persistence ─────────────────────────────────────
+
+    def replace_token_profile(
+        self,
+        trace_id: str,
+        profile_rows: list[dict[str, Any]],
+    ) -> None:
+        """Bulk upsert pre-computed token byte metrics for the profiler view.
+
+        Called during _sync_trace_to_sqlite() alongside turn_computed persistence.
+        """
+        with self._connect() as conn:
+            conn.execute("DELETE FROM token_profile WHERE trace_id = ?", (trace_id,))
+            for row in profile_rows:
+                conn.execute(
+                    """
+                    INSERT INTO token_profile(
+                        trace_id, turn_index,
+                        request_bytes, response_bytes, delta_bytes
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        trace_id,
+                        int(row.get("turn_index") or 0),
+                        int(row.get("request_bytes") or 0),
+                        int(row.get("response_bytes") or 0),
+                        int(row.get("delta_bytes") or 0),
+                    ),
+                )
+
+    def get_token_profile(self, trace_id: str) -> list[dict[str, Any]]:
+        """Read stored token profile for a trace. Used by the profiler API endpoint."""
+        with self._connect() as conn:
+            rows = list(
+                conn.execute(
+                    """
+                    SELECT turn_index, request_bytes, response_bytes, delta_bytes
+                    FROM token_profile
+                    WHERE trace_id = ?
+                    ORDER BY turn_index
+                    """,
+                    (trace_id,),
+                )
+            )
+        return [
+            {
+                "turn_index": int(row["turn_index"]),
+                "request_bytes": int(row["request_bytes"]),
+                "response_bytes": int(row["response_bytes"]),
+                "delta_bytes": int(row["delta_bytes"]),
+            }
+            for row in rows
+        ]
+

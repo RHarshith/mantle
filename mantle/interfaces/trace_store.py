@@ -124,10 +124,6 @@ class ITraceStore(Protocol):
         """Return summarized insights for one tool call."""
         ...
 
-    def trace_dimension_metrics(self, trace_id: str) -> dict[str, Any]:
-        """Return correctness/safety/efficiency heuristic metrics."""
-        ...
-
-    def all_trace_dimension_metrics(self) -> dict[str, Any]:
-        """Return dimension metrics for all traces."""
+    def token_profile(self, trace_id: str) -> dict[str, Any]:
+        """Return pre-computed token byte profile for a trace."""
         ...

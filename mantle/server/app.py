@@ -335,19 +335,15 @@ def trace_capture_quality(trace_id: str) -> dict[str, Any]:
 		raise HTTPException(status_code=404, detail="Trace not found")
 
 
-@app.get("/api/traces/{trace_id}/dimension-metrics")
-def trace_dimension_metrics(trace_id: str) -> dict[str, Any]:
-	"""Return correctness/safety/efficiency heuristic metrics for one trace."""
+@app.get("/api/traces/{trace_id}/token-profile")
+def trace_token_profile(trace_id: str) -> dict[str, Any]:
+	"""Return per-turn byte metrics for the token profiler view."""
 	try:
-		return store.trace_dimension_metrics(trace_id)
+		return store.token_profile(trace_id)
 	except KeyError:
 		raise HTTPException(status_code=404, detail="Trace not found")
 
 
-@app.get("/api/dimensions/metrics")
-def all_dimension_metrics() -> dict[str, Any]:
-	"""Return dimension metrics for all traces."""
-	return store.all_trace_dimension_metrics()
 
 
 @app.get("/api/traces/{trace_id}/tool-summary/{tool_call_id}")

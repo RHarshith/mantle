@@ -99,3 +99,14 @@ CREATE TABLE IF NOT EXISTS turn_computed (
 
 CREATE INDEX IF NOT EXISTS idx_turn_computed_trace ON turn_computed(trace_id);
 CREATE INDEX IF NOT EXISTS idx_turn_computed_trace_turn ON turn_computed(trace_id, turn_id);
+
+CREATE TABLE IF NOT EXISTS token_profile (
+    id INTEGER PRIMARY KEY,
+    trace_id TEXT NOT NULL,
+    turn_index INTEGER NOT NULL,
+    request_bytes INTEGER NOT NULL DEFAULT 0,
+    response_bytes INTEGER NOT NULL DEFAULT 0,
+    delta_bytes INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(trace_id, turn_index)
+);
+CREATE INDEX IF NOT EXISTS idx_token_profile_trace ON token_profile(trace_id);
