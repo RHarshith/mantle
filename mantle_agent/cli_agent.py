@@ -10,8 +10,7 @@ import traceback
 
 from openai import OpenAI
 
-from mantle.runtime.bootstrap import bootstrap_runtime
-from mantle.runtime.logging import bind_correlation, get_component_logger
+import logging
 
 try:
     # Works when invoked as `python -m mantle_agent.cli_agent`.
@@ -72,6 +71,31 @@ ALL_TOOLS = [PYTHON_EXEC_TOOL, COMMAND_EXEC_TOOL]
 def log_event(verbose: bool, message: str) -> None:
     if verbose:
         print(f"[agent] {message}")
+
+
+def log_chat_api_call(request_data: dict, response_data: object) -> None:
+    try:
+        logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        log_file = os.path.join(logs_dir, "chat_api_logs.json")
+        
+        logs = []
+        if os.path.exists(log_file):
+            with open(log_file, "r") as f:
+                content = f.read().strip()
+                if content:
+                    logs = json.loads(content)
+                
+        logs.append({
+            "timestamp": time.time(),
+            "request": request_data,
+            "response": response_data
+        })
+        
+        with open(log_file, "w") as f:
+            json.dump(logs, f, indent=2)
+    except Exception as e:
+        print(f"[agent] Warning: failed to log chat api call: {e}")
 
 
 def prompt_user_approval(tool_name: str, tool_args: dict, auto_approve: bool = False) -> bool:
@@ -336,13 +360,26 @@ def run_single_turn(
 ) -> str:
     while True:
         log_event(verbose, f"sending request to model='{model}' with {len(messages)} messages")
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=ALL_TOOLS,
-            tool_choice="auto",
-            stream=False,
-        )
+        
+        request_params = {
+            "model": model,
+            "messages": messages,
+            "tools": ALL_TOOLS,
+            "tool_choice": "auto",
+            "stream": False,
+        }
+        
+        response = client.chat.completions.create(**request_params)
+
+        response_data = None
+        if hasattr(response, "model_dump"):
+            response_data = response.model_dump()
+        elif isinstance(response, dict):
+            response_data = response
+        else:
+            response_data = str(response)
+            
+        log_chat_api_call(request_params, response_data)
 
         assistant_content, tool_calls = extract_assistant_payload(response)
         log_event(verbose, f"received response; tool_calls={len(tool_calls)}")
@@ -477,8 +514,8 @@ def run_single_turn(
 
 
 def main() -> None:
-    _, layout = bootstrap_runtime("agent")
-    logger = get_component_logger("agent", layout=layout)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    logger = logging.getLogger("agent")
 
     parser = argparse.ArgumentParser(description="Simple CLI LLM agent")
     parser.add_argument(
@@ -524,15 +561,14 @@ def main() -> None:
             model = "mock-model"
     else:
         api_key = os.getenv("OAK1")
-        base_url = os.getenv("OPENAI_BASE_URL", "https://chat-api.tamu.ai/api")
+        base_url = os.getenv("OPENAI_BASE_URL", "https://chat-api.tamu.ai/openai")
         if not api_key:
             raise RuntimeError("Missing OAK1 environment variable.")
 
     client = OpenAI(api_key=api_key, base_url=base_url)
     sink = build_event_sink()
 
-    bind_correlation(trace_id=os.getenv("AGENT_TRACE_ID", ""))
-    logger.info("cli agent runtime initialized", extra={"model": model, "base_url": base_url})
+    logger.info(f"cli agent runtime initialized model={model} base_url={base_url}")
 
     messages = []
     shared_globals = {"__builtins__": __builtins__}

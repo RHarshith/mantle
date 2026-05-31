@@ -9,8 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from mantle.ingest.config import resolve_observability_paths
-from mantle.runtime.logging import get_component_logger
+import logging
 
 
 class EventSink(Protocol):
@@ -73,15 +72,15 @@ def build_event_sink() -> EventSink:
     enabled = os.getenv("AGENT_OBS_ENABLED", "1").strip().lower() not in {"0", "false", "off", "no"}
     if not enabled:
         return NullEventSink()
-
-    logger = get_component_logger("agent")
+    logger = logging.getLogger("agent")
 
     trace_id = os.getenv("AGENT_TRACE_ID", "").strip()
     if not trace_id:
         trace_id = f"trace-{int(time.time())}-{os.getpid()}"
 
     session_id = str(uuid.uuid4())
-    _, events_dir = resolve_observability_paths()
+    repo_root = Path(__file__).resolve().parents[1]
+    events_dir = repo_root / ".mantle" / "obs" / "events"
     output_path = events_dir / f"{trace_id}.events.jsonl"
-    logger.info("configured agent event sink path", extra={"trace_id": trace_id, "event_sink_path": str(output_path)})
+    logger.info(f"configured agent event sink path trace_id={trace_id} event_sink_path={output_path}")
     return JsonlEventSink(trace_id=trace_id, session_id=session_id, output_path=output_path)
